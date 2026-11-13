@@ -171,7 +171,13 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	slog.InfoContext(ctx, "serving", "addr", ln.Addr().String())
-	return serveHTTP(ctx, ln, &http.Server{Handler: h, ReadHeaderTimeout: cfg.ReadHeaderTimeout}, cfg.ShutdownTimeout)
+	// The sweep lives and stops with the server: a server error cancels it.
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return serveHTTP(gctx, ln, &http.Server{Handler: h, ReadHeaderTimeout: cfg.ReadHeaderTimeout}, cfg.ShutdownTimeout)
+	})
+	g.Go(func() error { return svc.SweepIdempotencyKeys(gctx, cfg.IdempotencySweep) })
+	return g.Wait()
 }
 
 // serveHTTP runs srv until ctx is cancelled, then drains in-flight requests
