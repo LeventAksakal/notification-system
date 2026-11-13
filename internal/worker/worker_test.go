@@ -29,6 +29,7 @@ type memQueue struct {
 	claims   map[core.Priority]int
 	results  map[string][]core.AttemptOutcome
 	released int
+	lost     int // result writes refused because the lease had run out
 }
 
 type memRow struct {
@@ -79,6 +80,11 @@ func (q *memQueue) finish(job core.Job, a *core.Attempt, to core.Status, kind co
 	if r == nil || r.status != core.StatusProcessing || r.job.ClaimVersion != job.ClaimVersion {
 		return core.ErrLeaseLost
 	}
+	if time.Now().After(r.job.LeaseUntil) {
+		// As if the reaper had taken it back: the claimer's write is fenced off.
+		q.lost++
+		return core.ErrLeaseLost
+	}
 	r.status, r.kind, r.due = to, kind, due
 	if a != nil {
 		r.job.Attempts++
@@ -101,7 +107,20 @@ func (q *memQueue) MarkFailed(_ context.Context, j core.Job, a core.Attempt, k c
 func (q *memQueue) Release(_ context.Context, j core.Job, due time.Time) error {
 	return q.finish(j, nil, core.StatusPending, "", due)
 }
-func (q *memQueue) ReapExpired(context.Context) (int, error) { return 0, nil }
+func (q *memQueue) ReapExpired(context.Context) ([]core.Job, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var out []core.Job
+	for _, id := range q.order {
+		r := q.rows[id]
+		if r.status == core.StatusProcessing && time.Now().After(r.job.LeaseUntil) {
+			r.status = core.StatusPending
+			out = append(out, core.Job{ID: r.job.ID, BatchID: r.job.BatchID, Channel: r.job.Channel,
+				Attempts: r.job.Attempts, CorrelationID: r.job.CorrelationID})
+		}
+	}
+	return out, nil
+}
 
 func (q *memQueue) count(st core.Status) int {
 	q.mu.Lock()
@@ -121,22 +140,48 @@ func (q *memQueue) row(id string) memRow {
 	return *q.rows[id]
 }
 
-// openLimiter grants every permit; failing makes it unreachable.
-type openLimiter struct {
-	mu    sync.Mutex
-	err   error
-	takes int
+// gridLimiter is an in-memory GCRA with burst 1 per channel, like the Valkey
+// limiter: slots exactly interval apart, at most horizon ahead.
+type gridLimiter struct {
+	mu       sync.Mutex
+	err      error
+	takes    int
+	interval time.Duration
+	horizon  time.Duration
+	next     map[core.Channel]time.Time
 }
 
-func (l *openLimiter) Take(context.Context, core.Channel, int) (int, time.Duration, error) {
+func newGridLimiter(interval, horizon time.Duration) *gridLimiter {
+	return &gridLimiter{interval: interval, horizon: horizon, next: map[core.Channel]time.Time{}}
+}
+
+func (l *gridLimiter) Take(_ context.Context, ch core.Channel, n int) (core.Grant, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.takes++
 	if l.err != nil {
-		return 0, 0, l.err
+		return core.Grant{}, l.err
 	}
-	return 1, 0, nil
+	now := time.Now()
+	tat := l.next[ch]
+	if tat.Before(now) {
+		tat = now
+	}
+	first := tat.Sub(now)
+	k := 0
+	if first <= l.horizon {
+		k = min(int((l.horizon-first)/l.interval)+1, n)
+	}
+	tat = tat.Add(time.Duration(k) * l.interval)
+	l.next[ch] = tat
+	var wait time.Duration
+	if k < n {
+		wait = max(tat.Sub(now)-l.horizon, 0)
+	}
+	return core.Grant{N: k, First: first, Interval: l.interval, Wait: wait}, nil
 }
+
+func testLimiter() *gridLimiter { return newGridLimiter(5*time.Millisecond, 20*time.Millisecond) }
 
 // scriptSender answers by function.
 type scriptSender struct {
@@ -177,9 +222,10 @@ func (p *recPublisher) statuses(id string) []core.Status {
 
 func testConfig() Config {
 	return Config{
-		Concurrency: 4, MaxAttempts: 3, RetryBase: time.Millisecond, RetryCap: 5 * time.Millisecond,
+		Concurrency: 30, MaxAttempts: 3, RetryBase: time.Millisecond, RetryCap: 5 * time.Millisecond,
 		Lease: time.Minute, ReapInterval: 10 * time.Millisecond, ShutdownTimeout: time.Second,
 		Weights: [3]int{70, 20, 10}, IdleMin: time.Millisecond, IdleMax: 5 * time.Millisecond, SendAlign: time.Microsecond,
+		Horizon: 20 * time.Millisecond,
 	}
 }
 
@@ -208,7 +254,7 @@ func TestWorkerDelivers(t *testing.T) {
 	q.add(20, core.ChannelSMS, core.PriorityNormal)
 	q.add(20, core.ChannelEmail, core.PriorityLow)
 	pub := &recPublisher{}
-	stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: &openLimiter{}, Sender: scriptSender{accept}, Publisher: pub}))
+	stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{accept}, Publisher: pub}))
 	waitFor(t, "all 40 sent", func() bool { return q.count(core.StatusSent) == 40 })
 	if err := stop(); err != nil {
 		t.Fatal(err)
@@ -246,7 +292,7 @@ func TestWorkerRetryOutcomes(t *testing.T) {
 				}
 				return provider.Response{Status: st, Header: http.Header{}}, nil
 			}
-			stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: &openLimiter{}, Sender: scriptSender{send}}))
+			stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{send}}))
 			id := "push-high-0"
 			waitFor(t, "a final status", func() bool { st := q.row(id).status; return st == core.StatusSent || st == core.StatusFailed })
 			if err := stop(); err != nil {
@@ -266,7 +312,8 @@ func TestWorkerRetryOutcomes(t *testing.T) {
 func TestWorkerSendsNothingWhenTheLimiterIsDown(t *testing.T) {
 	q := newMemQueue()
 	q.add(5, core.ChannelSMS, core.PriorityHigh)
-	lim := &openLimiter{err: errors.New("valkey down")}
+	lim := testLimiter()
+	lim.err = errors.New("valkey down")
 	stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: lim, Sender: scriptSender{accept}}))
 	waitFor(t, "the limiter is asked", func() bool { lim.mu.Lock(); defer lim.mu.Unlock(); return lim.takes > 3 })
 	if err := stop(); err != nil {
@@ -288,7 +335,7 @@ func TestWorkerShutdownReleasesUnsentWork(t *testing.T) {
 	}
 	cfg := testConfig()
 	cfg.ShutdownTimeout = 20 * time.Millisecond
-	stop := run(t, New(cfg, Deps{Queue: q, Limiter: &openLimiter{}, Sender: scriptSender{send}}))
+	stop := run(t, New(cfg, Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{send}}))
 	for range 3 {
 		<-started
 	}
@@ -309,7 +356,7 @@ func TestWorkerWeightsAndBorrowing(t *testing.T) {
 		for _, p := range core.Priorities {
 			q.add(400, core.ChannelSMS, p)
 		}
-		stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: &openLimiter{}, Sender: scriptSender{accept}}))
+		stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{accept}}))
 		waitFor(t, "400 sent", func() bool { return q.count(core.StatusSent) >= 400 })
 		if err := stop(); err != nil {
 			t.Fatal(err)
@@ -330,7 +377,7 @@ func TestWorkerWeightsAndBorrowing(t *testing.T) {
 		q := newMemQueue()
 		q.add(400, core.ChannelSMS, core.PriorityHigh)
 		q.add(400, core.ChannelSMS, core.PriorityLow)
-		stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: &openLimiter{}, Sender: scriptSender{accept}}))
+		stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{accept}}))
 		waitFor(t, "300 sent", func() bool { return q.count(core.StatusSent) >= 300 })
 		if err := stop(); err != nil {
 			t.Fatal(err)
@@ -344,23 +391,25 @@ func TestWorkerWeightsAndBorrowing(t *testing.T) {
 	})
 }
 
-func TestSelectorOrder(t *testing.T) {
-	s := newSelector([3]int{70, 20, 10})
-	counts := map[int]int{}
-	for range 100 {
-		counts[s.next()]++
-	}
-	if counts[0] != 70 || counts[1] != 20 || counts[2] != 10 {
-		t.Errorf("100 turns: got %v, want exactly 70/20/10", counts)
-	}
+func TestSelectorPlan(t *testing.T) {
 	now := time.Now()
-	s = newSelector([3]int{0, 1, 0}) // always picks normal first
-	if got := fmt.Sprint(s.order(now)); got != "[normal low high]" {
-		t.Errorf("order: want down then up, got %s", got)
+	s := newSelector([3]int{70, 20, 10})
+	if got := s.plan(100, now); got != [3]int{70, 20, 10} {
+		t.Errorf("100 slots: got %v, want exactly 70/20/10", got)
 	}
-	s.markEmpty(core.PriorityLow, now.Add(time.Second))
-	if got := fmt.Sprint(s.order(now)); got != "[normal high]" {
-		t.Errorf("order with low empty: got %s", got)
+	s = newSelector([3]int{70, 20, 10})
+	s.markEmpty(1, now.Add(time.Second))
+	if got := s.plan(100, now); got != [3]int{70, 0, 30} {
+		t.Errorf("normal empty: got %v, want its share lent down to low", got)
+	}
+	s = newSelector([3]int{70, 20, 10})
+	s.markEmpty(2, now.Add(time.Second))
+	if got := s.plan(100, now); got != [3]int{70, 30, 0} {
+		t.Errorf("low empty: got %v, want its share lent up to normal", got)
+	}
+	s = newSelector([3]int{70, 20, 0})
+	if got := s.plan(100, now); got[2] != 0 {
+		t.Errorf("weight 0: low got %d slots of its own, want none", got[2])
 	}
 }
 

@@ -4,6 +4,7 @@ package limiter_test
 
 import (
 	"context"
+	"math"
 	"slices"
 	"sync"
 	"testing"
@@ -16,6 +17,16 @@ import (
 	"github.com/LeventAksakal/notification-system/test/support"
 )
 
+// grant is one Take as a taker saw it: the call's local start and end.
+type grant struct {
+	start, end time.Time
+	g          core.Grant
+}
+
+// TestLimiterHoldsTheRateAcrossTakers runs three takers that reserve slots in
+// batches, as three workers do, and checks the slots themselves: no two
+// overlap, no sliding second holds more than the paced rate, and the paced
+// rate is used.
 func TestLimiterHoldsTheRateAcrossTakers(t *testing.T) {
 	addr := support.Valkey(t)
 	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}, DisableCache: true})
@@ -24,51 +35,119 @@ func TestLimiterHoldsTheRateAcrossTakers(t *testing.T) {
 	}
 	defer client.Close()
 
-	const rate, takers, run = 100, 8, 4 * time.Second
+	const rate, headroom, takers, run = 100, 3, 3, 4 * time.Second
+	const horizon = 200 * time.Millisecond
 	var mu sync.Mutex
-	var grants []time.Time
+	var grants []grant
 	ctx, cancel := context.WithTimeout(t.Context(), run)
 	defer cancel()
 	var wg sync.WaitGroup
 	for range takers {
 		// One Limiter per taker, as each worker process has its own.
-		l := limiter.New(client, rate, 3, "test:rate:")
+		l := limiter.New(client, rate, headroom, horizon, "test:rate:")
+		want := int(horizon/l.Interval()) + 1
 		wg.Go(func() {
 			for ctx.Err() == nil {
-				got, wait, err := l.Take(ctx, core.ChannelSMS, 1)
+				start := time.Now()
+				g, err := l.Take(ctx, core.ChannelSMS, want)
+				end := time.Now()
 				if err != nil {
 					if ctx.Err() == nil {
 						t.Errorf("take: %v", err)
 					}
 					return
 				}
-				if got > 0 {
+				if g.N > 0 {
 					mu.Lock()
-					grants = append(grants, time.Now())
+					grants = append(grants, grant{start: start, end: end, g: g})
 					mu.Unlock()
-					continue
 				}
+				// As the worker: ask again once half a horizon can be reserved.
 				select {
 				case <-ctx.Done():
-				case <-time.After(wait):
+				case <-time.After(g.Wait + horizon/2):
 				}
 			}
 		})
 	}
 	wg.Wait()
-	slices.SortFunc(grants, func(a, b time.Time) int { return a.Compare(b) })
+	if len(grants) < 2 {
+		t.Fatalf("only %d grants", len(grants))
+	}
+	interval := grants[0].g.Interval
+	paced := int(math.Ceil(float64(time.Second) / float64(interval)))
+
+	// A slot's local time is known up to the round trip of its Take. Grants
+	// from one key are contiguous or separated by a restart; place each grant
+	// right after the previous one when its estimate is within the round trip.
+	firstAt := func(x grant) time.Time { return x.end.Add(x.g.First) }
+	slices.SortFunc(grants, func(a, b grant) int { return firstAt(a).Compare(firstAt(b)) })
+	var slots []time.Time
+	var prevEnd time.Time
+	var prevRTT time.Duration
+	restarts := 0
+	for i, x := range grants {
+		at := firstAt(x)
+		rtt := x.end.Sub(x.start)
+		tol := max(rtt, prevRTT) + time.Millisecond
+		if i > 0 {
+			switch d := at.Sub(prevEnd); {
+			case d < -tol:
+				t.Fatalf("grant %d overlaps the previous one by %s (tolerance %s)", i, -d, tol)
+			case d <= tol:
+				at = prevEnd
+			default:
+				restarts++
+			}
+		}
+		for k := range x.g.N {
+			slots = append(slots, at.Add(time.Duration(k)*interval))
+		}
+		prevEnd, prevRTT = at.Add(time.Duration(x.g.N)*interval), rtt
+	}
+	for i := 1; i < len(slots); i++ {
+		if d := slots[i].Sub(slots[i-1]); d < interval {
+			t.Fatalf("slots %d and %d are %s apart, interval %s", i-1, i, d, interval)
+		}
+	}
 	busiest := 0
-	for i := range grants {
-		j, _ := slices.BinarySearchFunc(grants, grants[i].Add(time.Second), func(a, b time.Time) int { return a.Compare(b) })
+	for i := range slots {
+		j, _ := slices.BinarySearchFunc(slots, slots[i].Add(time.Second), func(a, b time.Time) int { return a.Compare(b) })
 		busiest = max(busiest, j-i)
 	}
-	avg := float64(len(grants)-1) / grants[len(grants)-1].Sub(grants[0]).Seconds()
-	t.Logf("%d grants to %d takers: busiest 1 s window %d, average %.1f/s", len(grants), takers, busiest, avg)
-	if busiest > rate {
-		t.Errorf("busiest one-second window: %d grants, limit %d", busiest, rate)
+	avg := float64(len(slots)-1) / slots[len(slots)-1].Sub(slots[0]).Seconds()
+	t.Logf("%d slots in %d grants to %d takers (interval %s, %d restarts): busiest 1 s window %d (paced %d), average %.2f/s",
+		len(slots), len(grants), takers, interval, restarts, busiest, paced, avg)
+	if busiest > paced {
+		t.Errorf("busiest one-second window: %d slots, paced rate %d", busiest, paced)
 	}
-	if avg < 95 {
-		t.Errorf("average %.1f/s, want at least 95 (the limit must be used)", avg)
+	if avg < 96.5 {
+		t.Errorf("average %.2f/s, want at least 96.5 (the paced rate must be used)", avg)
+	}
+}
+
+func TestLimiterReservesWithinTheHorizon(t *testing.T) {
+	addr := support.Valkey(t)
+	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}, DisableCache: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	l := limiter.New(client, 100, 0, 50*time.Millisecond, "test:horizon:")
+	g, err := l.Take(t.Context(), core.ChannelEmail, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 10 ms slots at 0, 10, ..., 50 ms: six fit in a 50 ms horizon.
+	if g.N != 6 || g.First != 0 || g.Interval != 10*time.Millisecond || g.Wait <= 0 || g.Wait > 10*time.Millisecond {
+		t.Fatalf("first take: got %+v, want 6 slots from now and a wait of at most one interval", g)
+	}
+	g, err = l.Take(t.Context(), core.ChannelEmail, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.N > 1 || g.First < 50*time.Millisecond {
+		t.Fatalf("second take at once: got %+v, want nothing (or one slot) beyond the first six", g)
 	}
 }
 
@@ -78,11 +157,11 @@ func TestLimiterFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := limiter.New(client, 100, 3, "x:")
+	l := limiter.New(client, 100, 3, 200*time.Millisecond, "x:")
 	client.Close() // the connection is gone, as when Valkey goes away
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	if got, _, err := l.Take(ctx, core.ChannelSMS, 1); err == nil || got != 0 {
-		t.Fatalf("unreachable Valkey: want an error and no permit, got %d, %v", got, err)
+	if g, err := l.Take(ctx, core.ChannelSMS, 1); err == nil || g.N != 0 {
+		t.Fatalf("unreachable Valkey: want an error and no slot, got %+v, %v", g, err)
 	}
 }
