@@ -191,22 +191,34 @@ func (q *Queries) InsertDeliveryAttempt(ctx context.Context, arg InsertDeliveryA
 	return err
 }
 
-const leaseNotification = `-- name: LeaseNotification :execrows
+const leaseNotifications = `-- name: LeaseNotifications :execrows
 UPDATE notifications
 SET status = 'processing',
     lease_until = NOW(3) + INTERVAL ? MICROSECOND,
     claim_version = claim_version + 1
-WHERE id = ? AND status = 'pending'
+WHERE id IN (/*SLICE:ids*/?) AND status = 'pending'
 `
 
-type LeaseNotificationParams struct {
+type LeaseNotificationsParams struct {
 	LeaseUs interface{}
-	ID      string
+	Ids     []string
 }
 
-// pending -> processing for a row locked by ClaimCandidates in the same transaction.
-func (q *Queries) LeaseNotification(ctx context.Context, arg LeaseNotificationParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, leaseNotification, arg.LeaseUs, arg.ID)
+// pending -> processing for the rows locked by ClaimCandidates in the same
+// transaction, in one statement (one round trip, however many rows).
+func (q *Queries) LeaseNotifications(ctx context.Context, arg LeaseNotificationsParams) (int64, error) {
+	query := leaseNotifications
+	var queryParams []interface{}
+	queryParams = append(queryParams, arg.LeaseUs)
+	if len(arg.Ids) > 0 {
+		for _, v := range arg.Ids {
+			queryParams = append(queryParams, v)
+		}
+		query = strings.Replace(query, "/*SLICE:ids*/?", strings.Repeat(",?", len(arg.Ids))[1:], 1)
+	} else {
+		query = strings.Replace(query, "/*SLICE:ids*/?", "NULL", 1)
+	}
+	result, err := q.db.ExecContext(ctx, query, queryParams...)
 	if err != nil {
 		return 0, err
 	}

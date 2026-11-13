@@ -46,8 +46,9 @@ type Querier interface {
 	// rule the list filter uses.
 	// due_at is the schedule or now on the database clock; a past schedule means now.
 	InsertNotification(ctx context.Context, arg InsertNotificationParams) error
-	// pending -> processing for a row locked by ClaimCandidates in the same transaction.
-	LeaseNotification(ctx context.Context, arg LeaseNotificationParams) (int64, error)
+	// pending -> processing for the rows locked by ClaimCandidates in the same
+	// transaction, in one statement (one round trip, however many rows).
+	LeaseNotifications(ctx context.Context, arg LeaseNotificationsParams) (int64, error)
 	// One page of a batch in request order (batch_idx); after_index -1 starts at the first item.
 	ListBatchItems(ctx context.Context, arg ListBatchItemsParams) ([]ListBatchItemsRow, error)
 	// Every id of a batch in request order; rebuilds a replayed BatchCreated.
