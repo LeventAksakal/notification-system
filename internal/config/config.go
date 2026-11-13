@@ -46,6 +46,7 @@ type Config struct {
 	BreakerFailureRatio  float64
 	BreakerCooldown      time.Duration
 	IdempotencyRetention time.Duration
+	IdempotencySweep     time.Duration
 	WSSendBuffer         int
 }
 
@@ -114,6 +115,8 @@ var Dials = []Dial{
 		func(c *Config) *time.Duration { return &c.BreakerCooldown }),
 	duration("APP_IDEMPOTENCY_RETENTION", "24h", "how long an Idempotency-Key is remembered", time.Second, 30*24*time.Hour,
 		func(c *Config) *time.Duration { return &c.IdempotencyRetention }),
+	duration("APP_IDEMPOTENCY_SWEEP_INTERVAL", "1m", "how often app serve deletes expired Idempotency-Keys", 10*time.Millisecond, time.Hour,
+		func(c *Config) *time.Duration { return &c.IdempotencySweep }),
 	integer("APP_WS_SEND_BUFFER", "256", "events buffered per WebSocket subscriber before it is dropped", 1, 65_536,
 		func(c *Config) *int { return &c.WSSendBuffer }),
 }
