@@ -22,6 +22,12 @@ func Open(ctx context.Context, dsn string, maxOpen int) (*sql.DB, error) {
 	}
 	cfg.ParseTime = true
 	cfg.Loc = time.UTC
+	// NOW(3) and the DATETIME columns are read and written as UTC, the same
+	// zone the driver formats time.Time arguments in.
+	if cfg.Params == nil {
+		cfg.Params = map[string]string{}
+	}
+	cfg.Params["time_zone"] = "'+00:00'"
 	conn, err := mysql.NewConnector(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("mysql connector: %w", err)

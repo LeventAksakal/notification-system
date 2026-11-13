@@ -6,11 +6,44 @@ package sqlc
 
 import (
 	"context"
+	"database/sql"
 )
 
 type Querier interface {
+	// The only way out of pending to cancelled; a lost race changes nothing.
+	CancelNotification(ctx context.Context, id string) (int64, error)
+	// Counts per API status (scheduled is a view of pending).
+	CountBatchByStatus(ctx context.Context, batchID sql.NullString) ([]CountBatchByStatusRow, error)
+	// Forget one key older than the retention, so it can be used again.
+	DeleteExpiredIdempotencyKey(ctx context.Context, arg DeleteExpiredIdempotencyKeyParams) (int64, error)
+	DeleteTemplate(ctx context.Context, name string) (int64, error)
+	GetBatch(ctx context.Context, id string) (Batch, error)
+	GetIdempotencyKey(ctx context.Context, idemKey string) (IdempotencyKey, error)
+	GetNotification(ctx context.Context, id string) (GetNotificationRow, error)
+	GetTemplate(ctx context.Context, name string) (Template, error)
+	InsertBatch(ctx context.Context, arg InsertBatchParams) error
+	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
+	// Intake: create, read, list, cancel and replay notifications; batches;
+	// idempotency keys; templates. The API status `scheduled` is computed on the
+	// database clock (stored pending, never tried, due in the future), the same
+	// rule the list filter uses.
+	// due_at is the schedule or now on the database clock; a past schedule means now.
+	InsertNotification(ctx context.Context, arg InsertNotificationParams) error
+	// One page of a batch in request order (batch_idx); after_index -1 starts at the first item.
+	ListBatchItems(ctx context.Context, arg ListBatchItemsParams) ([]ListBatchItemsRow, error)
+	// Every id of a batch in request order; rebuilds a replayed BatchCreated.
+	ListBatchNotificationIDs(ctx context.Context, batchID sql.NullString) ([]string, error)
+	// Oldest first (attempts_notification_idx).
+	ListDeliveryAttempts(ctx context.Context, notificationID string) ([]DeliveryAttempt, error)
+	// Newest first, keyset on id. scheduled_only: NULL = no view filter, 1 = only
+	// scheduled, 0 = only not scheduled (combined with status = 'pending').
+	ListNotifications(ctx context.Context, arg ListNotificationsParams) ([]ListNotificationsRow, error)
+	ListTemplates(ctx context.Context) ([]Template, error)
 	// sqlc needs at least one query; the readiness probe can use it.
 	Ping(ctx context.Context) (int32, error)
+	// A dead letter goes back to pending with a fresh attempt budget; history is kept.
+	ReplayNotification(ctx context.Context, id string) (int64, error)
+	UpsertTemplate(ctx context.Context, arg UpsertTemplateParams) error
 }
 
 var _ Querier = (*Queries)(nil)
