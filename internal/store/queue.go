@@ -36,6 +36,16 @@ func (s *Queue) Claim(ctx context.Context, channel core.Channel, priority core.P
 	if err := core.Transition(core.StatusPending, core.StatusProcessing); err != nil {
 		return nil, err
 	}
+	var jobs []core.Job
+	err := retryLockConflict(ctx, func() error {
+		var err error
+		jobs, err = s.claimOnce(ctx, channel, priority, n, lease)
+		return err
+	})
+	return jobs, err
+}
+
+func (s *Queue) claimOnce(ctx context.Context, channel core.Channel, priority core.Priority, n int, lease time.Duration) ([]core.Job, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("claim: begin: %w", err)
@@ -127,7 +137,13 @@ func (s *Queue) finish(ctx context.Context, job core.Job, a core.Attempt, to cor
 	if err := core.Transition(core.StatusProcessing, to); err != nil {
 		return err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	return retryLockConflict(ctx, func() error { return s.finishOnce(ctx, job, a, to, update) })
+}
+
+func (s *Queue) finishOnce(ctx context.Context, job core.Job, a core.Attempt, to core.Status, update func(*sqlc.Queries) (int64, error)) error {
+	// READ COMMITTED like the claim: no gap locks, so a result write and a
+	// claim on the same channel do not deadlock on claim_idx.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return fmt.Errorf("finish %s: begin: %w", job.ID, err)
 	}
@@ -195,6 +211,29 @@ func (s *Queue) ReapExpired(ctx context.Context) (int, error) {
 			return total, nil
 		}
 	}
+}
+
+// lockRetries is how often a transaction InnoDB rolled back as a deadlock
+// victim or after a lock wait timeout is tried again.
+const lockRetries = 4
+
+// retryLockConflict runs fn again when InnoDB rolled it back for a lock
+// conflict; the whole transaction is retried, never a single statement.
+func retryLockConflict(ctx context.Context, fn func() error) error {
+	var err error
+	for i := range lockRetries {
+		if err = fn(); err == nil || !IsLockConflict(err) {
+			return err
+		}
+		t := time.NewTimer(time.Duration(i+1) * 2 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return err
+		case <-t.C:
+		}
+	}
+	return err
 }
 
 // delayUs is how far dueAt lies ahead of the local clock, in microseconds; the

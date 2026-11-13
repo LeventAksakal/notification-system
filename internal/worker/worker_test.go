@@ -15,7 +15,11 @@ import (
 	"github.com/LeventAksakal/notification-system/internal/provider"
 )
 
-func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
+// The Docker client of the integration tests (testcontainers on Windows)
+// starts one process-wide IO completion goroutine that never ends.
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m, goleak.IgnoreAnyFunction("github.com/Microsoft/go-winio.ioCompletionProcessor"))
+}
 
 // memQueue is an in-memory core.Queue with the same fencing rules.
 type memQueue struct {
@@ -175,7 +179,7 @@ func testConfig() Config {
 	return Config{
 		Concurrency: 4, MaxAttempts: 3, RetryBase: time.Millisecond, RetryCap: 5 * time.Millisecond,
 		Lease: time.Minute, ReapInterval: 10 * time.Millisecond, ShutdownTimeout: time.Second,
-		Weights: [3]int{70, 20, 10}, IdleMin: time.Millisecond, IdleMax: 5 * time.Millisecond,
+		Weights: [3]int{70, 20, 10}, IdleMin: time.Millisecond, IdleMax: 5 * time.Millisecond, SendAlign: time.Microsecond,
 	}
 }
 
