@@ -1,7 +1,8 @@
 // Package obs wires logs, traces and metrics. Logs go to stdout as JSON with
 // the trace id attached, and to OTLP through the slog bridge, so a log line in
-// Grafana links to its trace. With no endpoint configured nothing is exported
-// and the global providers stay no-ops (tests, local runs without the stack).
+// Grafana links to its trace. With no endpoint configured nothing is exported:
+// traces still get real ids (an SDK tracer provider without an exporter) so
+// the W3C context reaches the provider; metrics and logs stay local.
 package obs
 
 import (
@@ -32,8 +33,13 @@ func Setup(ctx context.Context, service, endpoint string, level slog.Level) (fun
 	// traceparent then still reaches the request context and the stored row.
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 	if endpoint == "" {
+		// A real tracer provider without an exporter: spans get valid ids, so
+		// a worker still sends a valid traceparent to the provider and log
+		// lines still carry trace_id; nothing leaves the process.
+		tp := sdktrace.NewTracerProvider()
+		otel.SetTracerProvider(tp)
 		slog.SetDefault(slog.New(stdout))
-		return func(context.Context) error { return nil }, nil
+		return tp.Shutdown, nil
 	}
 
 	res, err := resource.Merge(resource.Default(), resource.NewSchemaless(semconv.ServiceName(service)))

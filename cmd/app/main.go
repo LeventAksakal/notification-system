@@ -21,14 +21,19 @@ import (
 	"time"
 
 	"github.com/valkey-io/valkey-go"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/LeventAksakal/notification-system/internal/api"
+	"github.com/LeventAksakal/notification-system/internal/breaker"
 	"github.com/LeventAksakal/notification-system/internal/config"
 	"github.com/LeventAksakal/notification-system/internal/core"
 	"github.com/LeventAksakal/notification-system/internal/intake"
+	"github.com/LeventAksakal/notification-system/internal/limiter"
 	"github.com/LeventAksakal/notification-system/internal/obs"
+	"github.com/LeventAksakal/notification-system/internal/provider"
 	"github.com/LeventAksakal/notification-system/internal/store"
+	delivery "github.com/LeventAksakal/notification-system/internal/worker"
 )
 
 func main() {
@@ -79,7 +84,7 @@ func run(ctx context.Context, cmd string) error {
 	case "serve":
 		return serve(ctx, cfg, db)
 	case "worker":
-		return worker(ctx, cfg)
+		return worker(ctx, cfg, db)
 	default:
 		return fmt.Errorf("unknown command %q (serve, worker, migrate, healthcheck)", cmd)
 	}
@@ -93,18 +98,47 @@ func connectValkey(cfg config.Config) (valkey.Client, error) {
 	return vk, nil
 }
 
-// worker is the delivery process. Skeleton: it holds its connections and
-// waits for SIGINT/SIGTERM; the delivery loop lands with its slice.
-func worker(ctx context.Context, cfg config.Config) error {
+// worker is the delivery process: it runs until SIGINT/SIGTERM, then stops
+// claiming, drains in-flight sends for APP_SHUTDOWN_TIMEOUT and releases the
+// rest.
+func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 	vk, err := connectValkey(cfg)
 	if err != nil {
 		return err
 	}
 	defer vk.Close()
-	slog.InfoContext(ctx, "worker started", "concurrency", cfg.WorkerConcurrency)
-	<-ctx.Done()
+
+	breakers := make(map[core.Channel]*breaker.Breaker, len(core.Channels))
+	for _, ch := range core.Channels {
+		breakers[ch] = breaker.New(breaker.Config{
+			Window:       cfg.BreakerWindow,
+			MinRequests:  cfg.BreakerMinRequests,
+			FailureRatio: cfg.BreakerFailureRatio,
+			Cooldown:     cfg.BreakerCooldown,
+		}, time.Now)
+	}
+	w := delivery.New(delivery.Config{
+		Concurrency:     cfg.WorkerConcurrency,
+		MaxAttempts:     cfg.MaxAttempts,
+		RetryBase:       cfg.RetryBase,
+		RetryCap:        cfg.RetryCap,
+		Lease:           cfg.LeaseDuration,
+		ReapInterval:    cfg.ReapInterval,
+		ShutdownTimeout: cfg.ShutdownTimeout,
+		Weights:         cfg.PriorityWeights,
+	}, delivery.Deps{
+		Queue:     store.NewQueue(db),
+		Limiter:   limiter.New(vk, cfg.RateLimitPerSecond, cfg.RateLimitHeadroomPct, "ratelimit:"),
+		Sender:    provider.New(cfg.ProviderURLs, cfg.ProviderTimeout, cfg.WorkerConcurrency),
+		Publisher: noopPublisher{},
+		Breakers:  breakers,
+		Tracer:    otel.Tracer("notifier/worker"),
+	})
+	slog.InfoContext(ctx, "worker started", "concurrency", cfg.WorkerConcurrency, "weights", cfg.PriorityWeights,
+		"rate_per_second", cfg.RateLimitPerSecond, "headroom_percent", cfg.RateLimitHeadroomPct)
+	err = w.Run(ctx)
 	slog.InfoContext(context.WithoutCancel(ctx), "worker stopped")
-	return nil
+	return err
 }
 
 // noopPublisher drops status changes until the realtime slice replaces it
