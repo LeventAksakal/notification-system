@@ -12,16 +12,32 @@ import (
 type Querier interface {
 	// The only way out of pending to cancelled; a lost race changes nothing.
 	CancelNotification(ctx context.Context, id string) (int64, error)
+	// The delivery queue (decisions 0003, 0018). A claim is a lease: it sets
+	// lease_until and bumps claim_version; every later write by the claimer
+	// carries WHERE status = 'processing' AND claim_version = ?, so a worker that
+	// lost its lease changes nothing. Times are on the database clock.
+	// Runs inside a READ COMMITTED transaction. claim_idx (status, channel,
+	// priority, due_at) serves both the filter and the order, so InnoDB locks
+	// only the rows it returns; rows locked by another claimer are skipped.
+	ClaimCandidates(ctx context.Context, arg ClaimCandidatesParams) ([]ClaimCandidatesRow, error)
 	// Counts per API status (scheduled is a view of pending).
 	CountBatchByStatus(ctx context.Context, batchID sql.NullString) ([]CountBatchByStatusRow, error)
 	// Forget one key older than the retention, so it can be used again.
 	DeleteExpiredIdempotencyKey(ctx context.Context, arg DeleteExpiredIdempotencyKeyParams) (int64, error)
 	DeleteTemplate(ctx context.Context, name string) (int64, error)
+	// processing -> failed (permanent refusal or an exhausted budget).
+	FinishFailed(ctx context.Context, arg FinishFailedParams) (int64, error)
+	// processing -> pending, due again after delay_us (a retry is a stored due time, decision 0007).
+	FinishRetry(ctx context.Context, arg FinishRetryParams) (int64, error)
+	// processing -> sent.
+	FinishSent(ctx context.Context, arg FinishSentParams) (int64, error)
 	GetBatch(ctx context.Context, id string) (Batch, error)
 	GetIdempotencyKey(ctx context.Context, idemKey string) (IdempotencyKey, error)
+	GetLease(ctx context.Context, id string) (GetLeaseRow, error)
 	GetNotification(ctx context.Context, id string) (GetNotificationRow, error)
 	GetTemplate(ctx context.Context, name string) (Template, error)
 	InsertBatch(ctx context.Context, arg InsertBatchParams) error
+	InsertDeliveryAttempt(ctx context.Context, arg InsertDeliveryAttemptParams) error
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
 	// Intake: create, read, list, cancel and replay notifications; batches;
 	// idempotency keys; templates. The API status `scheduled` is computed on the
@@ -29,6 +45,8 @@ type Querier interface {
 	// rule the list filter uses.
 	// due_at is the schedule or now on the database clock; a past schedule means now.
 	InsertNotification(ctx context.Context, arg InsertNotificationParams) error
+	// pending -> processing for a row locked by ClaimCandidates in the same transaction.
+	LeaseNotification(ctx context.Context, arg LeaseNotificationParams) (int64, error)
 	// One page of a batch in request order (batch_idx); after_index -1 starts at the first item.
 	ListBatchItems(ctx context.Context, arg ListBatchItemsParams) ([]ListBatchItemsRow, error)
 	// Every id of a batch in request order; rebuilds a replayed BatchCreated.
@@ -41,6 +59,10 @@ type Querier interface {
 	ListTemplates(ctx context.Context) ([]Template, error)
 	// sqlc needs at least one query; the readiness probe can use it.
 	Ping(ctx context.Context) (int32, error)
+	// processing -> pending for leases that ran out (lease_idx). Bounded per tick.
+	ReapExpiredLeases(ctx context.Context) (int64, error)
+	// processing -> pending without an attempt (breaker open, shutdown; decision 0008).
+	ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error)
 	// A dead letter goes back to pending with a fresh attempt budget; history is kept.
 	ReplayNotification(ctx context.Context, id string) (int64, error)
 	UpsertTemplate(ctx context.Context, arg UpsertTemplateParams) error
