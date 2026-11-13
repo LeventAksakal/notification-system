@@ -75,6 +75,9 @@ func TestQueue(t *testing.T) {
 				t.Errorf("claim query key: want claim_idx, got %q", got["key"])
 			}
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("read explain: %v", err)
+		}
 	})
 
 	t.Run("concurrent claimers never get the same row", func(t *testing.T) {

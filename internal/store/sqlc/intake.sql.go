@@ -12,11 +12,14 @@ import (
 )
 
 const cancelNotification = `-- name: CancelNotification :execrows
+
 UPDATE notifications
 SET status = 'cancelled', finished_at = NOW(3)
 WHERE id = ? AND status = 'pending'
 `
 
+// ListNotifications is built in Go (store.ListNotificationsQuery): the WHERE
+// holds only the filters a request sets, so each filter keeps its index.
 // The only way out of pending to cancelled; a lost race changes nothing.
 func (q *Queries) CancelNotification(ctx context.Context, id string) (int64, error) {
 	result, err := q.db.ExecContext(ctx, cancelNotification, id)
@@ -405,102 +408,6 @@ func (q *Queries) ListDeliveryAttempts(ctx context.Context, notificationID strin
 	return items, nil
 }
 
-const listNotifications = `-- name: ListNotifications :many
-SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.failure_kind, notifications.attempts, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
-  CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
-FROM notifications
-WHERE (? IS NULL OR status = ?)
-  AND (? IS NULL
-       OR (attempts = 0 AND due_at > NOW(3)) = ?)
-  AND (? IS NULL OR channel = ?)
-  AND (? IS NULL OR batch_id = ?)
-  AND (? IS NULL OR created_at >= ?)
-  AND (? IS NULL OR created_at < ?)
-  AND (? IS NULL OR id < ?)
-ORDER BY id DESC
-LIMIT ?
-`
-
-type ListNotificationsParams struct {
-	Status        NullNotificationsStatus
-	ScheduledOnly sql.NullInt32
-	Channel       NullNotificationsChannel
-	BatchID       sql.NullString
-	CreatedFrom   sql.NullTime
-	CreatedTo     sql.NullTime
-	BeforeID      sql.NullString
-	Limit         int32
-}
-
-type ListNotificationsRow struct {
-	Notification Notification
-	IsScheduled  int64
-}
-
-// Newest first, keyset on id. scheduled_only: NULL = no view filter, 1 = only
-// scheduled, 0 = only not scheduled (combined with status = 'pending').
-func (q *Queries) ListNotifications(ctx context.Context, arg ListNotificationsParams) ([]ListNotificationsRow, error) {
-	rows, err := q.db.QueryContext(ctx, listNotifications,
-		arg.Status,
-		arg.Status,
-		arg.ScheduledOnly,
-		arg.ScheduledOnly,
-		arg.Channel,
-		arg.Channel,
-		arg.BatchID,
-		arg.BatchID,
-		arg.CreatedFrom,
-		arg.CreatedFrom,
-		arg.CreatedTo,
-		arg.CreatedTo,
-		arg.BeforeID,
-		arg.BeforeID,
-		arg.Limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []ListNotificationsRow
-	for rows.Next() {
-		var i ListNotificationsRow
-		if err := rows.Scan(
-			&i.Notification.ID,
-			&i.Notification.BatchID,
-			&i.Notification.BatchIndex,
-			&i.Notification.Recipient,
-			&i.Notification.Channel,
-			&i.Notification.Priority,
-			&i.Notification.Content,
-			&i.Notification.Status,
-			&i.Notification.FailureKind,
-			&i.Notification.Attempts,
-			&i.Notification.DueAt,
-			&i.Notification.ScheduledAt,
-			&i.Notification.LeaseUntil,
-			&i.Notification.ClaimVersion,
-			&i.Notification.ProviderMessageID,
-			&i.Notification.LastError,
-			&i.Notification.CorrelationID,
-			&i.Notification.Traceparent,
-			&i.Notification.CreatedAt,
-			&i.Notification.UpdatedAt,
-			&i.Notification.FinishedAt,
-			&i.IsScheduled,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listTemplates = `-- name: ListTemplates :many
 SELECT name, body, created_at, updated_at FROM templates ORDER BY name
 `
@@ -542,6 +449,22 @@ WHERE id = ? AND status = 'failed'
 // A dead letter goes back to pending with a fresh attempt budget; history is kept.
 func (q *Queries) ReplayNotification(ctx context.Context, id string) (int64, error) {
 	result, err := q.db.ExecContext(ctx, replayNotification, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const sweepIdempotencyKeys = `-- name: SweepIdempotencyKeys :execrows
+DELETE FROM idempotency_keys
+WHERE created_at < NOW(3) - INTERVAL ? * 1000 MICROSECOND
+LIMIT 1000
+`
+
+// Forget up to 1000 keys older than the retention, on the database clock (the
+// clock that set created_at), through idempotency_created_idx.
+func (q *Queries) SweepIdempotencyKeys(ctx context.Context, retentionMs interface{}) (int64, error) {
+	result, err := q.db.ExecContext(ctx, sweepIdempotencyKeys, retentionMs)
 	if err != nil {
 		return 0, err
 	}

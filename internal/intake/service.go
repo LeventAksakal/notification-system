@@ -102,6 +102,18 @@ const maxTxAttempts = 5
 // that the Idempotency-Key matched an earlier identical request, whose
 // notification is returned.
 func (s *Service) Create(ctx context.Context, r Request, m Meta) (n Notification, replayed bool, err error) {
+	if err := checkIdempotencyKey(m.IdempotencyKey); err != nil {
+		return Notification{}, false, err
+	}
+	// A replay answers from the stored resource before anything that reads
+	// current state (templates, the clock): the first response is the answer.
+	hash := requestHash("notification", r)
+	if id, ok, err := s.earlier(ctx, m.IdempotencyKey, hash, sqlc.IdempotencyKeysResourceKindNotification); err != nil || ok {
+		if err != nil {
+			return Notification{}, false, err
+		}
+		return s.replayed(ctx, id)
+	}
 	templates, err := s.loadTemplates(ctx, []Request{r})
 	if err != nil {
 		return Notification{}, false, err
@@ -123,20 +135,19 @@ func (s *Service) Create(ctx context.Context, r Request, m Meta) (n Notification
 		Traceparent:   sql.NullString{String: m.Traceparent, Valid: m.Traceparent != ""},
 		CreatedAt:     createdAt,
 	}
-	hash := requestHash("notification", r)
 	stored, err := s.store(ctx, m.IdempotencyKey, hash, sqlc.IdempotencyKeysResourceKindNotification, params.ID,
 		func(q *sqlc.Queries, _ *sql.Tx) error { return q.InsertNotification(ctx, params) })
 	if err != nil {
 		return Notification{}, false, err
 	}
+	if stored != params.ID {
+		return s.replayed(ctx, stored)
+	}
 	n, err = s.get(ctx, stored)
 	if err != nil {
 		return Notification{}, false, err
 	}
-	if stored != params.ID {
-		return n, true, nil
-	}
-	lctx := obs.WithNotificationID(ctx, n.ID)
+	lctx := obs.WithNotification(ctx, n.ID, n.CorrelationID)
 	slog.InfoContext(lctx, "notification accepted", "channel", a.Channel, "priority", a.Priority, "scheduled", n.Scheduled)
 	s.publish(lctx, n.Notification)
 	return n, false, nil
@@ -147,6 +158,17 @@ func (s *Service) Create(ctx context.Context, r Request, m Meta) (n Notification
 func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b BatchCreated, replayed bool, err error) {
 	if len(rs) == 0 || len(rs) > core.MaxBatchSize {
 		return BatchCreated{}, false, invalid("notifications", fmt.Sprintf("must hold 1 to %d notifications", core.MaxBatchSize))
+	}
+	if err := checkIdempotencyKey(m.IdempotencyKey); err != nil {
+		return BatchCreated{}, false, err
+	}
+	hash := requestHash("batch", rs)
+	if id, ok, err := s.earlier(ctx, m.IdempotencyKey, hash, sqlc.IdempotencyKeysResourceKindBatch); err != nil || ok {
+		if err != nil {
+			return BatchCreated{}, false, err
+		}
+		b, err = s.batchCreated(ctx, id)
+		return b, err == nil, err
 	}
 	templates, err := s.loadTemplates(ctx, rs)
 	if err != nil {
@@ -175,7 +197,6 @@ func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b Batc
 		b.NotificationIDs[i] = items[i].ID
 	}
 	meta := store.BatchMeta{BatchID: b.ID, CorrelationID: m.CorrelationID, Traceparent: m.Traceparent, CreatedAt: b.CreatedAt}
-	hash := requestHash("batch", rs)
 	stored, err := s.store(ctx, m.IdempotencyKey, hash, sqlc.IdempotencyKeysResourceKindBatch, b.ID,
 		func(q *sqlc.Queries, tx *sql.Tx) error {
 			if err := q.InsertBatch(ctx, sqlc.InsertBatchParams{
@@ -195,7 +216,7 @@ func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b Batc
 
 	slog.InfoContext(ctx, "batch accepted", "batch_id", b.ID, "total", b.Total)
 	for _, it := range items {
-		s.publishEvent(obs.WithNotificationID(ctx, it.ID), core.Event{
+		s.publishEvent(obs.WithNotification(ctx, it.ID, m.CorrelationID), core.Event{
 			NotificationID: it.ID, BatchID: b.ID, Status: core.StatusPending, At: b.CreatedAt, CorrelationID: m.CorrelationID,
 		})
 	}
@@ -243,6 +264,53 @@ func (s *Service) store(ctx context.Context, key string, hash []byte, kind sqlc.
 	}
 	return "", fmt.Errorf("store after %d attempts: %w", maxTxAttempts, last)
 }
+
+// earlier looks key up before a create does any work. ok reports a stored
+// resource for the same request, whose id is returned; a different request
+// under the key is ErrIdempotencyKeyReused. An absent or expired key (or no
+// key) lets the create go on; the insert's primary key still decides a race.
+func (s *Service) earlier(ctx context.Context, key string, hash []byte, kind sqlc.IdempotencyKeysResourceKind) (id string, ok bool, err error) {
+	if key == "" {
+		return "", false, nil
+	}
+	id, retry, err := s.replay(ctx, key, hash, kind)
+	if err != nil || retry {
+		return "", false, err
+	}
+	return id, true, nil
+}
+
+// replayed answers a create replay with the stored notification.
+func (s *Service) replayed(ctx context.Context, id string) (Notification, bool, error) {
+	n, err := s.get(ctx, id)
+	if err != nil {
+		return Notification{}, false, err
+	}
+	slog.InfoContext(obs.WithNotification(ctx, n.ID, n.CorrelationID), "notification create replayed",
+		"request_correlation_id", obs.CorrelationID(ctx))
+	return n, true, nil
+}
+
+// checkIdempotencyKey repeats the spec's rule for the header (1 to
+// MaxIdempotencyKeyLen visible ASCII characters), so a key the ASCII column
+// cannot hold is a 400, never a database error.
+func checkIdempotencyKey(key string) error {
+	if key == "" {
+		return nil
+	}
+	if len(key) > core.MaxIdempotencyKeyLen {
+		return invalid(idempotencyKeyField, fmt.Sprintf("at most %d characters", core.MaxIdempotencyKeyLen))
+	}
+	for i := range len(key) {
+		if key[i] < '!' || key[i] > '~' {
+			return invalid(idempotencyKeyField, "visible ASCII characters only, no spaces")
+		}
+	}
+	return nil
+}
+
+// idempotencyKeyField names the header in a refusal's details.
+const idempotencyKeyField = "Idempotency-Key"
 
 // replay resolves a taken key: the earlier resource when the payload is the
 // same, ErrIdempotencyKeyReused when not. retry asks the caller to try the
@@ -316,39 +384,31 @@ func (s *Service) get(ctx context.Context, id string) (Notification, error) {
 // List returns one page of notifications, newest first.
 func (s *Service) List(ctx context.Context, f Filter) (Page, error) {
 	limit := pageSize(f.Limit)
-	p := sqlc.ListNotificationsParams{Limit: int32(limit + 1)} //nolint:gosec // bounded by MaxPageSize
+	lf := store.ListFilter{
+		Channel: string(f.Channel), BatchID: f.BatchID, CreatedFrom: f.CreatedFrom, CreatedTo: f.CreatedTo, Limit: limit + 1,
+	}
 	switch f.Status {
 	case "":
 	case "scheduled", "pending":
-		p.Status = sqlc.NullNotificationsStatus{NotificationsStatus: sqlc.NotificationsStatusPending, Valid: true}
-		only := int32(0)
-		if f.Status == "scheduled" {
-			only = 1
-		}
-		p.ScheduledOnly = sql.NullInt32{Int32: only, Valid: true}
+		lf.Status = string(core.StatusPending)
+		only := f.Status == "scheduled"
+		lf.Scheduled = &only
 	default:
 		if !core.Status(f.Status).Valid() {
 			return Page{}, invalid("status", "unknown status")
 		}
-		p.Status = sqlc.NullNotificationsStatus{NotificationsStatus: sqlc.NotificationsStatus(f.Status), Valid: true}
+		lf.Status = f.Status
 	}
-	if f.Channel != "" {
-		p.Channel = sqlc.NullNotificationsChannel{NotificationsChannel: sqlc.NotificationsChannel(f.Channel), Valid: true}
-	}
-	if f.BatchID != "" {
-		p.BatchID = sql.NullString{String: f.BatchID, Valid: true}
-	}
-	p.CreatedFrom, p.CreatedTo = nullTime(f.CreatedFrom), nullTime(f.CreatedTo)
 	if f.Cursor != "" {
 		id, err := DecodeListCursor(f.Cursor)
 		if err != nil {
 			return Page{}, err
 		}
-		p.BeforeID = sql.NullString{String: id, Valid: true}
+		lf.BeforeID = id
 	}
-	rows, err := s.q.ListNotifications(ctx, p)
+	rows, err := store.ListNotifications(ctx, s.db, lf)
 	if err != nil {
-		return Page{}, fmt.Errorf("list notifications: %w", err)
+		return Page{}, err
 	}
 	page := Page{Items: make([]Notification, 0, min(len(rows), limit))}
 	for i, r := range rows {
@@ -356,7 +416,7 @@ func (s *Service) List(ctx context.Context, f Filter) (Page, error) {
 			page.NextCursor = EncodeListCursor(page.Items[limit-1].ID)
 			break
 		}
-		page.Items = append(page.Items, Notification{Notification: r.Notification, Scheduled: r.IsScheduled != 0})
+		page.Items = append(page.Items, Notification{Notification: r.Notification, Scheduled: r.IsScheduled})
 	}
 	return page, nil
 }
@@ -392,8 +452,10 @@ func (s *Service) transition(ctx context.Context, id string, from, to core.Statu
 	if err != nil {
 		return Notification{}, err
 	}
-	lctx := obs.WithNotificationID(ctx, id)
-	slog.InfoContext(lctx, msg, "from", from, "to", to)
+	// Lines about a notification carry its stored correlation id; the
+	// request's own id stays on the access line and is added here.
+	lctx := obs.WithNotification(ctx, id, n.CorrelationID)
+	slog.InfoContext(lctx, msg, "from", from, "to", to, "request_correlation_id", obs.CorrelationID(ctx))
 	s.publishEvent(lctx, core.Event{
 		NotificationID: n.ID, BatchID: n.BatchID.String, Status: to, Attempts: int(n.Attempts),
 		Error: n.LastError.String, At: n.UpdatedAt, CorrelationID: n.CorrelationID,
