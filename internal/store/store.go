@@ -64,3 +64,26 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	}
 	return nil
 }
+
+// Warm opens n pooled connections up front, so the first queries of a
+// worker do not each pay a TCP and auth handshake at once (claims that wait
+// on dials finish together and arrive at the provider as a burst).
+func Warm(ctx context.Context, db *sql.DB, n int) error {
+	conns := make([]*sql.Conn, 0, n)
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close() // back to the idle pool
+		}
+	}()
+	for range n {
+		c, err := db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("warm pool: %w", err)
+		}
+		conns = append(conns, c)
+		if err := c.PingContext(ctx); err != nil {
+			return fmt.Errorf("warm pool: %w", err)
+		}
+	}
+	return nil
+}

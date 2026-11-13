@@ -43,8 +43,14 @@ type Config struct {
 	ShutdownTimeout time.Duration // APP_SHUTDOWN_TIMEOUT
 	Weights         [3]int        // APP_PRIORITY_WEIGHTS
 	Channels        []core.Channel
+	// SendAlign is the fixed offset after a permit's grant at which its
+	// notification is sent (default 200ms; sent at once when the claim took
+	// longer). Arrivals at the provider then keep the permits' spacing
+	// whatever the claim latency, so the headroom is not eaten by database
+	// jitter. The job waits at most SendAlign: pacing, not backoff.
+	SendAlign time.Duration
 	// IdleMin and IdleMax bound the idle poll of a channel with nothing due:
-	// it starts at IdleMin and doubles up to IdleMax. Defaults 25ms and 250ms.
+	// it starts at IdleMin and doubles up to IdleMax. Defaults 50ms and 250ms.
 	IdleMin, IdleMax time.Duration
 }
 
@@ -77,7 +83,10 @@ func New(cfg Config, deps Deps) *Worker {
 		cfg.MaxAttempts = 1
 	}
 	if cfg.IdleMin <= 0 {
-		cfg.IdleMin = 25 * time.Millisecond
+		cfg.IdleMin = 50 * time.Millisecond
+	}
+	if cfg.SendAlign <= 0 {
+		cfg.SendAlign = 200 * time.Millisecond
 	}
 	if cfg.IdleMax < cfg.IdleMin {
 		cfg.IdleMax = max(250*time.Millisecond, cfg.IdleMin)
@@ -105,6 +114,9 @@ func New(cfg Config, deps Deps) *Worker {
 	deps.Breakers = breakers
 	return &Worker{cfg: cfg, deps: deps}
 }
+
+// claimsInFlight is how many claims one channel loop runs at once.
+const claimsInFlight = 4
 
 // storeTimeout bounds one result write; it is not cut short by shutdown, so a
 // finished send is always recorded when the database answers.
@@ -152,13 +164,31 @@ func (w *Worker) Run(ctx context.Context) error {
 	return err
 }
 
+// channelState is what a channel's loop and its claim tasks share.
+type channelState struct {
+	// claiming bounds the claims in flight on this channel. A permit is only
+	// taken when a claim can start, so a slow database slows permit taking
+	// instead of letting claims pile up and reach the provider together.
+	claiming chan struct{}
+
+	mu   sync.Mutex
+	sel  *selector
+	idle time.Duration // current idle poll; IdleMin while work is found
+}
+
+// channelLoop only waits for permits: it asks the breaker, takes a pool slot
+// and a permit, and hands the permit to a claim-and-send task on the pool.
+// It never waits on the database, so a permit that falls due always finds a
+// taker and the channel runs at the limiter's pace.
 func (w *Worker) channelLoop(ctx, sendCtx context.Context, ch core.Channel, br *breaker.Breaker, slots chan struct{}, inflight *sync.WaitGroup) {
-	sel := newSelector(w.cfg.Weights)
-	idle := w.cfg.IdleMin
+	st := &channelState{claiming: make(chan struct{}, claimsInFlight), sel: newSelector(w.cfg.Weights), idle: w.cfg.IdleMin}
 	limiterDown := false
 	for ctx.Err() == nil {
 		now := time.Now()
-		if at := sel.nextCheck(now); !at.IsZero() {
+		st.mu.Lock()
+		at := st.sel.nextCheck(now)
+		st.mu.Unlock()
+		if !at.IsZero() {
 			// Every priority had nothing due when last asked: no permit, no query.
 			sleep(ctx, at.Sub(now))
 			continue
@@ -173,7 +203,16 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, ch core.Channel, br *
 			br.Cancel()
 			return
 		}
-		free := func() { <-slots }
+		select {
+		case st.claiming <- struct{}{}:
+		case <-ctx.Done():
+			<-slots
+			br.Cancel()
+			return
+		}
+		var once sync.Once
+		claimed := func() { once.Do(func() { <-st.claiming }) }
+		free := func() { claimed(); <-slots }
 
 		granted, wait, err := w.deps.Limiter.Take(ctx, ch, 1)
 		if err != nil {
@@ -199,56 +238,80 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, ch core.Channel, br *
 			sleep(ctx, wait)
 			continue
 		}
-
-		job, ok, err := w.claimOne(ctx, ch, sel, idle)
-		if err != nil {
-			free()
-			br.Cancel()
-			if ctx.Err() == nil {
-				slog.ErrorContext(ctx, "claim failed", "channel", ch, "err", err)
-				sleep(ctx, w.cfg.IdleMax)
-			}
-			continue
-		}
-		if !ok {
-			free()
-			br.Cancel()
-			idle = min(idle*2, w.cfg.IdleMax)
-			continue
-		}
-		idle = w.cfg.IdleMin
-		jctx := jobContext(sendCtx, job)
-		w.publish(jctx, job, core.StatusProcessing, job.Attempts, "")
-		if ctx.Err() != nil {
-			// Shutdown between claim and send: give it back unsent.
-			w.release(jctx, job)
-			br.Cancel()
-			free()
-			return
-		}
+		sendAt := time.Now().Add(w.cfg.SendAlign)
 		inflight.Add(1)
 		go func() { // owned by Run through inflight
 			defer inflight.Done()
 			defer free()
-			w.deliver(jctx, job, br)
+			w.claimAndDeliver(ctx, sendCtx, ch, st, br, claimed, sendAt)
 		}()
 	}
 }
 
+// claimAndDeliver spends one permit: it claims one notification and sends it.
+func (w *Worker) claimAndDeliver(ctx, sendCtx context.Context, ch core.Channel, st *channelState, br *breaker.Breaker, claimed func(), sendAt time.Time) {
+	job, ok, err := w.claimOne(ctx, ch, st)
+	claimed()
+	if err != nil {
+		br.Cancel()
+		if ctx.Err() == nil {
+			slog.ErrorContext(ctx, "claim failed", "channel", ch, "err", err)
+			st.pause(time.Now().Add(w.cfg.IdleMax))
+		}
+		return
+	}
+	if !ok {
+		br.Cancel()
+		return
+	}
+	jctx := jobContext(sendCtx, job)
+	w.publish(jctx, job, core.StatusProcessing, job.Attempts, "")
+	sleep(ctx, time.Until(sendAt)) // keep the permit's spacing at the provider
+	if ctx.Err() != nil {
+		// Shutdown between claim and send: give it back unsent.
+		br.Cancel()
+		w.release(jctx, job)
+		return
+	}
+	w.deliver(jctx, job, br)
+}
+
+// pause makes the channel loop take no permit until until.
+func (st *channelState) pause(until time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for _, p := range core.Priorities {
+		st.sel.markEmpty(p, until)
+	}
+}
+
 // claimOne claims one due notification of ch for one permit, by the
-// selector's order. Priorities found empty are skipped for idle.
-func (w *Worker) claimOne(ctx context.Context, ch core.Channel, sel *selector, idle time.Duration) (core.Job, bool, error) {
+// selector's order. A priority found empty is skipped for the current idle
+// poll, which doubles while nothing at all is found.
+func (w *Worker) claimOne(ctx context.Context, ch core.Channel, st *channelState) (core.Job, bool, error) {
 	now := time.Now()
-	for _, p := range sel.order(now) {
+	st.mu.Lock()
+	order, idle := st.sel.order(now), st.idle
+	st.mu.Unlock()
+	for _, p := range order {
 		jobs, err := w.deps.Queue.Claim(ctx, ch, p, 1, w.cfg.Lease)
 		if err != nil {
 			return core.Job{}, false, err
 		}
+		st.mu.Lock()
 		if len(jobs) > 0 {
-			sel.markBusy(p)
+			st.sel.markBusy(p)
+			st.idle = w.cfg.IdleMin
+			st.mu.Unlock()
 			return jobs[0], true, nil
 		}
-		sel.markEmpty(p, now.Add(idle))
+		st.sel.markEmpty(p, now.Add(idle))
+		st.mu.Unlock()
+	}
+	if len(order) > 0 {
+		st.mu.Lock()
+		st.idle = min(st.idle*2, w.cfg.IdleMax)
+		st.mu.Unlock()
 	}
 	return core.Job{}, false, nil
 }

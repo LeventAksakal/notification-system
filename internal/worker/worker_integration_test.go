@@ -1,0 +1,188 @@
+//go:build integration
+
+package worker_test
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/valkey-io/valkey-go"
+
+	"github.com/LeventAksakal/notification-system/internal/breaker"
+	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/internal/limiter"
+	"github.com/LeventAksakal/notification-system/internal/provider"
+	"github.com/LeventAksakal/notification-system/internal/store"
+	"github.com/LeventAksakal/notification-system/internal/worker"
+	"github.com/LeventAksakal/notification-system/test/support"
+)
+
+// TestWorkersHoldTheRateAtTheProvider runs three workers in-process against
+// real MySQL, Valkey and the provider double and checks the arrival shape the
+// provider sees: at most the limit in any one-second window, and the limit used.
+func TestWorkersHoldTheRateAtTheProvider(t *testing.T) {
+	const perChannel, workers, limit = 500, 3, 100
+	_, dsn := support.MySQL(t)
+	vkAddr := support.Valkey(t)
+	purl, prov := support.Provider(t)
+
+	seed, err := store.Open(t.Context(), dsn, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = seed.Close() }()
+	to := map[core.Channel]string{core.ChannelSMS: "+905551234567", core.ChannelEmail: "a@example.com", core.ChannelPush: "device-1"}
+	for _, ch := range core.Channels {
+		var b strings.Builder
+		var args []any
+		b.WriteString("INSERT INTO notifications (id, recipient, channel, priority, content, due_at, correlation_id) VALUES ")
+		for i := range perChannel {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("(?, ?, ?, 'normal', 'hello', NOW(3), 'corr')")
+			args = append(args, uuid.Must(uuid.NewV7()).String(), to[ch], ch)
+		}
+		if _, err := seed.ExecContext(t.Context(), b.String(), args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	start := time.Now()
+	ctx, cancel := context.WithCancel(t.Context())
+	errc := make(chan error, workers)
+	urls := map[core.Channel]string{}
+	for _, ch := range core.Channels {
+		urls[ch] = purl + "/send"
+	}
+	for range workers {
+		db, err := store.Open(t.Context(), dsn, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		if err := store.Warm(t.Context(), db, 10); err != nil {
+			t.Fatal(err)
+		}
+		vk, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{vkAddr}, DisableCache: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer vk.Close()
+		brs := map[core.Channel]*breaker.Breaker{}
+		for _, ch := range core.Channels {
+			brs[ch] = breaker.New(breaker.Config{Window: 10 * time.Second, MinRequests: 10, FailureRatio: 0.5, Cooldown: 5 * time.Second}, time.Now)
+		}
+		w := worker.New(worker.Config{
+			Concurrency: 32, MaxAttempts: 5, RetryBase: 100 * time.Millisecond, RetryCap: time.Second,
+			Lease: 2 * time.Second, ReapInterval: 500 * time.Millisecond, ShutdownTimeout: 5 * time.Second,
+			Weights: [3]int{70, 20, 10},
+		}, worker.Deps{
+			Queue:    &timedQueue{Queue: store.NewQueue(db), start: start},
+			Limiter:  limiter.New(vk, limit, 3, "rate:"),
+			Sender:   provider.New(urls, 500*time.Millisecond, 32),
+			Breakers: brs,
+		})
+		go func() { errc <- w.Run(ctx) }()
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		var sent int
+		if err := seed.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM notifications WHERE status = 'sent'").Scan(&sent); err != nil {
+			t.Fatal(err)
+		}
+		if sent == perChannel*len(core.Channels) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d sent within 60s", sent)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	cancel()
+	for range workers {
+		if err := <-errc; err != nil {
+			t.Errorf("worker: %v", err)
+		}
+	}
+
+	claimMu.Lock()
+	var early, late []time.Duration
+	for _, c := range claimLog {
+		if c[0] < 300*time.Millisecond {
+			early = append(early, c[1])
+		} else {
+			late = append(late, c[1])
+		}
+	}
+	claimMu.Unlock()
+	pct := func(d []time.Duration) string {
+		if len(d) == 0 {
+			return "-"
+		}
+		slices.Sort(d)
+		return fmt.Sprintf("n=%d p50=%s p90=%s p99=%s max=%s", len(d), d[len(d)/2], d[len(d)*9/10], d[len(d)*99/100], d[len(d)-1])
+	}
+	t.Logf("claim latency first 300ms: %s; later: %s", pct(early), pct(late))
+	for _, ch := range core.Channels {
+		rs := prov.Requests(fakeprovider.Filter{Channel: string(ch)})
+		times := make([]time.Time, len(rs))
+		for i, r := range rs {
+			times[i] = r.ReceivedAt
+		}
+		slices.SortFunc(times, func(a, b time.Time) int { return a.Compare(b) })
+		busiest, at := 0, 0
+		for i := range times {
+			j, _ := slices.BinarySearchFunc(times, times[i].Add(time.Second), func(a, b time.Time) int { return a.Compare(b) })
+			if j-i > busiest {
+				busiest, at = j-i, i
+			}
+		}
+		avg := float64(len(times)-1) / times[len(times)-1].Sub(times[0]).Seconds()
+		var buckets []string
+		for k := 0; k < 15; k++ {
+			from := times[0].Add(time.Duration(k) * 100 * time.Millisecond)
+			n := 0
+			for _, x := range times {
+				if !x.Before(from) && x.Before(from.Add(100*time.Millisecond)) {
+					n++
+				}
+			}
+			buckets = append(buckets, fmt.Sprint(n))
+		}
+		t.Logf("%s: %d requests, average %.1f/s, busiest 1 s window %d starting %s after the first; per 100 ms: %s",
+			ch, len(times), avg, busiest, times[at].Sub(times[0]).Round(time.Millisecond), strings.Join(buckets, " "))
+		if busiest > limit {
+			t.Errorf("%s: %d requests in one second, limit %d", ch, busiest, limit)
+		}
+		if avg < 95 {
+			t.Errorf("%s: average %.1f/s, want at least 95", ch, avg)
+		}
+	}
+}
+
+var (
+	claimMu  sync.Mutex
+	claimLog [][2]time.Duration // since start, duration
+)
+
+type timedQueue struct {
+	core.Queue
+	start time.Time
+}
+
+func (q *timedQueue) Claim(ctx context.Context, ch core.Channel, p core.Priority, n int, lease time.Duration) ([]core.Job, error) {
+	st := time.Now()
+	jobs, err := q.Queue.Claim(ctx, ch, p, n, lease)
+	claimMu.Lock()
+	claimLog = append(claimLog, [2]time.Duration{st.Sub(q.start), time.Since(st)})
+	claimMu.Unlock()
+	return jobs, err
+}
