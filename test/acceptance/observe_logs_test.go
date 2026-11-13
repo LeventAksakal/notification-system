@@ -66,6 +66,40 @@ func TestR14CorrelationIDOnLogsAndProvider(t *testing.T) {
 		check(t, nil)
 	})
 
+	// Owner item 0006 #4, option (a): a later request about a notification (a
+	// cancel carrying its own X-Correlation-ID B) logs the notification's STORED
+	// id A in correlation_id; B may appear only as request_correlation_id.
+	t.Run("cancel with another correlation id: lines about the notification keep the stored id", func(t *testing.T) {
+		stored := "r14-stored-" + randHex(16)
+		other := "r14-cancel-" + randHex(16)
+		content := "r14-private-content-" + randHex(12)
+		contents = append(contents, content)
+		body := msg("sms", content)
+		// Scheduled hours ahead so the running worker cannot claim it before the cancel.
+		body["scheduledAt"] = time.Now().UTC().Add(3 * time.Hour).Format(time.RFC3339)
+		n := s.create(t, body, "X-Correlation-ID", stored)
+		before := len(linesAbout(s.Logs("serve"), n.ID))
+
+		r := s.postJSON(t, "/v1/notifications/"+n.ID+"/cancel", nil, "X-Correlation-ID", other)
+		if r.Status != 200 {
+			t.Fatalf("cancel: want 200, got %s", r)
+		}
+		if got := r.Header.Get("X-Correlation-ID"); got != other {
+			t.Errorf("cancel response X-Correlation-ID: want the request's %q, got %q", other, got)
+		}
+		// The cancel must log at least one line about the notification, or this
+		// case would pass on silence.
+		var about []map[string]any
+		if !poll(10*time.Second, func() bool { about = linesAbout(s.Logs("serve"), n.ID); return len(about) > before }) {
+			t.Fatalf("serve: no log line with notification_id=%s after the cancel (had %d before)", n.ID, before)
+		}
+		for _, l := range about {
+			if got := fieldString(l, "correlation_id"); got != stored {
+				t.Errorf("serve line about %s: correlation_id want the stored %q, got %q: %v", n.ID, stored, got, l)
+			}
+		}
+	})
+
 	t.Run("every line is JSON with time, level, msg and no content", func(t *testing.T) {
 		for _, role := range []string{"serve", "worker"} {
 			lines := s.LogLines(role)
