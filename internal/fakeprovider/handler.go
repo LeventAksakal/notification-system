@@ -103,11 +103,13 @@ func writeValue(w http.ResponseWriter, status int, v any) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, status, b)
+	_ = writeJSON(w, status, b) // caller left; nothing to do
 }
 
-func writeJSON(w http.ResponseWriter, status int, body []byte) {
+// writeJSON writes the response; an error means the caller left.
+func writeJSON(w http.ResponseWriter, status int, body []byte) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(body) // a write error means the caller left; nothing to do
+	_, err := w.Write(body)
+	return err
 }

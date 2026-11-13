@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	mrand "math/rand/v2"
 	"net/http"
 	"strconv"
@@ -101,18 +102,27 @@ type Filter struct {
 }
 
 // ChannelStats counts one channel's traffic.
+//
+// The sender's rate limit is judged on requests (MaxRequestsPerSecond: every
+// valid request by receive time, whatever its outcome); deliveries show what
+// got through. Both maxima are the busiest sliding window [t, t+1s).
 type ChannelStats struct {
 	Received               int         `json:"received"`
 	Deliveries             int         `json:"deliveries"`
+	MaxRequestsPerSecond   int         `json:"maxRequestsPerSecond"`
 	MaxDeliveriesPerSecond int         `json:"maxDeliveriesPerSecond"`
-	Responses              map[int]int `json:"responses"`
+	Responses              map[int]int `json:"responses"` // by status; 0 = no response sent
 }
 
 // Stats is a snapshot of everything counted since start or the last Reset.
+//
+// With dedupe on, MaxDeliveriesPerKey is at most 1 by construction, so "sent
+// once" is asserted on MaxRequestsPerKey, or with dedupe off.
 type Stats struct {
 	Dedupe                    bool                    `json:"dedupe"`
 	Channels                  map[string]ChannelStats `json:"channels"`
 	DistinctKeys              int                     `json:"distinctKeys"`
+	MaxRequestsPerKey         int                     `json:"maxRequestsPerKey"`
 	MaxDeliveriesPerKey       int                     `json:"maxDeliveriesPerKey"`
 	KeysDeliveredMoreThanOnce int                     `json:"keysDeliveredMoreThanOnce"`
 }
@@ -142,6 +152,7 @@ type Server struct {
 	// One mutex guards everything below: Go maps are not safe for concurrent
 	// writes, and handlers run on one goroutine per request.
 	mu       sync.Mutex
+	epoch    uint64 // bumped by Reset; requests begun in an older epoch are not counted
 	dedupe   bool
 	faults   []Fault
 	history  ring
@@ -150,14 +161,14 @@ type Server struct {
 }
 
 type channelState struct {
-	received, deliveries int
-	responses            map[int]int
-	window               window
+	received, deliveries      int
+	responses                 map[int]int
+	requestWin, deliveriesWin window
 }
 
 type keyState struct {
-	body       []byte
-	deliveries int
+	body                 []byte // first accepted response; nil until one is accepted
+	requests, deliveries int
 }
 
 // New returns a Server with dedupe on, no faults and an empty history.
@@ -180,6 +191,7 @@ func New(opts ...Option) *Server {
 func (s *Server) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.epoch++
 	s.dedupe = s.dedupeDefault
 	s.faults = nil
 	s.history = ring{limit: s.historyLimit}
@@ -233,9 +245,14 @@ func (s *Server) Stats() Stats {
 		for code, n := range c.responses {
 			resp[code] = n
 		}
-		st.Channels[name] = ChannelStats{c.received, c.deliveries, c.window.max, resp}
+		st.Channels[name] = ChannelStats{
+			Received: c.received, Deliveries: c.deliveries,
+			MaxRequestsPerSecond: c.requestWin.max, MaxDeliveriesPerSecond: c.deliveriesWin.max,
+			Responses: resp,
+		}
 	}
 	for _, k := range s.keys {
+		st.MaxRequestsPerKey = max(st.MaxRequestsPerKey, k.requests)
 		st.MaxDeliveriesPerKey = max(st.MaxDeliveriesPerKey, k.deliveries)
 		if k.deliveries > 1 {
 			st.KeysDeliveredMoreThanOnce++
@@ -256,7 +273,24 @@ type acceptedBody struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// deliver handles a provider request on any path.
+var errTrailing = errors.New("trailing data after the JSON object")
+
+// decodePayload reads exactly one JSON object. Unknown fields are accepted,
+// as a real provider would ignore them; bytes after the object are not.
+func decodePayload(w http.ResponseWriter, r *http.Request) (payload, error) {
+	var in payload
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := dec.Decode(&in); err != nil {
+		return in, err
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return in, errTrailing
+	}
+	return in, nil
+}
+
+// deliver handles a provider request on any path. The request is counted on
+// arrival; its response status and history entry are recorded when it ends.
 func (s *Server) deliver(w http.ResponseWriter, r *http.Request) {
 	rec := Request{
 		Path:           r.URL.Path,
@@ -264,49 +298,58 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:  r.Header.Get("X-Correlation-ID"),
 		Traceparent:    r.Header.Get("traceparent"),
 	}
-	var in payload
-	decodeErr := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in)
+	in, decodeErr := decodePayload(w, r)
 	rec.To, rec.Channel, rec.Content = in.To, in.Channel, in.Content
 
 	s.mu.Lock()
+	epoch := s.epoch
 	rec.ReceivedAt = s.now()
-	if msg := invalid(in, decodeErr); msg != "" {
+	msg := invalid(in, decodeErr)
+	s.arriveLocked(rec, msg == "")
+	if msg != "" {
 		rec.Status = http.StatusBadRequest
-		s.recordLocked(rec)
+		s.finishLocked(epoch, rec)
 		s.mu.Unlock()
 		writeError(w, http.StatusBadRequest, "invalid_request", msg)
 		return
 	}
 	fault, hit := s.pickFaultLocked(in.Channel)
-	if !hit || fault.Mode == ModeDelay {
+	switch {
+	case !hit:
+		body := s.acceptLocked(epoch, &rec)
+		rec.Status = http.StatusAccepted
+		s.finishLocked(epoch, rec)
 		s.mu.Unlock()
-		if hit && !s.wait(r.Context(), fault.DelayMS) {
-			s.record(rec) // status 0: the caller left before we answered
+		_ = writeJSON(w, http.StatusAccepted, body)
+	case fault.Mode == ModeDelay:
+		s.mu.Unlock()
+		if !s.wait(r.Context(), fault.DelayMS) {
+			s.finish(epoch, rec) // status 0: the caller left before we answered
 			return
 		}
 		s.mu.Lock()
-		body := s.acceptLocked(&rec)
+		body := s.acceptLocked(epoch, &rec)
+		rec.Status = http.StatusAccepted
+		s.finishLocked(epoch, rec)
 		s.mu.Unlock()
-		writeJSON(w, http.StatusAccepted, body)
-		return
-	}
-	switch fault.Mode {
-	case ModeStatus:
+		_ = writeJSON(w, http.StatusAccepted, body)
+	case fault.Mode == ModeStatus:
 		rec.Status = fault.Status
-		s.recordLocked(rec)
+		s.finishLocked(epoch, rec)
 		s.mu.Unlock()
 		if fault.RetryAfterSeconds > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(fault.RetryAfterSeconds))
 		}
 		writeError(w, fault.Status, "injected_fault", "fault injected by the provider double")
-	case ModeAcceptThenHang:
-		body := s.acceptLocked(&rec)
+	case fault.Mode == ModeAcceptThenHang:
+		body := s.acceptLocked(epoch, &rec) // the delivery counts now, answered or not
 		s.mu.Unlock()
-		if s.wait(r.Context(), fault.DelayMS) {
-			writeJSON(w, http.StatusAccepted, body)
+		if s.wait(r.Context(), fault.DelayMS) && writeJSON(w, http.StatusAccepted, body) == nil {
+			rec.Status = http.StatusAccepted
 		}
+		s.finish(epoch, rec) // status stays 0 if the caller left first
 	default: // ModeDrop
-		s.recordLocked(rec)
+		s.finishLocked(epoch, rec)
 		s.mu.Unlock()
 		// The server closes the connection without writing a response and
 		// does not log this sentinel panic; it is net/http's "abort" signal.
@@ -316,6 +359,8 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request) {
 
 func invalid(in payload, decodeErr error) string {
 	switch {
+	case errors.Is(decodeErr, errTrailing):
+		return "body must be one JSON object with nothing after it"
 	case decodeErr != nil:
 		return "body is not valid JSON"
 	case in.To == "" || in.Channel == "" || in.Content == "":
@@ -366,41 +411,64 @@ func (s *Server) pickFaultLocked(channel string) (Fault, bool) {
 	return Fault{}, false
 }
 
-// acceptLocked answers 202, counting a delivery unless dedupe recognises the
-// key. It records rec and returns the response body. Caller holds s.mu.
-func (s *Server) acceptLocked(rec *Request) []byte {
-	rec.Status = http.StatusAccepted
+// arriveLocked counts a request on arrival: received, and for a valid one the
+// request-rate window and its key's request count. Caller holds s.mu.
+func (s *Server) arriveLocked(rec Request, valid bool) {
+	c := s.channelLocked(rec.Channel)
+	c.received++
+	if !valid {
+		return
+	}
+	c.requestWin.add(rec.ReceivedAt)
+	if rec.IdempotencyKey != "" {
+		s.keyLocked(rec.IdempotencyKey).requests++
+	}
+}
+
+// acceptLocked returns the 202 body, counting a delivery unless dedupe
+// recognises the key or a Reset happened since the request arrived (epoch).
+// Caller holds s.mu.
+func (s *Server) acceptLocked(epoch uint64, rec *Request) []byte {
 	key := rec.IdempotencyKey
-	if k, seen := s.keys[key]; seen && key != "" && s.dedupe {
-		s.recordLocked(*rec)
+	if k := s.keys[key]; key != "" && s.dedupe && k != nil && k.body != nil && epoch == s.epoch {
 		return k.body
 	}
 	now := s.now()
 	body, _ := json.Marshal(acceptedBody{newUUID(), "accepted", now.UTC().Format(time.RFC3339)}) // cannot fail: plain strings
+	if epoch != s.epoch {
+		return body // answered, but it belongs to counters that Reset discarded
+	}
 	if key != "" {
-		k := s.keys[key]
-		if k == nil {
-			k = &keyState{body: body}
-			s.keys[key] = k
+		k := s.keyLocked(key)
+		if k.body == nil {
+			k.body = body
 		}
 		k.deliveries++
 	}
 	rec.Delivery = true
-	c := s.recordLocked(*rec)
+	c := s.channelLocked(rec.Channel)
 	c.deliveries++
-	c.window.add(now)
+	c.deliveriesWin.add(now)
 	return body
 }
 
-func (s *Server) record(rec Request) {
+func (s *Server) finish(epoch uint64, rec Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.recordLocked(rec)
+	s.finishLocked(epoch, rec)
 }
 
-// recordLocked stores rec and bumps its channel's counters. Caller holds s.mu.
-func (s *Server) recordLocked(rec Request) *channelState {
-	name := rec.Channel
+// finishLocked records rec's outcome (history and responses by status) unless
+// a Reset happened since it arrived. Caller holds s.mu.
+func (s *Server) finishLocked(epoch uint64, rec Request) {
+	if epoch != s.epoch {
+		return
+	}
+	s.channelLocked(rec.Channel).responses[rec.Status]++
+	s.history.push(rec)
+}
+
+func (s *Server) channelLocked(name string) *channelState {
 	if !validChannels[name] {
 		name = InvalidChannel
 	}
@@ -409,13 +477,19 @@ func (s *Server) recordLocked(rec Request) *channelState {
 		c = &channelState{responses: map[int]int{}}
 		s.channels[name] = c
 	}
-	c.received++
-	c.responses[rec.Status]++
-	s.history.push(rec)
 	return c
 }
 
-// window tracks the most deliveries seen in any 1-second span [t, t+1s).
+func (s *Server) keyLocked(key string) *keyState {
+	k := s.keys[key]
+	if k == nil {
+		k = &keyState{}
+		s.keys[key] = k
+	}
+	return k
+}
+
+// window tracks the most events (requests or deliveries) in any 1-second span [t, t+1s).
 // It keeps only timestamps from the last second, so memory follows the peak
 // rate, not the total.
 type window struct {
