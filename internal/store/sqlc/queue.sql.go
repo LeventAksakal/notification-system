@@ -8,6 +8,7 @@ package sqlc
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 )
 
@@ -212,16 +213,73 @@ func (q *Queries) LeaseNotification(ctx context.Context, arg LeaseNotificationPa
 	return result.RowsAffected()
 }
 
-const reapExpiredLeases = `-- name: ReapExpiredLeases :execrows
-UPDATE notifications
-SET status = 'pending', lease_until = NULL
+const reapCandidates = `-- name: ReapCandidates :many
+SELECT id, batch_id, channel, attempts, correlation_id
+FROM notifications
 WHERE status = 'processing' AND lease_until < NOW(3)
+ORDER BY lease_until
 LIMIT 1000
+FOR UPDATE SKIP LOCKED
 `
 
-// processing -> pending for leases that ran out (lease_idx). Bounded per tick.
-func (q *Queries) ReapExpiredLeases(ctx context.Context) (int64, error) {
-	result, err := q.db.ExecContext(ctx, reapExpiredLeases)
+type ReapCandidatesRow struct {
+	ID            string
+	BatchID       sql.NullString
+	Channel       NotificationsChannel
+	Attempts      uint32
+	CorrelationID string
+}
+
+// Runs inside a READ COMMITTED transaction: the expired leases (lease_idx),
+// locked so two reapers never return the same row. Bounded per tick.
+func (q *Queries) ReapCandidates(ctx context.Context) ([]ReapCandidatesRow, error) {
+	rows, err := q.db.QueryContext(ctx, reapCandidates)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ReapCandidatesRow
+	for rows.Next() {
+		var i ReapCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.BatchID,
+			&i.Channel,
+			&i.Attempts,
+			&i.CorrelationID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const reapLeases = `-- name: ReapLeases :execrows
+UPDATE notifications
+SET status = 'pending', lease_until = NULL
+WHERE id IN (/*SLICE:ids*/?) AND status = 'processing'
+`
+
+// processing -> pending for rows locked by ReapCandidates in the same transaction.
+func (q *Queries) ReapLeases(ctx context.Context, ids []string) (int64, error) {
+	query := reapLeases
+	var queryParams []interface{}
+	if len(ids) > 0 {
+		for _, v := range ids {
+			queryParams = append(queryParams, v)
+		}
+		query = strings.Replace(query, "/*SLICE:ids*/?", strings.Repeat(",?", len(ids))[1:], 1)
+	} else {
+		query = strings.Replace(query, "/*SLICE:ids*/?", "NULL", 1)
+	}
+	result, err := q.db.ExecContext(ctx, query, queryParams...)
 	if err != nil {
 		return 0, err
 	}

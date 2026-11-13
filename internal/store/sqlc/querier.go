@@ -57,8 +57,11 @@ type Querier interface {
 	ListTemplates(ctx context.Context) ([]Template, error)
 	// sqlc needs at least one query; the readiness probe can use it.
 	Ping(ctx context.Context) (int32, error)
-	// processing -> pending for leases that ran out (lease_idx). Bounded per tick.
-	ReapExpiredLeases(ctx context.Context) (int64, error)
+	// Runs inside a READ COMMITTED transaction: the expired leases (lease_idx),
+	// locked so two reapers never return the same row. Bounded per tick.
+	ReapCandidates(ctx context.Context) ([]ReapCandidatesRow, error)
+	// processing -> pending for rows locked by ReapCandidates in the same transaction.
+	ReapLeases(ctx context.Context, ids []string) (int64, error)
 	// processing -> pending without an attempt (breaker open, shutdown; decision 0008).
 	ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error)
 	// A dead letter goes back to pending with a fresh attempt budget; history is kept.

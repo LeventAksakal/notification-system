@@ -59,18 +59,35 @@ type Queue interface {
 	// shutdown), so no attempt is burned (decision 0008).
 	Release(ctx context.Context, job Job, dueAt time.Time) error
 	// ReapExpired returns notifications whose lease ran out to pending and
-	// reports how many (decision 0018).
-	ReapExpired(ctx context.Context) (int, error)
+	// reports them, so the caller can publish the change (decision 0018). Of
+	// each Job only ID, BatchID, Channel, Attempts and CorrelationID are set.
+	ReapExpired(ctx context.Context) ([]Job, error)
+}
+
+// Grant is a reservation of consecutive send slots on one channel.
+type Grant struct {
+	// N is how many slots were reserved; 0 when none is available yet.
+	N int
+	// First is how long from now until the first slot; slot i is due at
+	// First + i*Interval. A slot is the moment its request may leave.
+	First time.Duration
+	// Interval is the spacing between slots: one second divided by the paced rate.
+	Interval time.Duration
+	// Wait is how long until asking again can reserve something; set when N
+	// is less than what was asked for.
+	Wait time.Duration
 }
 
 // Limiter is the send-rate limit shared by every worker (decision 0009). Its
-// state and its clock live in Valkey.
+// state and its clock live in Valkey. It hands out send slots spaced one
+// interval apart across all workers, so the provider sees an even stream
+// whatever the workers' own timing is.
 type Limiter interface {
-	// Take asks for up to n send permits on a channel and returns how many
-	// were granted now. When fewer than n were granted, wait is how long until
-	// the next permit can be had. An error means the limiter is unreachable:
-	// the caller sends nothing (fail closed).
-	Take(ctx context.Context, channel Channel, n int) (granted int, wait time.Duration, err error)
+	// Take reserves up to n consecutive send slots on a channel, none further
+	// ahead than the limiter's horizon. A slot that is not used is lost; a
+	// request must never leave before its slot. An error means the limiter is
+	// unreachable: the caller sends nothing (fail closed).
+	Take(ctx context.Context, channel Channel, n int) (Grant, error)
 }
 
 // Event is one committed status change, as subscribers see it (decision 0013).
