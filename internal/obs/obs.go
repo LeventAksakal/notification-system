@@ -22,13 +22,15 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // Setup installs the global logger and OTel providers. The returned func
 // flushes and stops them; call it on shutdown with a bounded context.
 func Setup(ctx context.Context, service, endpoint string, level slog.Level) (func(context.Context) error, error) {
-	stdout := traceIDHandler{slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})}
+	stdout := contextHandler{slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})}
+	// The W3C propagator is installed even without an exporter: an incoming
+	// traceparent then still reaches the request context and the stored row.
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 	if endpoint == "" {
 		slog.SetDefault(slog.New(stdout))
 		return func(context.Context) error { return nil }, nil
@@ -57,32 +59,13 @@ func Setup(ctx context.Context, service, endpoint string, level slog.Level) (fun
 	otel.SetTracerProvider(tp)
 	otel.SetMeterProvider(mp)
 	otel.SetLoggerProvider(lp)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
 	bridge := otelslog.NewHandler(service, otelslog.WithLoggerProvider(lp))
-	slog.SetDefault(slog.New(slog.NewMultiHandler(stdout, levelFilter{bridge, level})))
+	slog.SetDefault(slog.New(slog.NewMultiHandler(stdout, levelFilter{contextHandler{bridge}, level})))
 
 	return func(ctx context.Context) error {
 		return errors.Join(tp.Shutdown(ctx), mp.Shutdown(ctx), lp.Shutdown(ctx))
 	}, nil
-}
-
-// traceIDHandler adds trace_id and span_id to every record logged with a
-// context that carries a span.
-type traceIDHandler struct{ slog.Handler }
-
-func (h traceIDHandler) Handle(ctx context.Context, r slog.Record) error {
-	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
-		r.AddAttrs(slog.String("trace_id", sc.TraceID().String()), slog.String("span_id", sc.SpanID().String()))
-	}
-	return h.Handler.Handle(ctx, r)
-}
-
-func (h traceIDHandler) WithAttrs(as []slog.Attr) slog.Handler {
-	return traceIDHandler{h.Handler.WithAttrs(as)}
-}
-func (h traceIDHandler) WithGroup(n string) slog.Handler {
-	return traceIDHandler{h.Handler.WithGroup(n)}
 }
 
 // levelFilter applies the configured level to the OTLP bridge, which has none.
