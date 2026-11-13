@@ -2,6 +2,7 @@ package fakeprovider_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -98,6 +99,10 @@ func TestProviderAcceptsTheContractAndRejectsEverythingElse(t *testing.T) {
 		{"empty content", `{"to":"+90","channel":"sms","content":""}`, http.StatusBadRequest},
 		{"missing channel", `{"to":"+90","content":"x"}`, http.StatusBadRequest},
 		{"invalid JSON", `{"to":`, http.StatusBadRequest},
+		{"trailing bytes after the object", sms + `x`, http.StatusBadRequest},
+		{"a second object after the first", sms + sms, http.StatusBadRequest},
+		{"trailing whitespace is fine", sms + "\n", http.StatusAccepted},
+		{"unknown fields are ignored", `{"to":"+90","channel":"sms","content":"x","extra":1}`, http.StatusAccepted},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -419,5 +424,171 @@ func getJSON(t *testing.T, url string, v any) {
 	defer func() { _ = res.Body.Close() }()
 	if err := json.NewDecoder(res.Body).Decode(v); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// R8: the sender's rate is judged on requests; deliveries show what got through.
+func TestRequestWindowCountsEveryValidRequestWhateverItsOutcome(t *testing.T) {
+	cases := []struct {
+		name                   string
+		faults                 []fakeprovider.Fault
+		sends                  []string // "channel:key"
+		wantRequestsPerSecond  map[string]int
+		wantDeliveriesPerSec   map[string]int
+		wantMaxRequestsPerKey  int
+		wantMaxDeliveriesByKey int
+	}{
+		{"dedupe hit raises requests, not deliveries", nil,
+			[]string{"sms:k", "sms:k", "sms:k"}, map[string]int{"sms": 3}, map[string]int{"sms": 1}, 3, 1},
+		{"injected 503 raises requests, not deliveries",
+			[]fakeprovider.Fault{{Mode: fakeprovider.ModeStatus, Status: 503, Count: 2}},
+			[]string{"sms:a", "sms:a", "sms:a"}, map[string]int{"sms": 3}, map[string]int{"sms": 1}, 3, 1},
+		{"channels are counted separately", nil,
+			[]string{"sms:", "email:", "sms:", "push:"}, map[string]int{"sms": 2, "email": 1, "push": 1}, map[string]int{"sms": 2, "email": 1, "push": 1}, 0, 0},
+		{"invalid requests are not in the window", nil,
+			[]string{"fax:x", "sms:x"}, map[string]int{"sms": 1}, map[string]int{"sms": 1}, 1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, url, _ := start(t)
+			if err := s.SetFaults(tc.faults); err != nil {
+				t.Fatal(err)
+			}
+			for _, sd := range tc.sends {
+				ch, key, _ := strings.Cut(sd, ":")
+				send(t, nil, http.MethodPost, url, msg(ch), "Idempotency-Key", key)
+			}
+			st := s.Stats()
+			for ch, want := range tc.wantRequestsPerSecond {
+				if got := st.Channels[ch]; got.MaxRequestsPerSecond != want || got.MaxDeliveriesPerSecond != tc.wantDeliveriesPerSec[ch] {
+					t.Errorf("%s: requests/s %d deliveries/s %d, want %d and %d", ch, got.MaxRequestsPerSecond, got.MaxDeliveriesPerSecond, want, tc.wantDeliveriesPerSec[ch])
+				}
+			}
+			if st.MaxRequestsPerKey != tc.wantMaxRequestsPerKey || st.MaxDeliveriesPerKey != tc.wantMaxDeliveriesByKey {
+				t.Errorf("per key: requests %d deliveries %d", st.MaxRequestsPerKey, st.MaxDeliveriesPerKey)
+			}
+		})
+	}
+}
+
+// B1: a request that ends without a response is recorded with status 0, and
+// only accept_then_hang counts it as delivered (once).
+func TestRequestsWithoutAResponseAreRecordedAsStatusZero(t *testing.T) {
+	cases := []struct {
+		name         string
+		fault        fakeprovider.Fault
+		wantDelivery bool
+	}{
+		{"drop", fakeprovider.Fault{Mode: fakeprovider.ModeDrop}, false},
+		{"delay cancelled by the caller", fakeprovider.Fault{Mode: fakeprovider.ModeDelay, DelayMS: 60_000}, false},
+		{"accept then hang, caller left", fakeprovider.Fault{Mode: fakeprovider.ModeAcceptThenHang, DelayMS: 60_000}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, url, _ := start(t)
+			if err := s.SetFaults([]fakeprovider.Fault{tc.fault}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			ended := make(chan error, 1)
+			go func() { ended <- post(ctx, url) }()
+			waitFor(t, func() bool { return s.Stats().Channels["sms"].Received == 1 })
+			cancel() // no-op for drop, which has already ended
+			select {
+			case err := <-ended:
+				if err == nil {
+					t.Fatal("caller got a response, want none")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("request did not end after the caller left")
+			}
+			// The handler finishes after the caller sees the error; wait for its record.
+			waitFor(t, func() bool { return len(s.Requests(fakeprovider.Filter{})) == 1 })
+			rec := s.Requests(fakeprovider.Filter{})[0]
+			st := s.Stats().Channels["sms"]
+			if rec.Status != 0 || rec.Delivery != tc.wantDelivery || st.Responses[0] != 1 || len(st.Responses) != 1 {
+				t.Errorf("record %+v, responses %v", rec, st.Responses)
+			}
+			if want := map[bool]int{true: 1, false: 0}[tc.wantDelivery]; st.Deliveries != want {
+				t.Errorf("deliveries %d, want %d", st.Deliveries, want)
+			}
+		})
+	}
+}
+
+func TestResponsesAreCountedByStatus(t *testing.T) {
+	s, url, _ := start(t)
+	if err := s.SetFaults([]fakeprovider.Fault{
+		{Mode: fakeprovider.ModeStatus, Status: 503, Count: 1},
+		{Mode: fakeprovider.ModeDrop, Count: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		_ = post(t.Context(), url)
+	}
+	want := map[int]int{503: 1, 0: 1, 202: 1}
+	got := s.Stats().Channels["sms"].Responses
+	if len(got) != len(want) || got[503] != 1 || got[0] != 1 || got[202] != 1 {
+		t.Errorf("responses %v, want %v", got, want)
+	}
+}
+
+// A request in flight across a Reset is answered but lands in no counter.
+func TestResetDuringADelayDoesNotCountTheOldRequest(t *testing.T) {
+	s, url, _ := start(t)
+	if err := s.SetFaults([]fakeprovider.Fault{{Mode: fakeprovider.ModeDelay, DelayMS: 300, Count: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan sent, 1)
+	go func() {
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, url, strings.NewReader(sms))
+		req.Header.Set("Idempotency-Key", "old")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			done <- sent{err: err}
+			return
+		}
+		_ = res.Body.Close()
+		done <- sent{status: res.StatusCode}
+	}()
+	waitFor(t, func() bool { return s.Stats().Channels["sms"].Received == 1 })
+	s.Reset()
+	select {
+	case got := <-done:
+		if got.err != nil || got.status != http.StatusAccepted {
+			t.Fatalf("delayed request: %d %v, want 202", got.status, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("delayed request never answered")
+	}
+	if st := s.Stats(); len(st.Channels) != 0 || st.DistinctKeys != 0 || len(s.Requests(fakeprovider.Filter{})) != 0 {
+		t.Errorf("post-reset state holds the old request: %+v", st)
+	}
+}
+
+func post(ctx context.Context, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(sms))
+	if err != nil {
+		return err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	return res.Body.Close()
+}
+
+// waitFor polls cond for up to 2 s: a bounded wait on an observable outcome,
+// not a fixed sleep before an assertion.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met within 2s")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

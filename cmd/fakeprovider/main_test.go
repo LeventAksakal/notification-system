@@ -70,15 +70,15 @@ func TestShutdownEndsHungRequestsAndLeaksNothing(t *testing.T) {
 			_ = res.Body.Close()
 		}
 	}()
-	waitFor(t, func() bool { // the hung request has been accepted and recorded
-		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/_control/requests", nil)
+	waitFor(t, func() bool { // the hung request has been accepted (counted as a delivery)
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/_control/stats", nil)
 		res, err := client.Do(req)
 		if err != nil {
 			return false
 		}
 		defer func() { _ = res.Body.Close() }()
 		b, _ := io.ReadAll(res.Body)
-		return strings.Contains(string(b), `"delivery":true`)
+		return strings.Contains(string(b), `"deliveries":1`)
 	})
 	cancel()
 	select {
