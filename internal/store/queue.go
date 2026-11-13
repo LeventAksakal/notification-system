@@ -66,15 +66,21 @@ func (s *Queue) claimOnce(ctx context.Context, channel core.Channel, priority co
 	if len(rows) == 0 {
 		return nil, nil
 	}
+	ids := make([]string, len(rows))
+	for i, r := range rows {
+		ids[i] = r.ID
+	}
+	affected, err := q.LeaseNotifications(ctx, sqlc.LeaseNotificationsParams{LeaseUs: lease.Microseconds(), Ids: ids})
+	if err != nil {
+		return nil, fmt.Errorf("claim: lease: %w", err)
+	}
+	if affected != int64(len(ids)) {
+		// Cannot happen while the row locks are held; never report a lease
+		// that was not taken.
+		return nil, fmt.Errorf("claim: %d of %d locked rows leased", affected, len(ids))
+	}
 	jobs := make([]core.Job, 0, len(rows))
 	for _, r := range rows {
-		affected, err := q.LeaseNotification(ctx, sqlc.LeaseNotificationParams{LeaseUs: lease.Microseconds(), ID: r.ID})
-		if err != nil {
-			return nil, fmt.Errorf("claim: lease %s: %w", r.ID, err)
-		}
-		if affected == 0 {
-			continue // cannot happen while the row lock is held; never lease what did not change
-		}
 		jobs = append(jobs, core.Job{
 			ID:       r.ID,
 			BatchID:  r.BatchID.String,
