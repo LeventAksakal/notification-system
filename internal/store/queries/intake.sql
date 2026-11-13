@@ -26,22 +26,8 @@ WHERE id = ?;
 -- Oldest first (attempts_notification_idx).
 SELECT * FROM delivery_attempts WHERE notification_id = ? ORDER BY id;
 
--- name: ListNotifications :many
--- Newest first, keyset on id. scheduled_only: NULL = no view filter, 1 = only
--- scheduled, 0 = only not scheduled (combined with status = 'pending').
-SELECT sqlc.embed(notifications),
-  CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
-FROM notifications
-WHERE (sqlc.narg(status) IS NULL OR status = sqlc.narg(status))
-  AND (sqlc.narg(scheduled_only) IS NULL
-       OR (attempts = 0 AND due_at > NOW(3)) = sqlc.narg(scheduled_only))
-  AND (sqlc.narg(channel) IS NULL OR channel = sqlc.narg(channel))
-  AND (sqlc.narg(batch_id) IS NULL OR batch_id = sqlc.narg(batch_id))
-  AND (sqlc.narg(created_from) IS NULL OR created_at >= sqlc.narg(created_from))
-  AND (sqlc.narg(created_to) IS NULL OR created_at < sqlc.narg(created_to))
-  AND (sqlc.narg(before_id) IS NULL OR id < sqlc.narg(before_id))
-ORDER BY id DESC
-LIMIT ?;
+-- ListNotifications is built in Go (store.ListNotificationsQuery): the WHERE
+-- holds only the filters a request sets, so each filter keeps its index.
 
 -- name: CancelNotification :execrows
 -- The only way out of pending to cancelled; a lost race changes nothing.
@@ -89,6 +75,13 @@ SELECT * FROM idempotency_keys WHERE idem_key = ?;
 -- name: DeleteExpiredIdempotencyKey :execrows
 -- Forget one key older than the retention, so it can be used again.
 DELETE FROM idempotency_keys WHERE idem_key = ? AND created_at < ?;
+
+-- name: SweepIdempotencyKeys :execrows
+-- Forget up to 1000 keys older than the retention, on the database clock (the
+-- clock that set created_at), through idempotency_created_idx.
+DELETE FROM idempotency_keys
+WHERE created_at < NOW(3) - INTERVAL sqlc.arg(retention_ms) * 1000 MICROSECOND
+LIMIT 1000;
 
 -- name: UpsertTemplate :exec
 INSERT INTO templates (name, body) VALUES (?, ?)
