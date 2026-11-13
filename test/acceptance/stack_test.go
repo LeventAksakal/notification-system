@@ -5,6 +5,8 @@ package acceptance
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -50,8 +52,11 @@ func TestD4SpecAndDocsAreServed(t *testing.T) {
 			t.Errorf("/openapi.json lacks path %s", p)
 		}
 	}
-	if info, _ := spec["info"].(map[string]any); info["version"] != "1.0.0" {
-		t.Errorf("/openapi.json info.version: want 1.0.0, got %v", info["version"])
+	// The served spec is the repository's spec (owner item 0008, option a): its
+	// info.version equals the one in api/openapi.yaml, whatever that is now.
+	want := specVersionOnDisk(t)
+	if info, _ := spec["info"].(map[string]any); info["version"] != want {
+		t.Errorf("/openapi.json info.version: want %q (api/openapi.yaml), got %v", want, info["version"])
 	}
 
 	d := s.getJSON(t, "/docs")
@@ -64,6 +69,30 @@ func TestD4SpecAndDocsAreServed(t *testing.T) {
 	if !strings.Contains(strings.ToLower(string(d.Body)), "<html") {
 		t.Errorf("GET /docs is not an HTML page: %s", truncate(d.Body))
 	}
+}
+
+// specVersionOnDisk reads info.version from api/openapi.yaml: the first
+// indented `version:` line inside the top-level `info:` block.
+func specVersionOnDisk(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(repoRoot, "api", "openapi.yaml"))
+	if err != nil {
+		t.Fatalf("read api/openapi.yaml: %v", err)
+	}
+	inInfo := false
+	for _, line := range strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n") {
+		top := line != "" && line[0] != ' ' && line[0] != '#'
+		switch {
+		case top:
+			inInfo = strings.HasPrefix(line, "info:")
+		case inInfo:
+			if v, ok := strings.CutPrefix(strings.TrimSpace(line), "version:"); ok {
+				return strings.Trim(strings.TrimSpace(v), `"'`)
+			}
+		}
+	}
+	t.Fatalf("api/openapi.yaml: no info.version found")
+	return ""
 }
 
 // D5: Database migrations: versioned schema changes
