@@ -5,3 +5,7 @@ generate:
   strict-server: true
   models: true
   embedded-spec: true
+output-options:
+  # GET /v1/ws upgrades to a WebSocket; it is mounted outside the generated,
+  # validated routes (docs/briefs/CONTRACT.md).
+  exclude-operation-ids: [streamEvents]

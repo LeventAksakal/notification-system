@@ -9,9 +9,8 @@ import (
 )
 
 type Querier interface {
-	GetMeta(ctx context.Context, k string) (AppMetum, error)
-	// sqlc's MySQL parser rejects the 8.0.19 row alias (AS new), so the value is bound twice.
-	UpsertMeta(ctx context.Context, arg UpsertMetaParams) error
+	// sqlc needs at least one query; the readiness probe can use it.
+	Ping(ctx context.Context) (int32, error)
 }
 
 var _ Querier = (*Queries)(nil)

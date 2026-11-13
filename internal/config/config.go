@@ -8,8 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/LeventAksakal/notification-system/internal/core"
 )
 
 // Config is the typed, validated set of dials.
@@ -23,7 +27,30 @@ type Config struct {
 	DBMaxOpenConns    int
 	ReadHeaderTimeout time.Duration
 	ShutdownTimeout   time.Duration
+
+	// ProviderURLs holds the provider endpoint of each channel.
+	ProviderURLs    map[core.Channel]string
+	ProviderTimeout time.Duration
+	MaxAttempts     int
+	RetryBase       time.Duration
+	RetryCap        time.Duration
+
+	RateLimitPerSecond   int
+	RateLimitHeadroomPct int
+	PriorityWeights      [3]int // high, normal, low
+	LeaseDuration        time.Duration
+	ReapInterval         time.Duration
+	WorkerConcurrency    int
+	BreakerWindow        time.Duration
+	BreakerMinRequests   int
+	BreakerFailureRatio  float64
+	BreakerCooldown      time.Duration
+	IdempotencyRetention time.Duration
+	WSSendBuffer         int
 }
+
+// ProviderURL returns the provider endpoint for a channel.
+func (c Config) ProviderURL(ch core.Channel) string { return c.ProviderURLs[ch] }
 
 // Dial describes one environment variable.
 type Dial struct {
@@ -51,12 +78,50 @@ var Dials = []Dial{
 		func(c *Config) *time.Duration { return &c.ReadHeaderTimeout }),
 	duration("APP_SHUTDOWN_TIMEOUT", "10s", "grace period for in-flight requests on SIGTERM", time.Second, 2*time.Minute,
 		func(c *Config) *time.Duration { return &c.ShutdownTimeout }),
+
+	providerURL("APP_PROVIDER_URL_SMS", core.ChannelSMS),
+	providerURL("APP_PROVIDER_URL_EMAIL", core.ChannelEmail),
+	providerURL("APP_PROVIDER_URL_PUSH", core.ChannelPush),
+	duration("APP_PROVIDER_TIMEOUT", "5s", "time limit of one provider call", 10*time.Millisecond, time.Minute,
+		func(c *Config) *time.Duration { return &c.ProviderTimeout }),
+	integer("APP_MAX_ATTEMPTS", "5", "provider calls before a notification fails as exhausted", 1, 50,
+		func(c *Config) *int { return &c.MaxAttempts }),
+	duration("APP_RETRY_BASE", "1s", "backoff base; attempt n waits random(0, min(cap, base*2^n))", time.Millisecond, time.Minute,
+		func(c *Config) *time.Duration { return &c.RetryBase }),
+	duration("APP_RETRY_CAP", "5m", "backoff cap; at least APP_RETRY_BASE", time.Millisecond, 24*time.Hour,
+		func(c *Config) *time.Duration { return &c.RetryCap }),
+	integer("APP_RATE_LIMIT_PER_SECOND", "100", "provider's send limit per channel, per second", 1, 100_000,
+		func(c *Config) *int { return &c.RateLimitPerSecond }),
+	integer("APP_RATE_LIMIT_HEADROOM_PERCENT", "3",
+		"the limiter paces this many percent under the limit, so arrival jitter cannot exceed it at the provider", 0, 50,
+		func(c *Config) *int { return &c.RateLimitHeadroomPct }),
+	{Env: "APP_PRIORITY_WEIGHTS", Default: "70,20,10",
+		Doc:   "high,normal,low shares of a channel's rate; each [0..100], sum above 0; unused share is borrowed",
+		apply: func(c *Config, raw string) error { return parseWeights(raw, &c.PriorityWeights) }},
+	duration("APP_LEASE_DURATION", "30s", "how long a claimed notification belongs to its worker", 100*time.Millisecond, time.Hour,
+		func(c *Config) *time.Duration { return &c.LeaseDuration }),
+	duration("APP_REAP_INTERVAL", "5s", "how often expired leases are returned to pending", 10*time.Millisecond, 10*time.Minute,
+		func(c *Config) *time.Duration { return &c.ReapInterval }),
+	integer("APP_WORKER_CONCURRENCY", "32", "provider calls in flight per worker process", 1, 1024,
+		func(c *Config) *int { return &c.WorkerConcurrency }),
+	duration("APP_BREAKER_WINDOW", "10s", "window the breaker's failure ratio is measured over", 100*time.Millisecond, 10*time.Minute,
+		func(c *Config) *time.Duration { return &c.BreakerWindow }),
+	integer("APP_BREAKER_MIN_REQUESTS", "10", "calls in the window before the failure ratio counts", 1, 10_000,
+		func(c *Config) *int { return &c.BreakerMinRequests }),
+	ratio("APP_BREAKER_FAILURE_RATIO", "0.5", "the breaker opens at or above this failure ratio", 0.01, 1,
+		func(c *Config) *float64 { return &c.BreakerFailureRatio }),
+	duration("APP_BREAKER_COOLDOWN", "5s", "open time before one half-open probe", 10*time.Millisecond, 10*time.Minute,
+		func(c *Config) *time.Duration { return &c.BreakerCooldown }),
+	duration("APP_IDEMPOTENCY_RETENTION", "24h", "how long an Idempotency-Key is remembered", time.Second, 30*24*time.Hour,
+		func(c *Config) *time.Duration { return &c.IdempotencyRetention }),
+	integer("APP_WS_SEND_BUFFER", "256", "events buffered per WebSocket subscriber before it is dropped", 1, 65_536,
+		func(c *Config) *int { return &c.WSSendBuffer }),
 }
 
 // Load reads every dial through getenv (os.Getenv in main, a map in tests)
 // and returns all problems at once.
 func Load(getenv func(string) string) (Config, error) {
-	var c Config
+	c := Config{ProviderURLs: make(map[core.Channel]string, len(core.Channels))}
 	var errs []error
 	for _, d := range Dials {
 		raw := getenv(d.Env)
@@ -71,7 +136,60 @@ func Load(getenv func(string) string) (Config, error) {
 			errs = append(errs, fmt.Errorf("%s: %w", d.Env, err))
 		}
 	}
+	if len(errs) == 0 && c.RetryCap < c.RetryBase {
+		errs = append(errs, fmt.Errorf("APP_RETRY_CAP %s is below APP_RETRY_BASE %s", c.RetryCap, c.RetryBase))
+	}
 	return c, errors.Join(errs...)
+}
+
+func providerURL(env string, ch core.Channel) Dial {
+	return Dial{Env: env, Default: "http://localhost:8090/send", Doc: "provider endpoint for " + string(ch) + " (http or https URL)",
+		apply: func(c *Config, raw string) error {
+			u, err := url.Parse(raw)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				return fmt.Errorf("not an http(s) URL: %q", raw)
+			}
+			c.ProviderURLs[ch] = raw
+			return nil
+		}}
+}
+
+func ratio(env, def, doc string, lo, hi float64, field func(*Config) *float64) Dial {
+	return Dial{Env: env, Default: def, Doc: fmt.Sprintf("%s [%g..%g]", doc, lo, hi),
+		apply: func(c *Config, raw string) error {
+			v, err := strconv.ParseFloat(raw, 64)
+			if err != nil {
+				return fmt.Errorf("not a number: %q", raw)
+			}
+			if v < lo || v > hi {
+				return fmt.Errorf("%g outside [%g..%g]", v, lo, hi)
+			}
+			*field(c) = v
+			return nil
+		}}
+}
+
+// parseWeights reads "high,normal,low": three integers in [0..100], sum above 0.
+func parseWeights(raw string, out *[3]int) error {
+	parts := strings.Split(raw, ",")
+	if len(parts) != 3 {
+		return fmt.Errorf("want three comma-separated weights (high,normal,low), got %q", raw)
+	}
+	var w [3]int
+	sum := 0
+	for i, p := range parts {
+		v, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil || v < 0 || v > 100 {
+			return fmt.Errorf("weight %q is not an integer in [0..100]", p)
+		}
+		w[i] = v
+		sum += v
+	}
+	if sum == 0 {
+		return errors.New("weights sum to 0")
+	}
+	*out = w
+	return nil
 }
 
 func text(env, def, doc string, field func(*Config) *string) Dial {

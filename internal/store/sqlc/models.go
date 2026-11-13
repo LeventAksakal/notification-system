@@ -5,11 +5,368 @@
 package sqlc
 
 import (
+	"database/sql"
+	"database/sql/driver"
+	"fmt"
 	"time"
 )
 
-type AppMetum struct {
-	K         string
-	V         string
+type DeliveryAttemptsChannel string
+
+const (
+	DeliveryAttemptsChannelSms   DeliveryAttemptsChannel = "sms"
+	DeliveryAttemptsChannelEmail DeliveryAttemptsChannel = "email"
+	DeliveryAttemptsChannelPush  DeliveryAttemptsChannel = "push"
+)
+
+func (e *DeliveryAttemptsChannel) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = DeliveryAttemptsChannel(s)
+	case string:
+		*e = DeliveryAttemptsChannel(s)
+	default:
+		return fmt.Errorf("unsupported scan type for DeliveryAttemptsChannel: %T", src)
+	}
+	return nil
+}
+
+type NullDeliveryAttemptsChannel struct {
+	DeliveryAttemptsChannel DeliveryAttemptsChannel
+	Valid                   bool // Valid is true if DeliveryAttemptsChannel is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullDeliveryAttemptsChannel) Scan(value interface{}) error {
+	if value == nil {
+		ns.DeliveryAttemptsChannel, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.DeliveryAttemptsChannel.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullDeliveryAttemptsChannel) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.DeliveryAttemptsChannel), nil
+}
+
+type DeliveryAttemptsOutcome string
+
+const (
+	DeliveryAttemptsOutcomeAccepted  DeliveryAttemptsOutcome = "accepted"
+	DeliveryAttemptsOutcomeTransient DeliveryAttemptsOutcome = "transient"
+	DeliveryAttemptsOutcomePermanent DeliveryAttemptsOutcome = "permanent"
+)
+
+func (e *DeliveryAttemptsOutcome) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = DeliveryAttemptsOutcome(s)
+	case string:
+		*e = DeliveryAttemptsOutcome(s)
+	default:
+		return fmt.Errorf("unsupported scan type for DeliveryAttemptsOutcome: %T", src)
+	}
+	return nil
+}
+
+type NullDeliveryAttemptsOutcome struct {
+	DeliveryAttemptsOutcome DeliveryAttemptsOutcome
+	Valid                   bool // Valid is true if DeliveryAttemptsOutcome is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullDeliveryAttemptsOutcome) Scan(value interface{}) error {
+	if value == nil {
+		ns.DeliveryAttemptsOutcome, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.DeliveryAttemptsOutcome.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullDeliveryAttemptsOutcome) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.DeliveryAttemptsOutcome), nil
+}
+
+type IdempotencyKeysResourceKind string
+
+const (
+	IdempotencyKeysResourceKindNotification IdempotencyKeysResourceKind = "notification"
+	IdempotencyKeysResourceKindBatch        IdempotencyKeysResourceKind = "batch"
+)
+
+func (e *IdempotencyKeysResourceKind) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = IdempotencyKeysResourceKind(s)
+	case string:
+		*e = IdempotencyKeysResourceKind(s)
+	default:
+		return fmt.Errorf("unsupported scan type for IdempotencyKeysResourceKind: %T", src)
+	}
+	return nil
+}
+
+type NullIdempotencyKeysResourceKind struct {
+	IdempotencyKeysResourceKind IdempotencyKeysResourceKind
+	Valid                       bool // Valid is true if IdempotencyKeysResourceKind is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullIdempotencyKeysResourceKind) Scan(value interface{}) error {
+	if value == nil {
+		ns.IdempotencyKeysResourceKind, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.IdempotencyKeysResourceKind.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullIdempotencyKeysResourceKind) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.IdempotencyKeysResourceKind), nil
+}
+
+type NotificationsChannel string
+
+const (
+	NotificationsChannelSms   NotificationsChannel = "sms"
+	NotificationsChannelEmail NotificationsChannel = "email"
+	NotificationsChannelPush  NotificationsChannel = "push"
+)
+
+func (e *NotificationsChannel) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = NotificationsChannel(s)
+	case string:
+		*e = NotificationsChannel(s)
+	default:
+		return fmt.Errorf("unsupported scan type for NotificationsChannel: %T", src)
+	}
+	return nil
+}
+
+type NullNotificationsChannel struct {
+	NotificationsChannel NotificationsChannel
+	Valid                bool // Valid is true if NotificationsChannel is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullNotificationsChannel) Scan(value interface{}) error {
+	if value == nil {
+		ns.NotificationsChannel, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.NotificationsChannel.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullNotificationsChannel) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.NotificationsChannel), nil
+}
+
+type NotificationsFailureKind string
+
+const (
+	NotificationsFailureKindPermanent NotificationsFailureKind = "permanent"
+	NotificationsFailureKindExhausted NotificationsFailureKind = "exhausted"
+)
+
+func (e *NotificationsFailureKind) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = NotificationsFailureKind(s)
+	case string:
+		*e = NotificationsFailureKind(s)
+	default:
+		return fmt.Errorf("unsupported scan type for NotificationsFailureKind: %T", src)
+	}
+	return nil
+}
+
+type NullNotificationsFailureKind struct {
+	NotificationsFailureKind NotificationsFailureKind
+	Valid                    bool // Valid is true if NotificationsFailureKind is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullNotificationsFailureKind) Scan(value interface{}) error {
+	if value == nil {
+		ns.NotificationsFailureKind, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.NotificationsFailureKind.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullNotificationsFailureKind) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.NotificationsFailureKind), nil
+}
+
+type NotificationsPriority string
+
+const (
+	NotificationsPriorityHigh   NotificationsPriority = "high"
+	NotificationsPriorityNormal NotificationsPriority = "normal"
+	NotificationsPriorityLow    NotificationsPriority = "low"
+)
+
+func (e *NotificationsPriority) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = NotificationsPriority(s)
+	case string:
+		*e = NotificationsPriority(s)
+	default:
+		return fmt.Errorf("unsupported scan type for NotificationsPriority: %T", src)
+	}
+	return nil
+}
+
+type NullNotificationsPriority struct {
+	NotificationsPriority NotificationsPriority
+	Valid                 bool // Valid is true if NotificationsPriority is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullNotificationsPriority) Scan(value interface{}) error {
+	if value == nil {
+		ns.NotificationsPriority, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.NotificationsPriority.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullNotificationsPriority) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.NotificationsPriority), nil
+}
+
+type NotificationsStatus string
+
+const (
+	NotificationsStatusPending    NotificationsStatus = "pending"
+	NotificationsStatusProcessing NotificationsStatus = "processing"
+	NotificationsStatusSent       NotificationsStatus = "sent"
+	NotificationsStatusFailed     NotificationsStatus = "failed"
+	NotificationsStatusCancelled  NotificationsStatus = "cancelled"
+)
+
+func (e *NotificationsStatus) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = NotificationsStatus(s)
+	case string:
+		*e = NotificationsStatus(s)
+	default:
+		return fmt.Errorf("unsupported scan type for NotificationsStatus: %T", src)
+	}
+	return nil
+}
+
+type NullNotificationsStatus struct {
+	NotificationsStatus NotificationsStatus
+	Valid               bool // Valid is true if NotificationsStatus is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullNotificationsStatus) Scan(value interface{}) error {
+	if value == nil {
+		ns.NotificationsStatus, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.NotificationsStatus.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullNotificationsStatus) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.NotificationsStatus), nil
+}
+
+type Batch struct {
+	ID            string
+	Total         uint32
+	CorrelationID string
+	CreatedAt     time.Time
+}
+
+type DeliveryAttempt struct {
+	ID                uint64
+	NotificationID    string
+	AttemptNo         uint32
+	Channel           DeliveryAttemptsChannel
+	StartedAt         time.Time
+	DurationMs        uint32
+	Outcome           DeliveryAttemptsOutcome
+	HttpStatus        sql.NullInt16
+	Error             sql.NullString
+	ProviderMessageID sql.NullString
+}
+
+type IdempotencyKey struct {
+	IdemKey      string
+	RequestHash  []byte
+	ResourceKind IdempotencyKeysResourceKind
+	ResourceID   string
+	CreatedAt    time.Time
+}
+
+type Notification struct {
+	ID                string
+	BatchID           sql.NullString
+	BatchIndex        sql.NullInt32
+	Recipient         string
+	Channel           NotificationsChannel
+	Priority          NotificationsPriority
+	Content           string
+	Status            NotificationsStatus
+	FailureKind       NullNotificationsFailureKind
+	Attempts          uint32
+	DueAt             time.Time
+	ScheduledAt       sql.NullTime
+	LeaseUntil        sql.NullTime
+	ClaimVersion      uint64
+	ProviderMessageID sql.NullString
+	LastError         sql.NullString
+	CorrelationID     string
+	Traceparent       sql.NullString
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	FinishedAt        sql.NullTime
+}
+
+type Template struct {
+	Name      string
+	Body      string
+	CreatedAt time.Time
 	UpdatedAt time.Time
 }
