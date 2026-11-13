@@ -137,7 +137,8 @@ func (s *stack) dlCounts(t *testing.T, where string, args ...any) map[string]int
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	rows, err := s.DB.QueryContext(ctx, "SELECT status, COUNT(*) FROM notifications WHERE "+where+" GROUP BY status", args...)
+	// where is always a constant condition written in the test source; values go through args.
+	rows, err := s.DB.QueryContext(ctx, "SELECT status, COUNT(*) FROM notifications WHERE "+where+" GROUP BY status", args...) //nolint:gosec // G202: where is a test-source constant, values are bound via args
 	if err != nil {
 		t.Fatalf("status counts: %v", err)
 	}
@@ -270,13 +271,15 @@ func (r *dlRecorder) serve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "recorder has no upstream yet", http.StatusServiceUnavailable)
 		return
 	}
-	out, err := http.NewRequestWithContext(req.Context(), req.Method, strings.TrimRight(*up, "/")+req.URL.Path, bytes.NewReader(body))
+	// The recorder forwards by design: the target is the test's own provider
+	// double on loopback (set by SetUpstream), only the path comes from the worker.
+	out, err := http.NewRequestWithContext(req.Context(), req.Method, strings.TrimRight(*up, "/")+req.URL.Path, bytes.NewReader(body)) //nolint:gosec // G704: test proxy to the test's own loopback double
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	out.Header = req.Header.Clone()
-	res, err := http.DefaultClient.Do(out)
+	res, err := http.DefaultClient.Do(out) //nolint:gosec // G704: test proxy to the test's own loopback double
 	if err != nil {
 		r.record(c)
 		http.Error(w, err.Error(), http.StatusBadGateway)
