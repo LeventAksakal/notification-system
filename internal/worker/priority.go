@@ -19,6 +19,8 @@ type selector struct {
 	current [3]int
 	// emptyUntil[i]: priority i had nothing (more) due when last asked.
 	emptyUntil [3]time.Time
+	// idle[i] is priority i's current idle poll.
+	idle [3]time.Duration
 }
 
 func newSelector(weights [3]int) *selector {
@@ -83,11 +85,21 @@ func lendOrder(p int) []int {
 
 func (s *selector) empty(i int, now time.Time) bool { return now.Before(s.emptyUntil[i]) }
 
-// markEmpty records that p had nothing more due; it is skipped until until.
-func (s *selector) markEmpty(i int, until time.Time) { s.emptyUntil[i] = until }
+// markEmpty records at now that priority i had nothing more due; it is
+// skipped for its idle poll: lo after it had rows, doubling up to hi while it
+// keeps having none.
+func (s *selector) markEmpty(i int, now time.Time, hadRows bool, lo, hi time.Duration) {
+	switch {
+	case hadRows || s.idle[i] < lo:
+		s.idle[i] = lo
+	default:
+		s.idle[i] = min(s.idle[i]*2, hi)
+	}
+	s.emptyUntil[i] = now.Add(s.idle[i])
+}
 
 // markBusy forgets that p was empty.
-func (s *selector) markBusy(i int) { s.emptyUntil[i] = time.Time{} }
+func (s *selector) markBusy(i int) { s.emptyUntil[i], s.idle[i] = time.Time{}, 0 }
 
 // nextCheck is the earliest time a priority known to be empty is asked again;
 // the zero time when one is not known to be empty at now.

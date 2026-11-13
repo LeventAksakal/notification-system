@@ -398,12 +398,12 @@ func TestSelectorPlan(t *testing.T) {
 		t.Errorf("100 slots: got %v, want exactly 70/20/10", got)
 	}
 	s = newSelector([3]int{70, 20, 10})
-	s.markEmpty(1, now.Add(time.Second))
+	s.markEmpty(1, now, false, time.Second, time.Second)
 	if got := s.plan(100, now); got != [3]int{70, 0, 30} {
 		t.Errorf("normal empty: got %v, want its share lent down to low", got)
 	}
 	s = newSelector([3]int{70, 20, 10})
-	s.markEmpty(2, now.Add(time.Second))
+	s.markEmpty(2, now, false, time.Second, time.Second)
 	if got := s.plan(100, now); got != [3]int{70, 30, 0} {
 		t.Errorf("low empty: got %v, want its share lent up to normal", got)
 	}

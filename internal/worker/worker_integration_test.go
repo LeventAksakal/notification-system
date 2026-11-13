@@ -91,6 +91,8 @@ func TestWorkersHoldTheRateAtTheProvider(t *testing.T) {
 			Breakers: brs,
 		})
 		go func() { errc <- w.Run(ctx) }()
+		// As processes started one after another: the first drains alone for a while.
+		time.Sleep(400 * time.Millisecond)
 	}
 	deadline := time.Now().Add(60 * time.Second)
 	for {
@@ -147,7 +149,7 @@ func TestWorkersHoldTheRateAtTheProvider(t *testing.T) {
 		}
 		avg := float64(len(times)-1) / times[len(times)-1].Sub(times[0]).Seconds()
 		var buckets []string
-		for k := 0; k < 15; k++ {
+		for k := 0; k <= int(times[len(times)-1].Sub(times[0])/(100*time.Millisecond)); k++ {
 			from := times[0].Add(time.Duration(k) * 100 * time.Millisecond)
 			n := 0
 			for _, x := range times {
