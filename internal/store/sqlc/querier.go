@@ -33,7 +33,6 @@ type Querier interface {
 	FinishSent(ctx context.Context, arg FinishSentParams) (int64, error)
 	GetBatch(ctx context.Context, id string) (Batch, error)
 	GetIdempotencyKey(ctx context.Context, idemKey string) (IdempotencyKey, error)
-	GetLease(ctx context.Context, id string) (GetLeaseRow, error)
 	GetNotification(ctx context.Context, id string) (GetNotificationRow, error)
 	GetTemplate(ctx context.Context, name string) (Template, error)
 	InsertBatch(ctx context.Context, arg InsertBatchParams) error

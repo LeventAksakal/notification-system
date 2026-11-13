@@ -62,20 +62,18 @@ func (s *Queue) Claim(ctx context.Context, channel core.Channel, priority core.P
 		if affected == 0 {
 			continue // cannot happen while the row lock is held; never lease what did not change
 		}
-		l, err := q.GetLease(ctx, r.ID)
-		if err != nil {
-			return nil, fmt.Errorf("claim: read lease %s: %w", r.ID, err)
-		}
 		jobs = append(jobs, core.Job{
-			ID:            r.ID,
-			BatchID:       r.BatchID.String,
-			Channel:       channel,
-			Priority:      priority,
-			To:            r.Recipient,
-			Content:       r.Content,
-			Attempts:      int(r.Attempts),
-			ClaimVersion:  l.ClaimVersion,
-			LeaseUntil:    l.LeaseUntil.Time,
+			ID:       r.ID,
+			BatchID:  r.BatchID.String,
+			Channel:  channel,
+			Priority: priority,
+			To:       r.Recipient,
+			Content:  r.Content,
+			Attempts: int(r.Attempts),
+			// Exact: the row lock is held from the SELECT to the commit.
+			ClaimVersion: r.ClaimVersion + 1,
+			// Informational: the fenced value is claim_version, not this time.
+			LeaseUntil:    time.Now().Add(lease),
 			DueAt:         r.DueAt,
 			CorrelationID: r.CorrelationID,
 			Traceparent:   r.Traceparent.String,

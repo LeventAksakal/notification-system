@@ -22,6 +22,12 @@ func Open(ctx context.Context, dsn string, maxOpen int) (*sql.DB, error) {
 	}
 	cfg.ParseTime = true
 	cfg.Loc = time.UTC
+	// Arguments are interpolated client-side: one text round trip per
+	// statement instead of prepare, execute and close. The close gets no
+	// reply, so with a prepared statement every query is write-write-read,
+	// which stalls ~40 ms on delayed ACKs behind some proxies (measured
+	// behind Docker Desktop: an empty claim took 48 ms at 1.7 ms RTT).
+	cfg.InterpolateParams = true
 	// NOW(3) and the DATETIME columns are read and written as UTC, the same
 	// zone the driver formats time.Time arguments in.
 	if cfg.Params == nil {

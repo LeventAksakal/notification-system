@@ -157,22 +157,6 @@ func (q *Queries) FinishSent(ctx context.Context, arg FinishSentParams) (int64, 
 	return result.RowsAffected()
 }
 
-const getLease = `-- name: GetLease :one
-SELECT claim_version, lease_until FROM notifications WHERE id = ?
-`
-
-type GetLeaseRow struct {
-	ClaimVersion uint64
-	LeaseUntil   sql.NullTime
-}
-
-func (q *Queries) GetLease(ctx context.Context, id string) (GetLeaseRow, error) {
-	row := q.db.QueryRowContext(ctx, getLease, id)
-	var i GetLeaseRow
-	err := row.Scan(&i.ClaimVersion, &i.LeaseUntil)
-	return i, err
-}
-
 const insertDeliveryAttempt = `-- name: InsertDeliveryAttempt :exec
 INSERT INTO delivery_attempts (
   notification_id, attempt_no, channel, started_at, duration_ms, outcome, http_status, error, provider_message_id
