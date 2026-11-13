@@ -40,6 +40,19 @@ type Config struct {
 // probeWait is how long Allow asks the caller to wait while the probe is out.
 const probeWait = 20 * time.Millisecond
 
+// Ticket ties a call to the breaker state that admitted it. Every state
+// change starts a new generation; a result carrying an older generation is
+// ignored, so a call admitted while closed can never decide a half-open
+// breaker, and only the probe's own result (or Cancel) ends a half-open state.
+type Ticket struct {
+	gen   uint64
+	probe bool
+}
+
+// Probe reports whether this ticket is the half-open probe: the caller should
+// make exactly one call with it.
+func (t Ticket) Probe() bool { return t.probe }
+
 type result struct {
 	at   time.Time
 	fail bool
@@ -53,6 +66,7 @@ type Breaker struct {
 
 	mu       sync.Mutex
 	state    State
+	gen      uint64 // bumped on every state change
 	openedAt time.Time
 	results  []result // closed state only, oldest first
 	fails    int      // failures in results
@@ -63,40 +77,47 @@ func New(cfg Config, now func() time.Time) *Breaker {
 	return &Breaker{cfg: cfg, now: now}
 }
 
-// State reports the current state, moving open to half-open-eligible only
-// through Allow.
+// State reports the current state, moving open to half-open only through Allow.
 func (b *Breaker) State() State {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.state
 }
 
-// Allow reports whether a call may start now. When it may not, wait is how
-// long until asking again makes sense. In half-open exactly one caller is
-// allowed (the probe); it must end with Done or Cancel.
-func (b *Breaker) Allow() (bool, time.Duration) {
+// Allow reports whether a call may start now and returns its ticket, which
+// the call must end with Done or Cancel. When it may not, wait is how long
+// until asking again makes sense. In half-open exactly one caller is allowed:
+// the probe.
+func (b *Breaker) Allow() (Ticket, bool, time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	switch b.state {
 	case Open:
 		if left := b.openedAt.Add(b.cfg.Cooldown).Sub(b.now()); left > 0 {
-			return false, left
+			return Ticket{}, false, left
 		}
-		b.state = HalfOpen
-		return true, 0
+		b.set(HalfOpen)
+		return Ticket{gen: b.gen, probe: true}, true, 0
 	case HalfOpen:
-		return false, probeWait
+		return Ticket{}, false, probeWait
 	}
-	return true, 0
+	return Ticket{gen: b.gen}, true, 0
 }
 
-// Done records the result of a call that reached the provider (or timed out).
-func (b *Breaker) Done(success bool) {
+// Done records the result of a call that reached the provider (or timed
+// out). A ticket from an older generation changes nothing.
+func (b *Breaker) Done(t Ticket, success bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if t.gen != b.gen {
+		return
+	}
 	now := b.now()
 	switch b.state {
 	case HalfOpen:
+		if !t.probe {
+			return
+		}
 		if success {
 			b.close()
 		} else {
@@ -113,30 +134,46 @@ func (b *Breaker) Done(success bool) {
 			b.open(now)
 		}
 	case Open:
-		// A call that started before the breaker opened; it changes nothing.
+		// Unreachable: opening starts a new generation.
 	}
 }
 
 // Cancel ends an allowed call that never reached the provider (nothing to
-// claim, shutdown). A cancelled probe lets the next caller probe.
-func (b *Breaker) Cancel() {
+// claim, shutdown). A cancelled probe lets the next caller probe; any other
+// cancel changes nothing.
+func (b *Breaker) Cancel(t Ticket) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.state == HalfOpen {
-		// Back to open with the cool-down already spent: the next Allow probes.
-		b.state = Open
-		b.openedAt = b.now().Add(-b.cfg.Cooldown)
+	if t.gen != b.gen || !t.probe || b.state != HalfOpen {
+		return
 	}
+	// Back to open with the cool-down already spent: the next Allow probes.
+	b.set(Open)
+	b.openedAt = b.now().Add(-b.cfg.Cooldown)
+}
+
+// Current reports whether t still belongs to the breaker's current state: a
+// call admitted while closed is not current once the breaker opened, and
+// should not be made.
+func (b *Breaker) Current(t Ticket) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return t.gen == b.gen
+}
+
+func (b *Breaker) set(s State) {
+	b.state = s
+	b.gen++
 }
 
 func (b *Breaker) open(now time.Time) {
-	b.state = Open
+	b.set(Open)
 	b.openedAt = now
 	b.results, b.fails = b.results[:0], 0
 }
 
 func (b *Breaker) close() {
-	b.state = Closed
+	b.set(Closed)
 	b.results, b.fails = b.results[:0], 0
 }
 

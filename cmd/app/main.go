@@ -129,16 +129,19 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		ReapInterval:    cfg.ReapInterval,
 		ShutdownTimeout: cfg.ShutdownTimeout,
 		Weights:         cfg.PriorityWeights,
+		Horizon:         cfg.RateLimitHorizon,
+		SendAlign:       delivery.DefaultSendAlign,
 	}, delivery.Deps{
 		Queue:     store.NewQueue(db),
-		Limiter:   limiter.New(vk, cfg.RateLimitPerSecond, cfg.RateLimitHeadroomPct, "ratelimit:"),
+		Limiter:   limiter.New(vk, cfg.RateLimitPerSecond, cfg.RateLimitHeadroomPct, cfg.RateLimitHorizon, "ratelimit:"),
 		Sender:    provider.New(cfg.ProviderURLs, cfg.ProviderTimeout, cfg.WorkerConcurrency),
 		Publisher: noopPublisher{},
 		Breakers:  breakers,
 		Tracer:    otel.Tracer("notifier/worker"),
 	})
 	slog.InfoContext(ctx, "worker started", "concurrency", cfg.WorkerConcurrency, "weights", cfg.PriorityWeights,
-		"rate_per_second", cfg.RateLimitPerSecond, "headroom_percent", cfg.RateLimitHeadroomPct)
+		"rate_per_second", cfg.RateLimitPerSecond, "headroom_percent", cfg.RateLimitHeadroomPct,
+		"horizon", cfg.RateLimitHorizon.String())
 	err = w.Run(ctx)
 	slog.InfoContext(context.WithoutCancel(ctx), "worker stopped")
 	return err

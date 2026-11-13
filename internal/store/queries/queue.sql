@@ -49,12 +49,21 @@ UPDATE notifications
 SET status = 'pending', due_at = NOW(3) + INTERVAL sqlc.arg(delay_us) MICROSECOND, lease_until = NULL
 WHERE id = sqlc.arg(id) AND status = 'processing' AND claim_version = sqlc.arg(claim_version);
 
--- name: ReapExpiredLeases :execrows
--- processing -> pending for leases that ran out (lease_idx). Bounded per tick.
+-- name: ReapCandidates :many
+-- Runs inside a READ COMMITTED transaction: the expired leases (lease_idx),
+-- locked so two reapers never return the same row. Bounded per tick.
+SELECT id, batch_id, channel, attempts, correlation_id
+FROM notifications
+WHERE status = 'processing' AND lease_until < NOW(3)
+ORDER BY lease_until
+LIMIT 1000
+FOR UPDATE SKIP LOCKED;
+
+-- name: ReapLeases :execrows
+-- processing -> pending for rows locked by ReapCandidates in the same transaction.
 UPDATE notifications
 SET status = 'pending', lease_until = NULL
-WHERE status = 'processing' AND lease_until < NOW(3)
-LIMIT 1000;
+WHERE id IN (sqlc.slice(ids)) AND status = 'processing';
 
 -- name: InsertDeliveryAttempt :exec
 INSERT INTO delivery_attempts (
