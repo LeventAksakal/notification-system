@@ -321,7 +321,7 @@ func (s *stack) send(method, path string, body any, kv ...string) (*response, er
 	if rdr != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	for i := 0; i < len(kv); i += 2 {
+	for i := 0; i+1 < len(kv); i += 2 {
 		req.Header.Set(kv[i], kv[i+1])
 	}
 	res, err := http.DefaultClient.Do(req)
@@ -432,7 +432,7 @@ func flushValkey(t *testing.T, addr string) {
 
 func freePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("free port: %v", err)
 	}
@@ -485,7 +485,10 @@ type child struct {
 func startChild(t *testing.T, role string, env []string, args ...string) *child {
 	t.Helper()
 	lb := &logBuffer{}
-	cmd := exec.Command(appBin, args...)
+	// Not t.Context(): it is cancelled before cleanups run, which would kill
+	// the child before stop() can interrupt it. The child's lifetime is owned
+	// by stop/kill, so its context never ends.
+	cmd := exec.CommandContext(context.Background(), appBin, args...)
 	cmd.Dir = repoRoot
 	cmd.Env = env
 	cmd.Stdout = lb.writer()

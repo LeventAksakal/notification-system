@@ -85,7 +85,7 @@ func runMain(m *testing.M) int {
 			name += ".exe"
 		}
 		appBin = filepath.Join(dir, name)
-		build := exec.Command("go", "build", "-o", appBin, "./cmd/app")
+		build := exec.CommandContext(context.Background(), "go", "build", "-o", appBin, "./cmd/app")
 		build.Dir = repoRoot
 		if out, err := build.CombinedOutput(); err != nil {
 			fmt.Fprintf(os.Stderr, "acceptance: go build ./cmd/app failed: %v\n%s\n", err, out)
