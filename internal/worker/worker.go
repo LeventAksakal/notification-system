@@ -207,24 +207,25 @@ type channelRun struct {
 	// calling bounds the provider calls in flight on this channel: its share
 	// of Concurrency. While it is full the loop reserves no slots.
 	calling chan struct{}
-	// claiming bounds the claim groups in flight. A group claimed more than
-	// SendAlign after its slots were reserved has missed them, and a group
-	// starts every refill, so ceil(SendAlign/refill)+1 groups can be useful
-	// at once; more would only claim rows to release them.
+	// claiming holds the one claim in flight on this channel. The next slots
+	// are reserved only once the previous claim is done: a claim normally
+	// takes a fraction of refill, and while the database is slow this worker
+	// reserves less and the other workers take the slots. Claims of one
+	// worker so stay in slot order, and a slot is reserved only by a worker
+	// that can claim for it at once; overlapping claims near the end of a
+	// backlog would hand the last rows to later slots and leave earlier ones
+	// empty.
 	claiming chan struct{}
 
-	mu   sync.Mutex
-	sel  *selector
-	idle time.Duration // current idle poll; IdleMin while work is found
+	mu  sync.Mutex
+	sel *selector
 }
 
 func (w *Worker) newChannelRun(ch core.Channel, share int) *channelRun {
-	refill := w.refill()
-	groups := int((w.cfg.SendAlign+refill-1)/refill) + 1
 	return &channelRun{
 		ch: ch, br: w.deps.Breakers[ch],
-		calling: make(chan struct{}, share), claiming: make(chan struct{}, groups),
-		sel: newSelector(w.cfg.Weights), idle: w.cfg.IdleMin,
+		calling: make(chan struct{}, share), claiming: make(chan struct{}, 1),
+		sel: newSelector(w.cfg.Weights),
 	}
 }
 
@@ -233,11 +234,10 @@ func (w *Worker) newChannelRun(ch core.Channel, share int) *channelRun {
 // slots, and the reserved time never runs out while one worker is alive.
 func (w *Worker) refill() time.Duration { return max(w.cfg.Horizon/2, time.Millisecond) }
 
-// channelLoop reserves slots and hands each group to a claim task. It never
-// waits on the database, so reservations keep their cadence however long a
-// claim takes. It reserves nothing while every priority is known to be empty,
-// while the breaker refuses, or while the channel's provider calls are all in
-// flight.
+// channelLoop reserves slots and hands each group to a claim task. It
+// reserves nothing while every priority is known to be empty, while the
+// breaker refuses, while the channel's previous claim is running, or while
+// the channel's provider calls are all in flight.
 func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, inflight *sync.WaitGroup) {
 	limiterDown := false
 	interval := time.Millisecond // until the first grant says
@@ -394,18 +394,24 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job,
 			return
 		}
 	}
-	defer func() { <-cr.calling }()
+	// The place is held for the provider call only, not for the database
+	// writes around it.
+	var once sync.Once
+	callDone := func() { once.Do(func() { <-cr.calling }) }
+	defer callDone()
 	if time.Now().After(late) {
+		callDone()
 		cr.br.Cancel(tk)
 		w.release(jctx, job, "slot missed")
 		return
 	}
 	if !cr.br.Current(tk) {
 		// The breaker opened after the claim: nothing goes out (decision 0008).
+		callDone()
 		w.release(jctx, job, "breaker opened before the send")
 		return
 	}
-	w.deliver(jctx, job, cr.br, tk)
+	w.deliver(jctx, job, cr.br, tk, callDone)
 }
 
 // pause makes the channel loop reserve nothing until until.
@@ -413,7 +419,7 @@ func (cr *channelRun) pause(until time.Time) {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 	for i := range core.Priorities {
-		cr.sel.markEmpty(i, until)
+		cr.sel.emptyUntil[i] = until
 	}
 }
 
@@ -421,15 +427,15 @@ func (cr *channelRun) pause(until time.Time) {
 // n by weight, then each priority is asked once, high to low, for its share
 // plus what the priorities above it could not use. What is still unused after
 // low goes up to the priorities that may have more. A priority that returned
-// fewer rows than asked is skipped for the current idle poll, which doubles
-// while nothing at all is found.
+// fewer rows than asked is skipped for its idle poll: IdleMin after it had
+// rows, doubling up to IdleMax while it keeps having none.
 func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]core.Job, error) {
 	if n <= 0 {
 		return nil, nil
 	}
 	now := time.Now()
 	cr.mu.Lock()
-	counts, idle := cr.sel.plan(n, now), cr.idle
+	counts := cr.sel.plan(n, now)
 	var empty [3]bool
 	for i := range empty {
 		empty[i] = cr.sel.empty(i, now)
@@ -447,7 +453,7 @@ func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]core.Job, 
 		cr.mu.Lock()
 		if len(got) < k {
 			drained[i] = true
-			cr.sel.markEmpty(i, now.Add(idle))
+			cr.sel.markEmpty(i, now, len(got) > 0, w.cfg.IdleMin, w.cfg.IdleMax)
 		} else {
 			cr.sel.markBusy(i)
 		}
@@ -482,13 +488,6 @@ func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]core.Job, 
 		}
 		carry -= got
 	}
-	cr.mu.Lock()
-	if len(jobs) == 0 {
-		cr.idle = min(cr.idle*2, w.cfg.IdleMax)
-	} else {
-		cr.idle = w.cfg.IdleMin
-	}
-	cr.mu.Unlock()
 	return jobs, err
 }
 
@@ -500,10 +499,12 @@ func jobContext(ctx context.Context, job core.Job) context.Context {
 // deliver makes one provider call for a claimed job and writes the result.
 // The call ends leaseMargin before the lease does (or at the provider
 // timeout, whichever is first); with less than minSendTime of lease left it is
-// not made and the job is released.
-func (w *Worker) deliver(ctx context.Context, job core.Job, br *breaker.Breaker, tk breaker.Ticket) {
+// not made and the job is released. callDone is called once the provider
+// call is over (or will not be made).
+func (w *Worker) deliver(ctx context.Context, job core.Job, br *breaker.Breaker, tk breaker.Ticket, callDone func()) {
 	left := job.LeaseUntil.Sub(w.deps.Now()) - leaseMargin
 	if left < minSendTime {
+		callDone()
 		br.Cancel(tk)
 		slog.WarnContext(ctx, "lease too close to its end to send; released", "channel", job.Channel,
 			"lease_left_ms", (left + leaseMargin).Milliseconds())
@@ -533,6 +534,7 @@ func (w *Worker) deliver(ctx context.Context, job core.Job, br *breaker.Breaker,
 	cut := errors.Is(context.Cause(callCtx), errLeaseCut)
 	cancelCall()
 	elapsed := time.Since(start)
+	callDone()
 	if err != nil && ctx.Err() != nil {
 		// Shutdown aborted the call: not an attempt; give the job back.
 		br.Cancel(tk)
