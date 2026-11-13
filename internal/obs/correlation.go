@@ -33,6 +33,17 @@ func WithNotificationID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, notificationKey, id)
 }
 
+// WithNotification returns ctx for log lines about one notification: they
+// carry its id and its stored correlation id (the one it was created with),
+// which replaces the current request's. An empty correlationID keeps it.
+func WithNotification(ctx context.Context, notificationID, correlationID string) context.Context {
+	ctx = WithNotificationID(ctx, notificationID)
+	if correlationID != "" {
+		ctx = WithCorrelationID(ctx, correlationID)
+	}
+	return ctx
+}
+
 // NotificationID returns the notification id in ctx, or "".
 func NotificationID(ctx context.Context) string {
 	id, _ := ctx.Value(notificationKey).(string)

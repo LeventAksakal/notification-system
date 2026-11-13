@@ -10,6 +10,8 @@ import (
 )
 
 type Querier interface {
+	// ListNotifications is built in Go (store.ListNotificationsQuery): the WHERE
+	// holds only the filters a request sets, so each filter keeps its index.
 	// The only way out of pending to cancelled; a lost race changes nothing.
 	CancelNotification(ctx context.Context, id string) (int64, error)
 	// The delivery queue (decisions 0003, 0018). A claim is a lease: it sets
@@ -52,9 +54,6 @@ type Querier interface {
 	ListBatchNotificationIDs(ctx context.Context, batchID sql.NullString) ([]string, error)
 	// Oldest first (attempts_notification_idx).
 	ListDeliveryAttempts(ctx context.Context, notificationID string) ([]DeliveryAttempt, error)
-	// Newest first, keyset on id. scheduled_only: NULL = no view filter, 1 = only
-	// scheduled, 0 = only not scheduled (combined with status = 'pending').
-	ListNotifications(ctx context.Context, arg ListNotificationsParams) ([]ListNotificationsRow, error)
 	ListTemplates(ctx context.Context) ([]Template, error)
 	// sqlc needs at least one query; the readiness probe can use it.
 	Ping(ctx context.Context) (int32, error)
@@ -64,6 +63,9 @@ type Querier interface {
 	ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error)
 	// A dead letter goes back to pending with a fresh attempt budget; history is kept.
 	ReplayNotification(ctx context.Context, id string) (int64, error)
+	// Forget up to 1000 keys older than the retention, on the database clock (the
+	// clock that set created_at), through idempotency_created_idx.
+	SweepIdempotencyKeys(ctx context.Context, retentionMs interface{}) (int64, error)
 	UpsertTemplate(ctx context.Context, arg UpsertTemplateParams) error
 }
 
