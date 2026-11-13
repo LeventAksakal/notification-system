@@ -1,10 +1,13 @@
 // Package limiter is the send-rate limit shared by every worker (decision
 // 0009): GCRA with burst 1 in Valkey, one key per channel, on Valkey's clock.
+// It hands out send slots: moments, exactly one interval apart, at which a
+// request may leave.
 package limiter
 
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -12,30 +15,46 @@ import (
 	"github.com/LeventAksakal/notification-system/internal/core"
 )
 
-// gcra grants at most one permit per call. State is the theoretical arrival
-// time (TAT, microseconds on the server clock) of the next permit.
+// gcra reserves up to n consecutive slots. State is the theoretical arrival
+// time (TAT, microseconds on the server clock): the next free slot.
 //
-// A permit is granted when TAT <= now; the new TAT is max(TAT, now - slack) +
-// interval. slack lets a taker that arrives a little after TAT (timer and
-// network latency) keep the grid instead of pushing every later permit back
-// by its lateness, which would pace below the rate. Successive grants are
-// still anchored at least one interval apart, so any one-second window holds
-// at most (1s + slack) / interval + 1 grants.
+// A TAT in the past restarts the grid at now (burst 1: unused slots are
+// gone). Slots are TAT, TAT+interval, ...; only those at most horizon after
+// now are reserved, and the TAT moves past the last one. Slots are therefore
+// never closer than one interval, whoever takes them, and any one-second
+// window holds at most ceil(1s/interval) of them. There is no slack: a taker
+// that comes late finds the grid restarted, never compressed.
 //
-// KEYS[1] channel key; ARGV[1] interval us; ARGV[2] slack us.
-// Returns {granted (0|1), wait us until the next permit}.
+// KEYS[1] channel key; ARGV[1] interval us; ARGV[2] horizon us; ARGV[3] n.
+// Returns {reserved, us from now to the first slot, us until asking again
+// can reserve something (0 when all n were reserved)}.
 const gcra = `
 local interval = tonumber(ARGV[1])
-local slack = tonumber(ARGV[2])
+local horizon = tonumber(ARGV[2])
+local want = tonumber(ARGV[3])
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000000 + tonumber(t[2])
 local tat = tonumber(redis.call('GET', KEYS[1]) or '0')
-if tat > now then
-  return {0, tat - now}
+if tat < now then
+  tat = now
 end
-local nt = math.max(tat, now - slack) + interval
-redis.call('SET', KEYS[1], string.format('%.0f', nt), 'PX', math.ceil((nt - now) / 1000) + 1000)
-return {1, nt - now}
+local first = tat - now
+local n = 0
+if first <= horizon then
+  n = math.floor((horizon - first) / interval) + 1
+  if n > want then
+    n = want
+  end
+end
+if n > 0 then
+  tat = tat + n * interval
+  redis.call('SET', KEYS[1], string.format('%.0f', tat), 'PX', math.ceil((tat - now) / 1000) + 1000)
+end
+local wait = 0
+if n < want then
+  wait = math.max(tat - now - horizon, 0)
+end
+return {n, first, wait}
 `
 
 var script = valkey.NewLuaScript(gcra)
@@ -44,38 +63,48 @@ var script = valkey.NewLuaScript(gcra)
 type Limiter struct {
 	client   valkey.Client
 	interval time.Duration
+	horizon  time.Duration
 	prefix   string
 }
 
 var _ core.Limiter = (*Limiter)(nil)
 
-// New paces each channel at perSecond reduced by headroomPct percent; the
-// keys are "<prefix><channel>".
-func New(client valkey.Client, perSecond, headroomPct int, prefix string) *Limiter {
+// New paces each channel at perSecond reduced by headroomPct percent and
+// reserves slots at most horizon ahead; the keys are "<prefix><channel>".
+//
+// The interval is rounded up to the microsecond, so the slots in any sliding
+// second never exceed the paced rate: 97 per second gives 10 310 us, and
+// ceil(1s / 10 310 us) = 97.
+func New(client valkey.Client, perSecond, headroomPct int, horizon time.Duration, prefix string) *Limiter {
 	pace := float64(perSecond) * float64(100-headroomPct) / 100
 	if pace <= 0 {
 		pace = 1
 	}
-	return &Limiter{client: client, interval: time.Duration(float64(time.Second) / pace), prefix: prefix}
+	us := math.Ceil(1e6 / pace)
+	return &Limiter{client: client, interval: time.Duration(us) * time.Microsecond, horizon: max(horizon, 0), prefix: prefix}
 }
 
-// Interval is the time between two permits on one channel.
+// Interval is the time between two slots on one channel.
 func (l *Limiter) Interval() time.Duration { return l.interval }
 
-// Take asks for up to n permits and returns how many were granted now (at
-// most one: burst 1). wait is how long until the next permit.
-func (l *Limiter) Take(ctx context.Context, channel core.Channel, n int) (int, time.Duration, error) {
+// Take reserves up to n consecutive slots on channel, none further ahead
+// than the horizon.
+func (l *Limiter) Take(ctx context.Context, channel core.Channel, n int) (core.Grant, error) {
 	if n <= 0 {
-		return 0, 0, nil
+		return core.Grant{Interval: l.interval}, nil
 	}
-	us := l.interval.Microseconds()
 	vals, err := script.Exec(ctx, l.client, []string{l.prefix + string(channel)},
-		[]string{fmt.Sprint(us), fmt.Sprint(us / 2)}).AsIntSlice()
+		[]string{fmt.Sprint(l.interval.Microseconds()), fmt.Sprint(l.horizon.Microseconds()), fmt.Sprint(n)}).AsIntSlice()
 	if err != nil {
-		return 0, 0, fmt.Errorf("rate limiter: %w", err)
+		return core.Grant{}, fmt.Errorf("rate limiter: %w", err)
 	}
-	if len(vals) != 2 {
-		return 0, 0, fmt.Errorf("rate limiter: unexpected reply %v", vals)
+	if len(vals) != 3 {
+		return core.Grant{}, fmt.Errorf("rate limiter: unexpected reply %v", vals)
 	}
-	return int(vals[0]), time.Duration(vals[1]) * time.Microsecond, nil
+	return core.Grant{
+		N:        int(vals[0]),
+		First:    time.Duration(vals[1]) * time.Microsecond,
+		Interval: l.interval,
+		Wait:     time.Duration(vals[2]) * time.Microsecond,
+	}, nil
 }

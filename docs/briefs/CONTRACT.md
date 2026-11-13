@@ -3,7 +3,7 @@
 Facts every lane builds against. No verdicts here; reasons are in `docs/decisions/`. The decision records are still `proposed`; this run builds to their recommended options (owner item 0001).
 
 ## Sources of truth
-- HTTP: `api/openapi.yaml` (v1.0.0). Schema: `schema/notifications.sql`. Vocabulary, state machine, limits, ports: `internal/core/` (`status.go`, `limits.go`, `ports.go`).
+- HTTP: `api/openapi.yaml` (v1.1.0). Schema: `schema/notifications.sql`. Vocabulary, state machine, limits, ports: `internal/core/` (`status.go`, `limits.go`, `ports.go`).
 - Only the coordinator edits those. A lane that needs a change writes `.agents/owner-items/NNNN-<slug>.md`, takes the nearest assumption that needs no contract change, and continues.
 - Generated, never hand-edited: `internal/api/api.gen.go`, `internal/store/sqlc/`, `migrations/`. Regenerate with `go tool -modfile=tools.mod task gen`.
 
@@ -13,7 +13,7 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 ## HTTP conventions
 - Refusals use the `Error` body `{code, message, details[{index?, field, reason}]}`.
 - 400 `invalid_request` for every broken rule, whether the spec validator or the service found it; `details[].field` names the JSON field (`to`, `content`, `template.variables.name`, `scheduledAt`, `notifications`), `index` the batch position.
-- 404 `not_found`. 409 `not_cancellable` (cancel when not pending), 409 `not_retryable` (retry when not failed). 422 `idempotency_key_reused`.
+- 413 `request_too_large` for a body over 8 MiB. 404 `not_found`. 409 `not_cancellable` (cancel when not pending), 409 `not_retryable` (retry when not failed). 422 `idempotency_key_reused`.
 - `X-Correlation-ID`: accepted, else generated; echoed on every response; stored on the row; on every log line about that notification in API and worker (JSON logs on stdout, field `correlation_id`; `notification_id` when known); sent to the provider as `X-Correlation-ID`.
 - `Idempotency-Key` on POST create (single or batch): same key and same payload returns the first response, same ids, status 201, header `Idempotent-Replayed: true`. Same key, different payload: 422.
 - Outside the generated routes (not validated against the spec): `GET /v1/ws` (WebSocket, `github.com/coder/websocket`), `GET /openapi.json` (the embedded spec), `GET /docs` (a page that renders it).
@@ -25,7 +25,8 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 ## Delivery rules
 - Classify (only in `provider.Classify`): retry on network error, timeout, 408, 425, 429, 5xx; permanent on any other 4xx; a 2xx without `messageId` counts as sent.
 - Backoff: `random(0, min(cap, base * 2^attempt))`, never shorter than `Retry-After`; stored as `due_at`. After `APP_MAX_ATTEMPTS` provider calls: `failed`, `failure_kind = exhausted`. Permanent: `failed`, `permanent`, after one call.
-- Rate limit: GCRA in Valkey with burst 1, Valkey's clock, one key per channel; permits are taken before claiming. Valkey unreachable: workers send nothing and `/readyz` says so.
+- Rate limit: GCRA in Valkey with burst 1, Valkey's clock, one key per channel. `Limiter.Take` reserves consecutive send slots one interval apart, at most `APP_RATE_LIMIT_HORIZON` ahead; slots are reserved before claiming, one claim query serves a group of slots, and each request leaves at its slot, never earlier. A job that misses its slot by more than one interval is released, not sent late. Valkey unreachable: workers send nothing and `/readyz` says so.
+- A request is sent only if its lease outlives the call: the call's timeout is capped at the time left on the lease minus a margin, and a job with too little lease left is released.
 - Priority: per-channel permits are split by weights with borrowing (unused share goes to the next priority down, then up). One claim query per priority through `claim_idx`.
 - Breaker per channel per worker process: open on failure ratio over a window, half-open probe after a cool-down. While open the worker does not claim that channel; nothing is counted as an attempt.
 - Lease: claim sets `lease_until` and increments `claim_version`; every later write carries `WHERE claim_version = ?`; a reaper returns expired leases to `pending`.
@@ -45,6 +46,7 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 | `APP_RETRY_CAP` | `5m` | backoff cap |
 | `APP_RATE_LIMIT_PER_SECOND` | `100` | provider's limit per channel |
 | `APP_RATE_LIMIT_HEADROOM_PERCENT` | `3` | the limiter paces this much under the limit, so arrival jitter cannot show 101 in a second at the provider |
+| `APP_RATE_LIMIT_HORIZON` | `200ms` | how far ahead send slots may be reserved |
 | `APP_PRIORITY_WEIGHTS` | `70,20,10` | high, normal, low shares |
 | `APP_LEASE_DURATION` | `30s` | claim lease |
 | `APP_REAP_INTERVAL` | `5s` | how often expired leases are returned |
@@ -54,6 +56,7 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 | `APP_BREAKER_FAILURE_RATIO` | `0.5` | opens at or above |
 | `APP_BREAKER_COOLDOWN` | `5s` | open time before one probe |
 | `APP_IDEMPOTENCY_RETENTION` | `24h` | how long a key is remembered |
+| `APP_IDEMPOTENCY_SWEEP_INTERVAL` | `1m` | how often expired keys are deleted |
 | `APP_WS_SEND_BUFFER` | `256` | events buffered per subscriber before it is dropped |
 
 ## Acceptance test harness (`test/acceptance/`, build tag `integration`)

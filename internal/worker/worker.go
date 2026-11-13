@@ -1,7 +1,16 @@
-// Package worker is the delivery loop of `app worker` (rows R7, R8, R9, R12,
-// B1, B2): per channel it asks the breaker, takes a rate-limit permit, claims
-// one notification for that permit by weighted priority, sends it on a
-// bounded pool, classifies the answer and writes the result.
+// Package worker is the delivery loop of `app worker` (rows R7, R8, R9, R11,
+// R12, B1, B2). Per channel it asks the breaker, reserves the send slots of
+// the next horizon in one limiter call, splits them between the priorities by
+// weight, claims the rows with one query per priority, and sends each job at
+// its slot. It classifies the answer and writes the result.
+//
+// Timing of one job: the slot comes from the limiter (Valkey's clock, exactly
+// one interval apart across all workers); the request leaves at slot +
+// SendAlign, never earlier. A job that cannot leave within one interval of
+// that moment (slow claim, no free provider call, a timer late under load) is
+// released unsent and claimed again for a later slot: it is never sent late on
+// top of the full rate. Before the call the lease is checked: the call ends
+// before the lease does, or it is not made.
 package worker
 
 import (
@@ -27,14 +36,18 @@ import (
 	"github.com/LeventAksakal/notification-system/internal/provider"
 )
 
-// Sender makes one provider call (provider.Client).
+// Sender makes one provider call (provider.Client). It must end the call when
+// ctx ends.
 type Sender interface {
 	Send(ctx context.Context, m provider.Message) (provider.Response, error)
 }
 
 // Config is the worker's dials.
 type Config struct {
-	Concurrency     int           // APP_WORKER_CONCURRENCY
+	// Concurrency is APP_WORKER_CONCURRENCY: provider calls in flight per
+	// process. Each channel gets an equal share (at least 1), so a channel
+	// whose provider hangs cannot hold the others' calls.
+	Concurrency     int
 	MaxAttempts     int           // APP_MAX_ATTEMPTS
 	RetryBase       time.Duration // APP_RETRY_BASE
 	RetryCap        time.Duration // APP_RETRY_CAP
@@ -43,16 +56,23 @@ type Config struct {
 	ShutdownTimeout time.Duration // APP_SHUTDOWN_TIMEOUT
 	Weights         [3]int        // APP_PRIORITY_WEIGHTS
 	Channels        []core.Channel
-	// SendAlign is the fixed offset after a permit's grant at which its
-	// notification is sent (default 200ms; sent at once when the claim took
-	// longer). Arrivals at the provider then keep the permits' spacing
-	// whatever the claim latency, so the headroom is not eaten by database
-	// jitter. The job waits at most SendAlign: pacing, not backoff.
+	// Horizon is APP_RATE_LIMIT_HORIZON: how far ahead slots are reserved;
+	// the limiter is built with the same value. Default 200ms.
+	Horizon time.Duration
+	// SendAlign is added to every slot (default DefaultSendAlign). It is the
+	// time a claim may take: slots are reserved before the claim, so the
+	// first slot of a group can be due at once; without the offset a claim of
+	// 16 ms (50 ms at p99, 170 ms at start-up on the Docker setup) would miss
+	// most first slots. Every request is shifted by the same amount, so the
+	// spacing at the provider stays the limiter's.
 	SendAlign time.Duration
 	// IdleMin and IdleMax bound the idle poll of a channel with nothing due:
 	// it starts at IdleMin and doubles up to IdleMax. Defaults 50ms and 250ms.
 	IdleMin, IdleMax time.Duration
 }
+
+// DefaultSendAlign is SendAlign's default: above the claim's start-up p99.
+const DefaultSendAlign = 200 * time.Millisecond
 
 // Deps are the worker's collaborators.
 type Deps struct {
@@ -66,6 +86,8 @@ type Deps struct {
 	Tracer   trace.Tracer
 	// Rand returns a uniform value in [0, n]; default math/rand/v2.
 	Rand func(n int64) int64
+	// Now is the clock a job's lease is checked against; default time.Now.
+	Now func() time.Time
 }
 
 // Worker runs the delivery loop; Run once.
@@ -86,7 +108,10 @@ func New(cfg Config, deps Deps) *Worker {
 		cfg.IdleMin = 50 * time.Millisecond
 	}
 	if cfg.SendAlign <= 0 {
-		cfg.SendAlign = 200 * time.Millisecond
+		cfg.SendAlign = DefaultSendAlign
+	}
+	if cfg.Horizon <= 0 {
+		cfg.Horizon = 200 * time.Millisecond
 	}
 	if cfg.IdleMax < cfg.IdleMin {
 		cfg.IdleMax = max(250*time.Millisecond, cfg.IdleMin)
@@ -99,6 +124,9 @@ func New(cfg Config, deps Deps) *Worker {
 	}
 	if deps.Rand == nil {
 		deps.Rand = func(n int64) int64 { return rand.Int64N(n + 1) } //nolint:gosec // jitter, not security
+	}
+	if deps.Now == nil {
+		deps.Now = time.Now
 	}
 	if deps.Tracer == nil {
 		deps.Tracer = noop.NewTracerProvider().Tracer("worker")
@@ -115,12 +143,21 @@ func New(cfg Config, deps Deps) *Worker {
 	return &Worker{cfg: cfg, deps: deps}
 }
 
-// claimsInFlight is how many claims one channel loop runs at once.
-const claimsInFlight = 4
-
 // storeTimeout bounds one result write; it is not cut short by shutdown, so a
 // finished send is always recorded when the database answers.
 const storeTimeout = 10 * time.Second
+
+// leaseMargin is how long before its lease ends a provider call is cut, so
+// the attempt is recorded while the claim still holds. It also covers the
+// skew between the local clock and the database's.
+const leaseMargin = 250 * time.Millisecond
+
+// minSendTime is the least call time worth starting; with less lease left
+// the job is released instead.
+const minSendTime = 100 * time.Millisecond
+
+// errLeaseCut is the cause of a call ended by the lease, not the provider timeout.
+var errLeaseCut = errors.New("call cut before the lease ends")
 
 // Run delivers until ctx is cancelled. Then it stops claiming, lets in-flight
 // sends finish for up to ShutdownTimeout, releases what was claimed but not
@@ -130,14 +167,13 @@ func (w *Worker) Run(ctx context.Context) error {
 	sendCtx, cancelSends := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelSends()
 
-	slots := make(chan struct{}, w.cfg.Concurrency)
 	var inflight sync.WaitGroup
-
+	share := max(1, w.cfg.Concurrency/len(w.cfg.Channels))
 	g, gctx := errgroup.WithContext(ctx)
 	for _, ch := range w.cfg.Channels {
-		br := w.deps.Breakers[ch]
+		cr := w.newChannelRun(ch, share)
 		g.Go(func() error {
-			w.channelLoop(gctx, sendCtx, ch, br, slots, &inflight)
+			w.channelLoop(gctx, sendCtx, cr, &inflight)
 			return nil
 		})
 	}
@@ -164,11 +200,17 @@ func (w *Worker) Run(ctx context.Context) error {
 	return err
 }
 
-// channelState is what a channel's loop and its claim tasks share.
-type channelState struct {
-	// claiming bounds the claims in flight on this channel. A permit is only
-	// taken when a claim can start, so a slow database slows permit taking
-	// instead of letting claims pile up and reach the provider together.
+// channelRun is what a channel's loop, its claim groups and its sends share.
+type channelRun struct {
+	ch core.Channel
+	br *breaker.Breaker
+	// calling bounds the provider calls in flight on this channel: its share
+	// of Concurrency. While it is full the loop reserves no slots.
+	calling chan struct{}
+	// claiming bounds the claim groups in flight. A group claimed more than
+	// SendAlign after its slots were reserved has missed them, and a group
+	// starts every refill, so ceil(SendAlign/refill)+1 groups can be useful
+	// at once; more would only claim rows to release them.
 	claiming chan struct{}
 
 	mu   sync.Mutex
@@ -176,144 +218,278 @@ type channelState struct {
 	idle time.Duration // current idle poll; IdleMin while work is found
 }
 
-// channelLoop only waits for permits: it asks the breaker, takes a pool slot
-// and a permit, and hands the permit to a claim-and-send task on the pool.
-// It never waits on the database, so a permit that falls due always finds a
-// taker and the channel runs at the limiter's pace.
-func (w *Worker) channelLoop(ctx, sendCtx context.Context, ch core.Channel, br *breaker.Breaker, slots chan struct{}, inflight *sync.WaitGroup) {
-	st := &channelState{claiming: make(chan struct{}, claimsInFlight), sel: newSelector(w.cfg.Weights), idle: w.cfg.IdleMin}
+func (w *Worker) newChannelRun(ch core.Channel, share int) *channelRun {
+	refill := w.refill()
+	groups := int((w.cfg.SendAlign+refill-1)/refill) + 1
+	return &channelRun{
+		ch: ch, br: w.deps.Breakers[ch],
+		calling: make(chan struct{}, share), claiming: make(chan struct{}, groups),
+		sel: newSelector(w.cfg.Weights), idle: w.cfg.IdleMin,
+	}
+}
+
+// refill is how long after a reservation the next is asked for: by then half
+// the horizon can be reserved again, so one call reserves about Horizon/2 of
+// slots, and the reserved time never runs out while one worker is alive.
+func (w *Worker) refill() time.Duration { return max(w.cfg.Horizon/2, time.Millisecond) }
+
+// channelLoop reserves slots and hands each group to a claim task. It never
+// waits on the database, so reservations keep their cadence however long a
+// claim takes. It reserves nothing while every priority is known to be empty,
+// while the breaker refuses, or while the channel's provider calls are all in
+// flight.
+func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, inflight *sync.WaitGroup) {
 	limiterDown := false
+	interval := time.Millisecond // until the first grant says
 	for ctx.Err() == nil {
 		now := time.Now()
-		st.mu.Lock()
-		at := st.sel.nextCheck(now)
-		st.mu.Unlock()
+		cr.mu.Lock()
+		at := cr.sel.nextCheck(now)
+		cr.mu.Unlock()
 		if !at.IsZero() {
-			// Every priority had nothing due when last asked: no permit, no query.
 			sleep(ctx, at.Sub(now))
 			continue
 		}
-		if ok, wait := br.Allow(); !ok {
+		if len(cr.calling) == cap(cr.calling) {
+			sleep(ctx, w.cfg.IdleMin)
+			continue
+		}
+		first, ok, wait := cr.br.Allow()
+		if !ok {
 			sleep(ctx, min(wait, w.cfg.IdleMax))
 			continue
 		}
 		select {
-		case slots <- struct{}{}:
+		case cr.claiming <- struct{}{}:
 		case <-ctx.Done():
-			br.Cancel()
+			cr.br.Cancel(first)
 			return
 		}
-		select {
-		case st.claiming <- struct{}{}:
-		case <-ctx.Done():
-			<-slots
-			br.Cancel()
-			return
+		want := int(w.cfg.Horizon/interval) + 1
+		if first.Probe() {
+			want = 1 // the probe is one call
 		}
-		var once sync.Once
-		claimed := func() { once.Do(func() { <-st.claiming }) }
-		free := func() { claimed(); <-slots }
-
-		granted, wait, err := w.deps.Limiter.Take(ctx, ch, 1)
+		g, err := w.deps.Limiter.Take(ctx, cr.ch, want)
+		takenAt := time.Now()
 		if err != nil {
-			free()
-			br.Cancel()
+			<-cr.claiming
+			cr.br.Cancel(first)
 			if ctx.Err() != nil {
 				return
 			}
 			if !limiterDown {
-				slog.ErrorContext(ctx, "rate limiter unreachable; channel sends nothing", "channel", ch, "err", err)
+				slog.ErrorContext(ctx, "rate limiter unreachable; channel sends nothing", "channel", cr.ch, "err", err)
 				limiterDown = true
 			}
 			sleep(ctx, w.cfg.IdleMax)
 			continue
 		}
 		if limiterDown {
-			slog.InfoContext(ctx, "rate limiter reachable again", "channel", ch)
+			slog.InfoContext(ctx, "rate limiter reachable again", "channel", cr.ch)
 			limiterDown = false
 		}
-		if granted == 0 {
-			free()
-			br.Cancel()
-			sleep(ctx, wait)
+		if g.Interval > 0 {
+			interval = g.Interval
+		}
+		pause := g.Wait + w.refill()
+		if first.Probe() {
+			pause = g.Wait
+		}
+		if g.N == 0 {
+			<-cr.claiming
+			cr.br.Cancel(first)
+			sleep(ctx, pause)
 			continue
 		}
-		sendAt := time.Now().Add(w.cfg.SendAlign)
+		tickets := make([]breaker.Ticket, 1, g.N)
+		tickets[0] = first
+		for len(tickets) < g.N {
+			t, ok, _ := cr.br.Allow()
+			if !ok {
+				break // the breaker opened meanwhile: the other slots are lost
+			}
+			tickets = append(tickets, t)
+		}
+		// Server-now maps to a local moment within the Take's round trip;
+		// takenAt is its latest bound, so no request leaves before its slot.
+		base := takenAt.Add(g.First + w.cfg.SendAlign)
+		slots := make([]time.Time, len(tickets))
+		for i := range slots {
+			slots[i] = base.Add(time.Duration(i) * g.Interval)
+		}
+		tolerance := max(g.Interval, time.Millisecond)
 		inflight.Add(1)
 		go func() { // owned by Run through inflight
 			defer inflight.Done()
-			defer free()
-			w.claimAndDeliver(ctx, sendCtx, ch, st, br, claimed, sendAt)
+			defer func() { <-cr.claiming }()
+			w.claimGroup(ctx, sendCtx, cr, slots, tickets, tolerance, inflight)
+		}()
+		sleep(ctx, time.Until(takenAt.Add(pause)))
+	}
+}
+
+// claimGroup claims rows for a group of slots and starts one send per row,
+// each at its slot. A slot whose moment passed (by more than tolerance)
+// before a row was there for it is lost; so is a slot no row was found for.
+func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, slots []time.Time, tickets []breaker.Ticket, tolerance time.Duration, inflight *sync.WaitGroup) {
+	i := 0
+	skipMissed := func(now time.Time) {
+		for i < len(slots) && now.After(slots[i].Add(tolerance)) {
+			cr.br.Cancel(tickets[i])
+			i++
+		}
+	}
+	skipMissed(time.Now())
+	jobs, err := w.claim(ctx, cr, len(slots)-i)
+	if err != nil && ctx.Err() == nil {
+		slog.ErrorContext(ctx, "claim failed", "channel", cr.ch, "err", err)
+		cr.pause(time.Now().Add(w.cfg.IdleMax))
+	}
+	skipMissed(time.Now())
+	for _, job := range jobs {
+		jctx := jobContext(sendCtx, job)
+		w.publish(jctx, job, core.StatusProcessing, job.Attempts, "")
+		if i == len(slots) {
+			w.release(jctx, job, "claim outlasted its slots")
+			continue
+		}
+		at, tk := slots[i], tickets[i]
+		i++
+		inflight.Add(1)
+		go func() { // owned by Run through inflight
+			defer inflight.Done()
+			w.sendAt(ctx, jctx, cr, job, at, tk, tolerance)
 		}()
 	}
+	for ; i < len(slots); i++ {
+		cr.br.Cancel(tickets[i])
+	}
 }
 
-// claimAndDeliver spends one permit: it claims one notification and sends it.
-func (w *Worker) claimAndDeliver(ctx, sendCtx context.Context, ch core.Channel, st *channelState, br *breaker.Breaker, claimed func(), sendAt time.Time) {
-	job, ok, err := w.claimOne(ctx, ch, st)
-	claimed()
-	if err != nil {
-		br.Cancel()
-		if ctx.Err() == nil {
-			slog.ErrorContext(ctx, "claim failed", "channel", ch, "err", err)
-			st.pause(time.Now().Add(w.cfg.IdleMax))
-		}
-		return
-	}
-	if !ok {
-		br.Cancel()
-		return
-	}
-	jctx := jobContext(sendCtx, job)
-	w.publish(jctx, job, core.StatusProcessing, job.Attempts, "")
-	sleep(ctx, time.Until(sendAt)) // keep the permit's spacing at the provider
+// sendAt sends job at its slot moment at, or releases it unsent when that
+// cannot happen within tolerance.
+func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job, at time.Time, tk breaker.Ticket, tolerance time.Duration) {
+	sleep(ctx, time.Until(at))
 	if ctx.Err() != nil {
-		// Shutdown between claim and send: give it back unsent.
-		br.Cancel()
-		w.release(jctx, job)
+		cr.br.Cancel(tk)
+		w.release(jctx, job, "shutdown before the send")
 		return
 	}
-	w.deliver(jctx, job, br)
+	late := at.Add(tolerance)
+	select {
+	case cr.calling <- struct{}{}:
+	default:
+		t := time.NewTimer(time.Until(late))
+		select {
+		case cr.calling <- struct{}{}:
+			t.Stop()
+		case <-t.C:
+			cr.br.Cancel(tk)
+			w.release(jctx, job, "no free provider call at its slot")
+			return
+		case <-ctx.Done():
+			t.Stop()
+			cr.br.Cancel(tk)
+			w.release(jctx, job, "shutdown before the send")
+			return
+		}
+	}
+	defer func() { <-cr.calling }()
+	if time.Now().After(late) {
+		cr.br.Cancel(tk)
+		w.release(jctx, job, "slot missed")
+		return
+	}
+	if !cr.br.Current(tk) {
+		// The breaker opened after the claim: nothing goes out (decision 0008).
+		w.release(jctx, job, "breaker opened before the send")
+		return
+	}
+	w.deliver(jctx, job, cr.br, tk)
 }
 
-// pause makes the channel loop take no permit until until.
-func (st *channelState) pause(until time.Time) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	for _, p := range core.Priorities {
-		st.sel.markEmpty(p, until)
+// pause makes the channel loop reserve nothing until until.
+func (cr *channelRun) pause(until time.Time) {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	for i := range core.Priorities {
+		cr.sel.markEmpty(i, until)
 	}
 }
 
-// claimOne claims one due notification of ch for one permit, by the
-// selector's order. A priority found empty is skipped for the current idle
-// poll, which doubles while nothing at all is found.
-func (w *Worker) claimOne(ctx context.Context, ch core.Channel, st *channelState) (core.Job, bool, error) {
+// claim claims up to n due notifications of the channel: the selector splits
+// n by weight, then each priority is asked once, high to low, for its share
+// plus what the priorities above it could not use. What is still unused after
+// low goes up to the priorities that may have more. A priority that returned
+// fewer rows than asked is skipped for the current idle poll, which doubles
+// while nothing at all is found.
+func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]core.Job, error) {
+	if n <= 0 {
+		return nil, nil
+	}
 	now := time.Now()
-	st.mu.Lock()
-	order, idle := st.sel.order(now), st.idle
-	st.mu.Unlock()
-	for _, p := range order {
-		jobs, err := w.deps.Queue.Claim(ctx, ch, p, 1, w.cfg.Lease)
+	cr.mu.Lock()
+	counts, idle := cr.sel.plan(n, now), cr.idle
+	var empty [3]bool
+	for i := range empty {
+		empty[i] = cr.sel.empty(i, now)
+	}
+	cr.mu.Unlock()
+
+	var jobs []core.Job
+	var drained [3]bool // asked and got fewer than asked
+	ask := func(i, k int) (int, error) {
+		got, err := w.deps.Queue.Claim(ctx, cr.ch, priorityName(i), k, w.cfg.Lease)
 		if err != nil {
-			return core.Job{}, false, err
+			return 0, err
 		}
-		st.mu.Lock()
-		if len(jobs) > 0 {
-			st.sel.markBusy(p)
-			st.idle = w.cfg.IdleMin
-			st.mu.Unlock()
-			return jobs[0], true, nil
+		jobs = append(jobs, got...)
+		cr.mu.Lock()
+		if len(got) < k {
+			drained[i] = true
+			cr.sel.markEmpty(i, now.Add(idle))
+		} else {
+			cr.sel.markBusy(i)
 		}
-		st.sel.markEmpty(p, now.Add(idle))
-		st.mu.Unlock()
+		cr.mu.Unlock()
+		return len(got), nil
 	}
-	if len(order) > 0 {
-		st.mu.Lock()
-		st.idle = min(st.idle*2, w.cfg.IdleMax)
-		st.mu.Unlock()
+	carry := 0
+	var err error
+	for i := range 3 {
+		k := counts[i] + carry
+		carry = 0
+		if k == 0 {
+			continue
+		}
+		if empty[i] {
+			carry = k
+			continue
+		}
+		var got int
+		if got, err = ask(i, k); err != nil {
+			break
+		}
+		carry = k - got
 	}
-	return core.Job{}, false, nil
+	for i := 2; err == nil && i >= 0 && carry > 0; i-- {
+		if empty[i] || drained[i] {
+			continue
+		}
+		var got int
+		if got, err = ask(i, carry); err != nil {
+			break
+		}
+		carry -= got
+	}
+	cr.mu.Lock()
+	if len(jobs) == 0 {
+		cr.idle = min(cr.idle*2, w.cfg.IdleMax)
+	} else {
+		cr.idle = w.cfg.IdleMin
+	}
+	cr.mu.Unlock()
+	return jobs, err
 }
 
 // jobContext carries the ids every log line about the job needs.
@@ -322,7 +498,18 @@ func jobContext(ctx context.Context, job core.Job) context.Context {
 }
 
 // deliver makes one provider call for a claimed job and writes the result.
-func (w *Worker) deliver(ctx context.Context, job core.Job, br *breaker.Breaker) {
+// The call ends leaseMargin before the lease does (or at the provider
+// timeout, whichever is first); with less than minSendTime of lease left it is
+// not made and the job is released.
+func (w *Worker) deliver(ctx context.Context, job core.Job, br *breaker.Breaker, tk breaker.Ticket) {
+	left := job.LeaseUntil.Sub(w.deps.Now()) - leaseMargin
+	if left < minSendTime {
+		br.Cancel(tk)
+		slog.WarnContext(ctx, "lease too close to its end to send; released", "channel", job.Channel,
+			"lease_left_ms", (left + leaseMargin).Milliseconds())
+		w.release(ctx, job, "lease too short")
+		return
+	}
 	// The delivery span continues the accepting request's trace (B5): it is a
 	// child of the stored traceparent, or the root of a new trace without one.
 	if job.Traceparent != "" {
@@ -339,19 +526,27 @@ func (w *Worker) deliver(ctx context.Context, job core.Job, br *breaker.Breaker)
 	defer span.End()
 
 	start := time.Now()
-	res, err := w.deps.Sender.Send(ctx, provider.Message{
+	callCtx, cancelCall := context.WithTimeoutCause(ctx, left, errLeaseCut)
+	res, err := w.deps.Sender.Send(callCtx, provider.Message{
 		Channel: job.Channel, To: job.To, Content: job.Content, Key: job.ID, CorrelationID: job.CorrelationID,
 	})
+	cut := errors.Is(context.Cause(callCtx), errLeaseCut)
+	cancelCall()
 	elapsed := time.Since(start)
 	if err != nil && ctx.Err() != nil {
 		// Shutdown aborted the call: not an attempt; give the job back.
-		br.Cancel()
+		br.Cancel(tk)
 		span.SetStatus(codes.Error, "aborted by shutdown")
-		w.release(ctx, job)
+		w.release(ctx, job, "shutdown aborted the call")
 		return
 	}
+	if err != nil && cut {
+		// No answer within the lease: a timeout, recorded now, while the
+		// claim still holds.
+		err = fmt.Errorf("%w: %w (%s before its end)", provider.ErrTimeout, errLeaseCut, leaseMargin)
+	}
 	v := provider.Classify(res.Status, err, res.Header)
-	br.Done(!v.ProviderFault)
+	br.Done(tk, !v.ProviderFault)
 	a := core.Attempt{
 		StartedAt: start, Duration: elapsed, Outcome: v.Outcome, HTTPStatus: res.Status,
 		Error: v.Error, ProviderMessageID: res.MessageID,
@@ -408,14 +603,14 @@ func (w *Worker) deliver(ctx context.Context, job core.Job, br *breaker.Breaker)
 }
 
 // release returns an unsent job to pending, due now, without an attempt.
-func (w *Worker) release(ctx context.Context, job core.Job) {
+func (w *Worker) release(ctx context.Context, job core.Job, reason string) {
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)
 	defer cancel()
 	if err := w.deps.Queue.Release(wctx, job, time.Now()); err != nil {
-		slog.WarnContext(ctx, "release failed; the lease will expire", "err", err)
+		slog.WarnContext(ctx, "release failed; the lease will expire", "reason", reason, "err", err)
 		return
 	}
-	slog.InfoContext(ctx, "released unsent notification", "channel", job.Channel)
+	slog.DebugContext(ctx, "released unsent notification", "channel", job.Channel, "reason", reason)
 	w.publish(ctx, job, core.StatusPending, job.Attempts, "")
 }
 
@@ -432,6 +627,7 @@ func (w *Worker) publish(ctx context.Context, job core.Job, st core.Status, atte
 	}
 }
 
+// reaper returns expired leases to pending and publishes each change.
 func (w *Worker) reaper(ctx context.Context) {
 	t := time.NewTicker(w.cfg.ReapInterval)
 	defer t.Stop()
@@ -441,12 +637,16 @@ func (w *Worker) reaper(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		n, err := w.deps.Queue.ReapExpired(ctx)
-		switch {
-		case err != nil && ctx.Err() == nil:
+		jobs, err := w.deps.Queue.ReapExpired(ctx)
+		if err != nil && ctx.Err() == nil {
 			slog.ErrorContext(ctx, "reap expired leases", "err", err)
-		case n > 0:
-			slog.InfoContext(ctx, "returned expired leases to pending", "count", n)
+		}
+		if len(jobs) > 0 {
+			slog.InfoContext(ctx, "returned expired leases to pending", "count", len(jobs))
+		}
+		// What was reaped is committed even when a later batch failed.
+		for _, job := range jobs {
+			w.publish(jobContext(ctx, job), job, core.StatusPending, job.Attempts, "")
 		}
 	}
 }
@@ -480,5 +680,6 @@ func sleep(ctx context.Context, d time.Duration) {
 
 // String is for logs of a worker's configuration.
 func (c Config) String() string {
-	return fmt.Sprintf("concurrency=%d max_attempts=%d weights=%v", c.Concurrency, c.MaxAttempts, c.Weights)
+	return fmt.Sprintf("concurrency=%d max_attempts=%d weights=%v horizon=%s send_align=%s",
+		c.Concurrency, c.MaxAttempts, c.Weights, c.Horizon, c.SendAlign)
 }

@@ -46,6 +46,9 @@ func (s *Queue) Claim(ctx context.Context, channel core.Channel, priority core.P
 }
 
 func (s *Queue) claimOnce(ctx context.Context, channel core.Channel, priority core.Priority, n int, lease time.Duration) ([]core.Job, error) {
+	// Taken before the transaction, so LeaseUntil is never later than the
+	// lease_until the database sets (the worker stops sending by it).
+	started := time.Now()
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("claim: begin: %w", err)
@@ -82,8 +85,9 @@ func (s *Queue) claimOnce(ctx context.Context, channel core.Channel, priority co
 			Attempts: int(r.Attempts),
 			// Exact: the row lock is held from the SELECT to the commit.
 			ClaimVersion: r.ClaimVersion + 1,
-			// Informational: the fenced value is claim_version, not this time.
-			LeaseUntil:    time.Now().Add(lease),
+			// A lower bound on the local clock: the worker sends only while
+			// it holds. The fenced value is claim_version.
+			LeaseUntil:    started.Add(lease),
 			DueAt:         r.DueAt,
 			CorrelationID: r.CorrelationID,
 			Traceparent:   r.Traceparent.String,
@@ -195,22 +199,71 @@ func (s *Queue) Release(ctx context.Context, job core.Job, dueAt time.Time) erro
 	return nil
 }
 
-// ReapExpired returns notifications whose lease ran out to pending.
-func (s *Queue) ReapExpired(ctx context.Context) (int, error) {
+// ReapExpired returns notifications whose lease ran out to pending and
+// reports them (ID, BatchID, Channel, Attempts, CorrelationID), so the caller
+// can publish the change. Each batch of up to 1000 is locked, updated and
+// committed in one READ COMMITTED transaction; concurrent reapers skip each
+// other's rows.
+func (s *Queue) ReapExpired(ctx context.Context) ([]core.Job, error) {
 	if err := core.Transition(core.StatusProcessing, core.StatusPending); err != nil {
-		return 0, err
+		return nil, err
 	}
-	total := 0
+	var all []core.Job
 	for {
-		n, err := s.q.ReapExpiredLeases(ctx)
+		var jobs []core.Job
+		err := retryLockConflict(ctx, func() error {
+			var err error
+			jobs, err = s.reapOnce(ctx)
+			return err
+		})
+		all = append(all, jobs...)
 		if err != nil {
-			return total, fmt.Errorf("reap: %w", err)
+			return all, err
 		}
-		total += int(n)
-		if n < 1000 {
-			return total, nil
+		if len(jobs) < reapBatch {
+			return all, nil
 		}
 	}
+}
+
+// reapBatch is the LIMIT of ReapCandidates.
+const reapBatch = 1000
+
+func (s *Queue) reapOnce(ctx context.Context) ([]core.Job, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("reap: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := s.q.WithTx(tx)
+	rows, err := q.ReapCandidates(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reap: select: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	ids := make([]string, len(rows))
+	jobs := make([]core.Job, len(rows))
+	for i, r := range rows {
+		ids[i] = r.ID
+		jobs[i] = core.Job{
+			ID: r.ID, BatchID: r.BatchID.String, Channel: core.Channel(r.Channel),
+			Attempts: int(r.Attempts), CorrelationID: r.CorrelationID,
+		}
+	}
+	n, err := q.ReapLeases(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("reap: update: %w", err)
+	}
+	if n != int64(len(ids)) {
+		// Cannot happen while the row locks are held; report nothing rather than a wrong list.
+		return nil, fmt.Errorf("reap: %d of %d locked rows changed", n, len(ids))
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("reap: commit: %w", err)
+	}
+	return jobs, nil
 }
 
 // lockRetries is how often a transaction InnoDB rolled back as a deadlock

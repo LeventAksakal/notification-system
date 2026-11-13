@@ -6,18 +6,18 @@ import (
 	"github.com/LeventAksakal/notification-system/internal/core"
 )
 
-// selector splits one channel's permits between the priorities (decision
-// 0010). Each permit goes to the priority chosen by smooth weighted round
-// robin over the weights; a priority with nothing due lends the permit to the
-// next priority down, then up. A priority found empty is not asked again
-// until its emptyUntil passes, so borrowing costs one claim query, not three.
+// selector splits one channel's send slots between the priorities (decision
+// 0010). Each slot goes to the priority chosen by smooth weighted round robin
+// over the weights; a priority known to have nothing due lends the slot to
+// the next priority down, then up. A priority found empty is not asked again
+// until its emptyUntil passes, so borrowing costs no extra claim query.
 //
-// A selector belongs to one channel loop goroutine; it is not locked.
+// A selector is guarded by its channel's mutex.
 type selector struct {
 	weights [3]int
 	total   int
 	current [3]int
-	// emptyUntil[i]: priority i had nothing due when last asked.
+	// emptyUntil[i]: priority i had nothing (more) due when last asked.
 	emptyUntil [3]time.Time
 }
 
@@ -32,7 +32,7 @@ func newSelector(weights [3]int) *selector {
 	return s
 }
 
-// next advances the round robin and returns the priority this permit belongs to.
+// next advances the round robin and returns the priority the next slot belongs to.
 func (s *selector) next() int {
 	best := 0
 	for i := range s.current {
@@ -45,33 +45,49 @@ func (s *selector) next() int {
 	return best
 }
 
-// order is the claim order for one permit: the chosen priority, then the
-// lower ones, then the higher ones, skipping those known to be empty at now.
-func (s *selector) order(now time.Time) []core.Priority {
-	p := s.next()
-	out := make([]core.Priority, 0, 3)
-	add := func(i int) {
-		if !now.Before(s.emptyUntil[i]) {
-			out = append(out, core.Priorities[i])
+// plan splits n slots: counts[i] is how many priority i should claim. A slot
+// whose priority is known to be empty at now goes to the first priority in
+// lending order (down, then up) that is not.
+func (s *selector) plan(n int, now time.Time) [3]int {
+	var counts [3]int
+	for range n {
+		if i, ok := s.lend(s.next(), now); ok {
+			counts[i]++
 		}
 	}
-	add(p)
+	return counts
+}
+
+// lend returns p, else the nearest lower priority, else the nearest higher
+// one, skipping those known to be empty at now.
+func (s *selector) lend(p int, now time.Time) (int, bool) {
+	for _, i := range lendOrder(p) {
+		if !s.empty(i, now) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// lendOrder is p, the lower priorities, then the higher ones.
+func lendOrder(p int) []int {
+	out := []int{p}
 	for i := p + 1; i < 3; i++ {
-		add(i)
+		out = append(out, i)
 	}
 	for i := p - 1; i >= 0; i-- {
-		add(i)
+		out = append(out, i)
 	}
 	return out
 }
 
-// markEmpty records that p had nothing due; it is skipped until until.
-func (s *selector) markEmpty(p core.Priority, until time.Time) {
-	s.emptyUntil[index(p)] = until
-}
+func (s *selector) empty(i int, now time.Time) bool { return now.Before(s.emptyUntil[i]) }
+
+// markEmpty records that p had nothing more due; it is skipped until until.
+func (s *selector) markEmpty(i int, until time.Time) { s.emptyUntil[i] = until }
 
 // markBusy forgets that p was empty.
-func (s *selector) markBusy(p core.Priority) { s.emptyUntil[index(p)] = time.Time{} }
+func (s *selector) markBusy(i int) { s.emptyUntil[i] = time.Time{} }
 
 // nextCheck is the earliest time a priority known to be empty is asked again;
 // the zero time when one is not known to be empty at now.
@@ -88,11 +104,5 @@ func (s *selector) nextCheck(now time.Time) time.Time {
 	return earliest
 }
 
-func index(p core.Priority) int {
-	for i, q := range core.Priorities {
-		if q == p {
-			return i
-		}
-	}
-	return len(core.Priorities) - 1
-}
+// priorityName is the priority at index i (high, normal, low).
+func priorityName(i int) core.Priority { return core.Priorities[i] }

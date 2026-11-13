@@ -37,6 +37,7 @@ type Config struct {
 
 	RateLimitPerSecond   int
 	RateLimitHeadroomPct int
+	RateLimitHorizon     time.Duration
 	PriorityWeights      [3]int // high, normal, low
 	LeaseDuration        time.Duration
 	ReapInterval         time.Duration
@@ -94,12 +95,18 @@ var Dials = []Dial{
 	integer("APP_RATE_LIMIT_PER_SECOND", "100", "provider's send limit per channel, per second", 1, 100_000,
 		func(c *Config) *int { return &c.RateLimitPerSecond }),
 	integer("APP_RATE_LIMIT_HEADROOM_PERCENT", "3",
-		"the limiter paces this many percent under the limit, so arrival jitter cannot exceed it at the provider", 0, 50,
+		"the limiter paces this many percent under the limit; send slots are exactly one interval apart, "+
+			"so 0 is exact at the limiter but leaves no room for arrival jitter at the provider", 0, 50,
 		func(c *Config) *int { return &c.RateLimitHeadroomPct }),
+	duration("APP_RATE_LIMIT_HORIZON", "200ms", "how far ahead a worker may reserve send slots; about half of it is reserved per limiter call",
+		10*time.Millisecond, 2*time.Second,
+		func(c *Config) *time.Duration { return &c.RateLimitHorizon }),
 	{Env: "APP_PRIORITY_WEIGHTS", Default: "70,20,10",
-		Doc:   "high,normal,low shares of a channel's rate; each [0..100], sum above 0; unused share is borrowed",
+		Doc: "high,normal,low shares of a channel's rate; each [0..100], sum above 0; unused share is borrowed. " +
+			"A weight of 0 means that priority only sends on slots the others leave unused",
 		apply: func(c *Config, raw string) error { return parseWeights(raw, &c.PriorityWeights) }},
-	duration("APP_LEASE_DURATION", "30s", "how long a claimed notification belongs to its worker", 100*time.Millisecond, time.Hour,
+	duration("APP_LEASE_DURATION", "30s",
+		"how long a claimed notification belongs to its worker; a provider call is cut 250ms before it ends", time.Second, time.Hour,
 		func(c *Config) *time.Duration { return &c.LeaseDuration }),
 	duration("APP_REAP_INTERVAL", "5s", "how often expired leases are returned to pending", 10*time.Millisecond, 10*time.Minute,
 		func(c *Config) *time.Duration { return &c.ReapInterval }),
