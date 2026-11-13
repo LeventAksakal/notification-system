@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Notification system
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Accepts notification requests (sms, email, push), queues them, and delivers them to an
     external provider with rate limiting, priorities, retries and status tracking.
@@ -22,7 +22,8 @@ info:
     - Limits (single source: `internal/core/limits.go`): sms `to` is E.164, content 1..1600
       characters; email `to` is an address of at most 254 characters, content 1..100000; push
       `to` is a device token of 1..255 characters, content 1..1024. Length is counted in
-      characters, not bytes. A batch holds 1..1000 notifications.
+      characters, not bytes. A batch holds 1..1000 notifications. A request body is at most
+      8 MiB (`413 request_too_large`).
 servers:
   - url: http://localhost:8080
 tags:
@@ -92,6 +93,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Notification" }
         "400": { $ref: "#/components/responses/InvalidRequest" }
+        "413": { $ref: "#/components/responses/RequestTooLarge" }
         "422": { $ref: "#/components/responses/IdempotencyKeyReused" }
     get:
       tags: [notifications]
@@ -152,6 +154,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/BatchCreated" }
         "400": { $ref: "#/components/responses/InvalidRequest" }
+        "413": { $ref: "#/components/responses/RequestTooLarge" }
         "422": { $ref: "#/components/responses/IdempotencyKeyReused" }
   /v1/notifications/{id}:
     get:
@@ -335,7 +338,8 @@ components:
       name: Idempotency-Key
       in: header
       required: false
-      schema: { type: string, minLength: 1, maxLength: 255 }
+      description: Visible ASCII, no spaces
+      schema: { type: string, minLength: 1, maxLength: 255, pattern: "^[!-~]+$" }
     CorrelationId:
       name: X-Correlation-ID
       in: header
@@ -370,6 +374,11 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
     Conflict:
       description: The resource is not in a state that allows this action
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RequestTooLarge:
+      description: The request body is larger than 8 MiB (`request_too_large`)
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -662,7 +671,7 @@ components:
       properties:
         code:
           type: string
-          description: invalid_request, not_found, not_cancellable, not_retryable, idempotency_key_reused, internal
+          description: invalid_request, not_found, not_cancellable, not_retryable, idempotency_key_reused, request_too_large, internal
         message: { type: string }
         details:
           type: array

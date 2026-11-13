@@ -57,8 +57,9 @@ CREATE TABLE notifications (
   KEY lease_idx (status, lease_until),
   -- Batch items in request order.
   KEY batch_idx (batch_id, batch_index),
-  -- Lists newest first, filtered by channel (status filters use claim_idx's prefix or the primary key).
+  -- Lists newest first, filtered by channel or by status.
   KEY list_channel_idx (channel, id),
+  KEY list_status_idx (status, id),
   -- Metrics: what finished inside a window.
   KEY finished_idx (finished_at, status, channel)
 );
