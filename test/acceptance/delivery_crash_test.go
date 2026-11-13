@@ -136,8 +136,12 @@ func TestDeliveryR5CancelRacesClaim(t *testing.T) {
 	for i := range n {
 		wg.Go(func() {
 			r, err := s.send(http.MethodPost, "/v1/notifications", msg(chans[i%3], fmt.Sprintf("R5 race %d", i)))
-			if err != nil || r.Status != http.StatusCreated {
-				results[i].err = fmt.Errorf("create: %v %v", r, err)
+			if err != nil {
+				results[i].err = fmt.Errorf("create: %w", err)
+				return
+			}
+			if r.Status != http.StatusCreated {
+				results[i].err = fmt.Errorf("create: %v", r)
 				return
 			}
 			var created notification
