@@ -32,6 +32,7 @@ import (
 	"github.com/LeventAksakal/notification-system/internal/limiter"
 	"github.com/LeventAksakal/notification-system/internal/obs"
 	"github.com/LeventAksakal/notification-system/internal/provider"
+	"github.com/LeventAksakal/notification-system/internal/realtime"
 	"github.com/LeventAksakal/notification-system/internal/store"
 	delivery "github.com/LeventAksakal/notification-system/internal/worker"
 )
@@ -135,7 +136,7 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		Queue:     store.NewQueue(db),
 		Limiter:   limiter.New(vk, cfg.RateLimitPerSecond, cfg.RateLimitHeadroomPct, cfg.RateLimitHorizon, "ratelimit:"),
 		Sender:    provider.New(cfg.ProviderURLs, cfg.ProviderTimeout, cfg.WorkerConcurrency),
-		Publisher: noopPublisher{},
+		Publisher: realtime.NewPublisher(vk, realtime.OriginWorker),
 		Breakers:  breakers,
 		Tracer:    otel.Tracer("notifier/worker"),
 	})
@@ -147,12 +148,6 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 	return err
 }
 
-// noopPublisher drops status changes until the realtime slice replaces it
-// with the Valkey publisher.
-type noopPublisher struct{}
-
-func (noopPublisher) Publish(context.Context, core.Event) error { return nil }
-
 func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 	vk, err := connectValkey(cfg)
 	if err != nil {
@@ -160,11 +155,23 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 	}
 	defer vk.Close()
 
-	svc := intake.New(db, noopPublisher{}, cfg.IdempotencyRetention)
+	// One Valkey subscription per process feeds every WebSocket (decision 0013).
+	hub := realtime.NewHub(vk)
+	svc := intake.New(db, realtime.NewPublisher(vk, realtime.OriginAPI), cfg.IdempotencyRetention)
 	srv := api.NewServer(svc, map[string]api.Check{
-		"mysql":  db.PingContext,
-		"valkey": func(ctx context.Context) error { return vk.Do(ctx, vk.B().Ping().Build()).Error() },
-	})
+		"mysql": db.PingContext,
+		// Ready only while events reach this instance: a subscriber accepted
+		// now must not miss the next change.
+		"valkey": func(ctx context.Context) error {
+			if err := vk.Do(ctx, vk.B().Ping().Build()).Error(); err != nil {
+				return err
+			}
+			if !hub.Live() {
+				return errors.New("status event subscription not active")
+			}
+			return nil
+		},
+	}, api.Options{Metrics: store.NewMetricsReader(db), Hub: hub, WSSendBuffer: cfg.WSSendBuffer})
 	h, err := srv.Handler()
 	if err != nil {
 		return err
@@ -174,12 +181,20 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	slog.InfoContext(ctx, "serving", "addr", ln.Addr().String())
-	// The sweep lives and stops with the server: a server error cancels it.
+	// The sweep and the hub live and stop with the server: a server error
+	// cancels them. Open WebSockets are hijacked connections that
+	// http.Server.Shutdown does not wait for; CloseStreams ends them.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		return serveHTTP(gctx, ln, &http.Server{Handler: h, ReadHeaderTimeout: cfg.ReadHeaderTimeout}, cfg.ShutdownTimeout)
 	})
 	g.Go(func() error { return svc.SweepIdempotencyKeys(gctx, cfg.IdempotencySweep) })
+	g.Go(func() error { return hub.Run(gctx) })
+	g.Go(func() error {
+		<-gctx.Done()
+		srv.CloseStreams()
+		return nil
+	})
 	return g.Wait()
 }
 
