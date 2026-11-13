@@ -261,7 +261,7 @@ type tcpProxy struct {
 
 func newTCPProxy(t *testing.T, target string) *tcpProxy {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
@@ -279,7 +279,7 @@ func (p *tcpProxy) serve() {
 		if err != nil {
 			return
 		}
-		up, err := net.DialTimeout("tcp", p.target, 5*time.Second)
+		up, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(context.Background(), "tcp", p.target)
 		if err != nil {
 			_ = down.Close()
 			continue
