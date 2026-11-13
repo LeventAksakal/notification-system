@@ -4,6 +4,7 @@ package acceptance
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -118,7 +119,11 @@ func TestR10LimitsAgreeSpecAndCore(t *testing.T) {
 		if p == nil {
 			return -1
 		}
-		return int(*p)
+		if *p <= math.MaxInt32 {
+			return int(*p)
+		}
+		t.Fatalf("spec limit %d does not fit an int", *p)
+		return -1
 	}
 	create := schema("NotificationCreate")
 	tref := schema("TemplateRef")
