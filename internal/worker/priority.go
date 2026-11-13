@@ -21,7 +21,15 @@ type selector struct {
 	emptyUntil [3]time.Time
 	// idle[i] is priority i's current idle poll.
 	idle [3]time.Duration
+	// hadRows[i] is when priority i last returned rows.
+	hadRows [3]time.Time
 }
+
+// recentRows is how long after it last returned rows a priority found empty
+// is still asked again after the shortest idle poll: rows released unsent
+// (a missed slot) come back at once, and a long back-off would leave them
+// waiting while the channel's slots go unused.
+const recentRows = time.Second
 
 func newSelector(weights [3]int) *selector {
 	s := &selector{weights: weights}
@@ -86,11 +94,14 @@ func lendOrder(p int) []int {
 func (s *selector) empty(i int, now time.Time) bool { return now.Before(s.emptyUntil[i]) }
 
 // markEmpty records at now that priority i had nothing more due; it is
-// skipped for its idle poll: lo after it had rows, doubling up to hi while it
-// keeps having none.
+// skipped for its idle poll: lo while it had rows within recentRows,
+// doubling up to hi while it keeps having none.
 func (s *selector) markEmpty(i int, now time.Time, hadRows bool, lo, hi time.Duration) {
+	if hadRows {
+		s.hadRows[i] = now
+	}
 	switch {
-	case hadRows || s.idle[i] < lo:
+	case now.Sub(s.hadRows[i]) < recentRows || s.idle[i] < lo:
 		s.idle[i] = lo
 	default:
 		s.idle[i] = min(s.idle[i]*2, hi)
@@ -98,8 +109,10 @@ func (s *selector) markEmpty(i int, now time.Time, hadRows bool, lo, hi time.Dur
 	s.emptyUntil[i] = now.Add(s.idle[i])
 }
 
-// markBusy forgets that p was empty.
-func (s *selector) markBusy(i int) { s.emptyUntil[i], s.idle[i] = time.Time{}, 0 }
+// markBusy records at now that priority i returned every row asked for.
+func (s *selector) markBusy(i int, now time.Time) {
+	s.emptyUntil[i], s.idle[i], s.hadRows[i] = time.Time{}, 0, now
+}
 
 // nextCheck is the earliest time a priority known to be empty is asked again;
 // the zero time when one is not known to be empty at now.

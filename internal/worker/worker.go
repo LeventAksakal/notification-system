@@ -45,8 +45,10 @@ type Sender interface {
 // Config is the worker's dials.
 type Config struct {
 	// Concurrency is APP_WORKER_CONCURRENCY: provider calls in flight per
-	// process. Each channel gets an equal share (at least 1), so a channel
-	// whose provider hangs cannot hold the others' calls.
+	// process. Each channel has places of its own (Concurrency/(2*channels),
+	// at least 1) and shares the rest with the others, so a channel whose
+	// provider hangs can hold at most its own places and the shared ones,
+	// never another channel's.
 	Concurrency     int
 	MaxAttempts     int           // APP_MAX_ATTEMPTS
 	RetryBase       time.Duration // APP_RETRY_BASE
@@ -168,10 +170,12 @@ func (w *Worker) Run(ctx context.Context) error {
 	defer cancelSends()
 
 	var inflight sync.WaitGroup
-	share := max(1, w.cfg.Concurrency/len(w.cfg.Channels))
+	n := len(w.cfg.Channels)
+	own := max(1, w.cfg.Concurrency/(2*n))
+	shared := make(chan struct{}, max(0, w.cfg.Concurrency-own*n))
 	g, gctx := errgroup.WithContext(ctx)
 	for _, ch := range w.cfg.Channels {
-		cr := w.newChannelRun(ch, share)
+		cr := w.newChannelRun(ch, callPlaces{own: make(chan struct{}, own), shared: shared})
 		g.Go(func() error {
 			w.channelLoop(gctx, sendCtx, cr, &inflight)
 			return nil
@@ -204,9 +208,9 @@ func (w *Worker) Run(ctx context.Context) error {
 type channelRun struct {
 	ch core.Channel
 	br *breaker.Breaker
-	// calling bounds the provider calls in flight on this channel: its share
-	// of Concurrency. While it is full the loop reserves no slots.
-	calling chan struct{}
+	// calling bounds the provider calls in flight on this channel. While no
+	// place is free the loop reserves no slots.
+	calling callPlaces
 	// claiming holds the one claim in flight on this channel. The next slots
 	// are reserved only once the previous claim is done: a claim normally
 	// takes a fraction of refill, and while the database is slow this worker
@@ -221,12 +225,52 @@ type channelRun struct {
 	sel *selector
 }
 
-func (w *Worker) newChannelRun(ch core.Channel, share int) *channelRun {
+func (w *Worker) newChannelRun(ch core.Channel, calling callPlaces) *channelRun {
 	return &channelRun{
 		ch: ch, br: w.deps.Breakers[ch],
-		calling: make(chan struct{}, share), claiming: make(chan struct{}, 1),
+		calling: calling, claiming: make(chan struct{}, 1),
 		sel: newSelector(w.cfg.Weights),
 	}
+}
+
+// callPlaces are the places a channel's provider calls take: the channel's
+// own first, then the process's shared ones.
+type callPlaces struct {
+	own    chan struct{}
+	shared chan struct{}
+}
+
+// full reports whether no place is free now.
+func (p callPlaces) full() bool {
+	return len(p.own) == cap(p.own) && len(p.shared) == cap(p.shared)
+}
+
+// take takes a place, waiting until deadline at most; it returns the func
+// that gives the place back, or false when none came free in time or ctx ended.
+func (p callPlaces) take(ctx context.Context, deadline time.Time) (func(), bool) {
+	giveOwn := func() { <-p.own }
+	giveShared := func() { <-p.shared }
+	select {
+	case p.own <- struct{}{}:
+		return giveOwn, true
+	default:
+	}
+	select {
+	case p.shared <- struct{}{}:
+		return giveShared, true
+	default:
+	}
+	t := time.NewTimer(time.Until(deadline))
+	defer t.Stop()
+	select {
+	case p.own <- struct{}{}:
+		return giveOwn, true
+	case p.shared <- struct{}{}:
+		return giveShared, true
+	case <-t.C:
+	case <-ctx.Done():
+	}
+	return nil, false
 }
 
 // refill is how long after a reservation the next is asked for: by then half
@@ -250,7 +294,7 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			sleep(ctx, at.Sub(now))
 			continue
 		}
-		if len(cr.calling) == cap(cr.calling) {
+		if cr.calling.full() {
 			sleep(ctx, w.cfg.IdleMin)
 			continue
 		}
@@ -376,28 +420,20 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job,
 		return
 	}
 	late := at.Add(tolerance)
-	select {
-	case cr.calling <- struct{}{}:
-	default:
-		t := time.NewTimer(time.Until(late))
-		select {
-		case cr.calling <- struct{}{}:
-			t.Stop()
-		case <-t.C:
-			cr.br.Cancel(tk)
-			w.release(jctx, job, "no free provider call at its slot")
-			return
-		case <-ctx.Done():
-			t.Stop()
-			cr.br.Cancel(tk)
-			w.release(jctx, job, "shutdown before the send")
-			return
+	give, ok := cr.calling.take(ctx, late)
+	if !ok {
+		cr.br.Cancel(tk)
+		reason := "no free provider call at its slot"
+		if ctx.Err() != nil {
+			reason = "shutdown before the send"
 		}
+		w.release(jctx, job, reason)
+		return
 	}
 	// The place is held for the provider call only, not for the database
 	// writes around it.
 	var once sync.Once
-	callDone := func() { once.Do(func() { <-cr.calling }) }
+	callDone := func() { once.Do(give) }
 	defer callDone()
 	if time.Now().After(late) {
 		callDone()
@@ -455,7 +491,7 @@ func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]core.Job, 
 			drained[i] = true
 			cr.sel.markEmpty(i, now, len(got) > 0, w.cfg.IdleMin, w.cfg.IdleMax)
 		} else {
-			cr.sel.markBusy(i)
+			cr.sel.markBusy(i, now)
 		}
 		cr.mu.Unlock()
 		return len(got), nil
