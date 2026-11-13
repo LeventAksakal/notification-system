@@ -13,7 +13,7 @@ import (
 	middleware "github.com/oapi-codegen/nethttp-middleware"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
-	"github.com/LeventAksakal/notification-system/internal/store/sqlc"
+	"github.com/LeventAksakal/notification-system/internal/intake"
 )
 
 // Check reports whether one dependency answers.
@@ -22,18 +22,18 @@ type Check func(ctx context.Context) error
 // Server implements the generated StrictServerInterface. Operations not yet
 // built live in unimplemented.go and answer 501.
 type Server struct {
-	q      sqlc.Querier
+	intake *intake.Service
 	checks map[string]Check
 }
 
 var _ StrictServerInterface = (*Server)(nil)
 
-// NewServer takes the queries and the readiness checks by dependency name.
-func NewServer(q sqlc.Querier, checks map[string]Check) *Server {
-	return &Server{q: q, checks: checks}
+// NewServer takes the intake service and the readiness checks by dependency name.
+func NewServer(svc *intake.Service, checks map[string]Check) *Server {
+	return &Server{intake: svc, checks: checks}
 }
 
-// Handler returns the full HTTP stack: tracing, then the routes that live
+// Handler returns the full HTTP stack: tracing, the correlation id, then the routes that live
 // outside the contract (/openapi.json, /docs, the WebSocket), then spec
 // validation (so a request the contract forbids never reaches a handler),
 // then the generated handlers.
@@ -63,7 +63,7 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.Handle("GET /docs", docsHandler())
 	mux.HandleFunc("GET /v1/ws", s.streamEvents)
 	mux.Handle("/", validated)
-	return otelhttp.NewHandler(mux, "http"), nil
+	return otelhttp.NewHandler(withCorrelation(mux), "http"), nil
 }
 
 func (s *Server) Health(context.Context, HealthRequestObject) (HealthResponseObject, error) {

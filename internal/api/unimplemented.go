@@ -14,50 +14,6 @@ var ErrNotImplemented = errors.New("not implemented")
 
 func notImplemented(op string) error { return fmt.Errorf("%s: %w", op, ErrNotImplemented) }
 
-func (s *Server) CreateNotification(context.Context, CreateNotificationRequestObject) (CreateNotificationResponseObject, error) {
-	return nil, notImplemented("createNotification")
-}
-
-func (s *Server) ListNotifications(context.Context, ListNotificationsRequestObject) (ListNotificationsResponseObject, error) {
-	return nil, notImplemented("listNotifications")
-}
-
-func (s *Server) CreateBatch(context.Context, CreateBatchRequestObject) (CreateBatchResponseObject, error) {
-	return nil, notImplemented("createBatch")
-}
-
-func (s *Server) GetNotification(context.Context, GetNotificationRequestObject) (GetNotificationResponseObject, error) {
-	return nil, notImplemented("getNotification")
-}
-
-func (s *Server) CancelNotification(context.Context, CancelNotificationRequestObject) (CancelNotificationResponseObject, error) {
-	return nil, notImplemented("cancelNotification")
-}
-
-func (s *Server) RetryNotification(context.Context, RetryNotificationRequestObject) (RetryNotificationResponseObject, error) {
-	return nil, notImplemented("retryNotification")
-}
-
-func (s *Server) GetBatch(context.Context, GetBatchRequestObject) (GetBatchResponseObject, error) {
-	return nil, notImplemented("getBatch")
-}
-
-func (s *Server) ListTemplates(context.Context, ListTemplatesRequestObject) (ListTemplatesResponseObject, error) {
-	return nil, notImplemented("listTemplates")
-}
-
-func (s *Server) PutTemplate(context.Context, PutTemplateRequestObject) (PutTemplateResponseObject, error) {
-	return nil, notImplemented("putTemplate")
-}
-
-func (s *Server) GetTemplate(context.Context, GetTemplateRequestObject) (GetTemplateResponseObject, error) {
-	return nil, notImplemented("getTemplate")
-}
-
-func (s *Server) DeleteTemplate(context.Context, DeleteTemplateRequestObject) (DeleteTemplateResponseObject, error) {
-	return nil, notImplemented("deleteTemplate")
-}
-
 func (s *Server) GetMetrics(context.Context, GetMetricsRequestObject) (GetMetricsResponseObject, error) {
 	return nil, notImplemented("getMetrics")
 }
