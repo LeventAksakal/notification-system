@@ -1,5 +1,6 @@
-# Quick start: `docker compose up --wait`, then http://localhost:8080/readyz
-# and Grafana at http://localhost:3000. Needs only Docker.
+# Quick start: `docker compose up --wait`, then http://localhost:8080/docs
+# (API), http://localhost:8080/readyz and Grafana at http://localhost:3000.
+# Needs only Docker.
 #
 # Secrets are injected at runtime: export MYSQL_PASSWORD (and
 # MYSQL_ROOT_PASSWORD) before `up`. The fallbacks below are throwaway local
@@ -82,6 +83,32 @@ services:
       interval: 2s
       timeout: 4s
       retries: 30
+
+  worker:
+    # Delivery workers: stateless, any number. Three by default so claiming,
+    # the shared rate limit and lease recovery are exercised by the default
+    # stack (decision 0002). Scale with `docker compose up --scale worker=N`.
+    build: { context: ., target: app }
+    image: notifier:local
+    command: ["worker"]
+    environment:
+      <<: *dsn
+      APP_VALKEY_ADDR: valkey:6379
+      APP_OTLP_ENDPOINT: http://otel:4318
+      # One provider URL per channel; all three default to the provider
+      # double. Point one at a real endpoint (for example a webhook.site URL)
+      # by exporting PROVIDER_URL_SMS, _EMAIL or _PUSH before `up`.
+      APP_PROVIDER_URL_SMS: ${PROVIDER_URL_SMS:-http://provider:8090/send}
+      APP_PROVIDER_URL_EMAIL: ${PROVIDER_URL_EMAIL:-http://provider:8090/send}
+      APP_PROVIDER_URL_PUSH: ${PROVIDER_URL_PUSH:-http://provider:8090/send}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      valkey: { condition: service_healthy }
+      provider: { condition: service_healthy }
+      otel: { condition: service_started }
+    deploy:
+      replicas: 3
+    stop_grace_period: 15s # above APP_SHUTDOWN_TIMEOUT so in-flight sends finish
 
 volumes:
   mysql:
