@@ -1,0 +1,84 @@
+# One gate, same commands as local (`task ...`). Every action is pinned by
+# commit SHA: tags can be moved, and in March 2026 trivy-action's were
+# (CVE-2026-33634). Trivy itself runs from its image, pinned by digest.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  T: go tool -modfile=tools.mod
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  # Linux only: it is what the image runs on. Windows, macOS and Linux are
+  # dev machines, not deploy targets; the cross-compile step below catches a
+  # build break on them in one job, without a runner per OS.
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Builds for every dev machine
+        run: |
+          go build ./...
+          GOOS=darwin GOARCH=arm64 go build ./...
+          GOOS=windows GOARCH=amd64 go build ./...
+      - name: Generated code is up to date
+        run: |
+          go generate ./...
+          git diff --exit-code
+      - name: Lint (fails on silent typecheck errors)
+        run: go run ./tools/lintguard ./...
+      - name: Race tests
+        run: go test -race ./...
+      - name: Known vulnerabilities
+        run: $T govulncheck ./...
+      - name: Migrations match schema/
+        run: $T task migrate:check
+      - name: Build image
+        run: docker build -t notifier:ci .
+      - name: No HIGH or CRITICAL CVEs in the image
+        run: >-
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE"
+          image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed notifier:ci
+      - name: Stack comes up healthy
+        run: |
+          docker compose up --wait --wait-timeout 180
+          curl -fsS http://127.0.0.1:8080/readyz
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+  # Optional AI review: runs only when the repository has the secret, so
+  # forks and fresh clones stay green without it.
+  claude-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    env:
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.HAS_KEY == 'true'
+      - uses: anthropics/claude-code-action@9008224dd4f743876f528e6ba0f0d611f076a7f9 # v1.0.271
+        if: env.HAS_KEY == 'true'
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Review this pull request as the verifier role in .claude/agents/verifier.md.
+            Report correctness bugs only, each with file:line and a failing scenario.

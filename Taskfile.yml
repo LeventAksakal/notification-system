@@ -1,0 +1,116 @@
+# Dev commands. Run with `go tool -modfile=tools.mod task <name>`; nothing to
+# install beyond Go. Task's built-in shell makes these run the same on
+# Windows, macOS and Linux. Running the stack (`docker compose up`) needs none
+# of this.
+version: '3'
+
+vars:
+  T: go tool -modfile=tools.mod
+  # Atlas cannot be pinned as a Go tool: its cmd/atlas module resolves to
+  # 2023 dependencies that do not compile on Go 1.27 (upstream builds it with
+  # replace directives that `go get` ignores). The Apache-2.0 community image
+  # is used instead, pinned by tag and digest (latest-community is a canary).
+  ATLAS_IMAGE: arigaio/atlas:1.3.1-community@sha256:76cc66fb31f99d5d316676b8a9866ef4b6d6bf5aacc0639485d04848670839e4
+  ATLAS: docker run --rm --network notifier-atlas -v "{{.ROOT_DIR}}:/work" -w /work {{.ATLAS_IMAGE}}
+  # Scratch MySQL that Atlas replays the schema into to compute a diff. Never holds data.
+  ATLAS_DEV_URL: mysql://root:dev@notifier-atlas-dev:3306/dev
+  MIGRATIONS: file://migrations?format=goose
+
+tasks:
+  default:
+    cmds: ['{{.T}} task --list']
+
+  doctor:
+    desc: Print every tool's version; fails if one is missing
+    cmds:
+      - go version
+      - '{{.T}} task --version'
+      - '{{.T}} golangci-lint version'
+      - '{{.T}} sqlc version'
+      - '{{.T}} oapi-codegen -version'
+      - '{{.T}} gotestsum --version'
+      - '{{.T}} mockgen -version'
+      - docker version --format 'docker {{"{{"}}.Server.Version{{"}}"}}'
+      - '{{.ATLAS}} version'
+
+  atlas:dev:
+    desc: Start the scratch MySQL Atlas diffs against (idempotent)
+    internal: true
+    cmds:
+      - docker network inspect notifier-atlas >/dev/null 2>&1 || docker network create notifier-atlas >/dev/null
+      - docker start notifier-atlas-dev >/dev/null 2>&1 || docker run -d --name notifier-atlas-dev --network notifier-atlas -e MYSQL_ROOT_PASSWORD=dev -e MYSQL_DATABASE=dev mysql:8.4 >/dev/null
+      # TCP, not the socket: during first boot MySQL answers a socket ping from
+      # an init server that has networking off.
+      - |
+        for i in $(seq 1 60); do
+          docker exec notifier-atlas-dev mysqladmin --protocol=tcp -h127.0.0.1 -uroot -pdev ping >/dev/null 2>&1 && exit 0
+          sleep 2
+        done
+        echo "scratch MySQL not ready after 120s" >&2; exit 1
+
+  migrate:diff:
+    desc: 'Write the next migration from schema/*.sql (usage: task migrate:diff -- <name>)'
+    deps: [atlas:dev]
+    cmds: ['{{.ATLAS}} migrate diff {{.CLI_ARGS}} --dir "{{.MIGRATIONS}}" --to file://schema --dev-url "{{.ATLAS_DEV_URL}}"']
+
+  migrate:check:
+    desc: Drift gate - fails if schema/ and migrations/ disagree
+    deps: [atlas:dev]
+    cmds:
+      - '{{.ATLAS}} migrate diff drift --dir "{{.MIGRATIONS}}" --to file://schema --dev-url "{{.ATLAS_DEV_URL}}"'
+      - git diff --exit-code -- migrations
+      - git status --porcelain -- migrations | grep -q . && { echo "schema changed without a committed migration; run task migrate:diff" >&2; exit 1; } || true
+
+  guard:
+    desc: Build the agent guard hook binary
+    cmds: ['go build -o .claude/bin/agentguard.exe ./tools/agentguard']
+
+  gen:
+    desc: Regenerate migrations, SQL and API code from their sources
+    cmds: ['go generate ./...']
+
+  lint:
+    desc: golangci-lint, failing on any silent typecheck error
+    cmds: ['go run ./tools/lintguard ./...']
+
+  owner:check:
+    desc: 'Fail if a lane changed files its role may not write (usage: task owner:check ROLE=implementer [BASE=main])'
+    requires:
+      vars: [ROLE]
+    cmds: ['go run ./tools/ownercheck -role {{.ROLE}} -base {{.BASE | default "main"}}']
+
+  test:
+    desc: Unit tests (narrow with -- -run X ./pkg)
+    cmds: ['{{.T}} gotestsum --format pkgname -- {{.CLI_ARGS | default "./..."}}']
+
+  vuln:
+    desc: Known vulnerabilities in reachable code
+    cmds: ['{{.T}} govulncheck ./...']
+
+  up:
+    desc: The whole stack, healthy (the quick-start path)
+    cmds: ['docker compose up --build --wait --wait-timeout 300']
+
+  scan:
+    desc: Build the image and fail on HIGH/CRITICAL CVEs (Trivy pinned by digest)
+    vars:
+      TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+    cmds:
+      - docker build -t notifier:scan .
+      - docker run --rm -v /var/run/docker.sock:/var/run/docker.sock {{.TRIVY_IMAGE}} image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed notifier:scan
+
+  ci:lint:
+    desc: Validate the GitHub workflows
+    # Not in tools.mod: it needs a different go.yaml.in/yaml/v4 pre-release
+    # than sqlc does, and one module graph holds one version. `go run
+    # pkg@version` resolves it in its own graph, still checksum-verified.
+    cmds: ['go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/ci.yml']
+
+  check:
+    desc: The full gate, run once before merge
+    cmds:
+      - go build ./...
+      - go vet ./...
+      - task: lint
+      - task: test
+      - task: vuln

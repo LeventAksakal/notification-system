@@ -1,0 +1,55 @@
+version: "2"
+
+# Bug-finders only; style is gofmt's job. Each linter here catches a mistake
+# that compiles and passes review: unclosed bodies, lost contexts, swallowed
+# errors, SQL rows left open. Noisy style linters (wsl, nlreturn, varnamelen)
+# are left out on purpose: they churn every edit for no defect found.
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - contextcheck
+    - durationcheck
+    - errcheck
+    - errorlint
+    - forbidigo
+    - gosec
+    - govet
+    - ineffassign
+    - nilerr
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - unconvert
+    - unused
+    - usestdlibvars
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: ^os\.Getenv$
+          msg: read settings through internal/config so every dial has a default, bounds and a doc
+        - pattern: ^fmt\.Print
+          msg: log with slog so lines carry the trace id
+  exclusions:
+    generated: strict
+    presets: [std-error-handling, common-false-positives]
+    rules:
+      # main hands os.Getenv to config.Load; that is the one allowed read.
+      - path: ^cmd/app/main\.go$
+        linters: [forbidigo]
+        text: os\.Getenv
+      # Dev tools print to the terminal by design, and run commands and open
+      # paths that come from their own CLI arguments (taint findings G702/G703
+      # would flag the tool's whole purpose).
+      - path: ^tools/
+        linters: [forbidigo]
+      - path: ^tools/
+        linters: [gosec]
+        text: G70[23]
+
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/LeventAksakal/notification-system]

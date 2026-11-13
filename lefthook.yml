@@ -1,0 +1,27 @@
+# Fast pre-commit checks on staged files only; tests and whole-repo lint run
+# in `task check` and CI. Install once per clone: `lefthook install`.
+# Commands run under sh (Git Bash on Windows, sh on macOS and Linux).
+pre-commit:
+  parallel: true
+  commands:
+    gofmt:
+      glob: "*.go"
+      run: |
+        unformatted=$(gofmt -l {staged_files})
+        if [ -n "$unformatted" ]; then
+          echo "gofmt: these files need formatting (run gofmt -w):"
+          echo "$unformatted"
+          exit 1
+        fi
+    gitleaks:
+      run: |
+        if command -v gitleaks >/dev/null 2>&1; then
+          gitleaks protect --staged --redact
+        else
+          echo "gitleaks not installed; secret scan skipped (https://github.com/gitleaks/gitleaks)"
+        fi
+    vet:
+      glob: "*.go"
+      run: |
+        pkgs=$(for f in {staged_files}; do echo "./$(dirname "$f")"; done | sort -u)
+        go vet $pkgs

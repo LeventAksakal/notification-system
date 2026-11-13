@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && go build -o .claude/bin/agentguard.exe ./tools/agentguard && go build -o .claude/bin/stopcheck.exe ./tools/stopcheck"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && { [ -x .claude/bin/agentguard.exe ] || go build -o .claude/bin/agentguard.exe ./tools/agentguard; } && .claude/bin/agentguard.exe || exit 2"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && { [ -x .claude/bin/stopcheck.exe ] || go build -o .claude/bin/stopcheck.exe ./tools/stopcheck; } && .claude/bin/stopcheck.exe"
+          }
+        ]
+      }
+    ]
+  }
+}

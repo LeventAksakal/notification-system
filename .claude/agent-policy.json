@@ -1,0 +1,31 @@
+{
+  "_doc": "Who may write what. Read by tools/agentguard (PreToolUse hook, fast feedback) and by the merge ownership check (catches Bash writes). Main thread = coordinator.",
+  "generated": ["**/*.gen.go", "internal/store/sqlc/**", "migrations/**"],
+  "contracts": ["api/**", "schema/**", "internal/core/**"],
+  "bash_deny": [
+    "git push --force",
+    "git push -f",
+    "git reset --hard",
+    "docker compose down -v",
+    "docker-compose down -v",
+    "rm -rf /",
+    "--no-verify"
+  ],
+  "profiles": {
+    "researcher": {
+      "write_allow": [".agents/**"],
+      "bash_allow": ["go doc", "go list", "go version", "git log", "git show", "git diff", "git status"]
+    },
+    "test-writer": {
+      "write_allow": ["test/acceptance/**", ".agents/**"]
+    },
+    "implementer": {
+      "write_allow": ["cmd/**", "internal/**", "test/**", "config/**", ".agents/**"],
+      "write_deny": ["test/acceptance/**"]
+    },
+    "verifier": {
+      "write_allow": [".agents/**"],
+      "bash_allow": ["go test", "go vet", "go tool task", "git diff", "git log", "git show", "git status", "docker compose", "k6"]
+    }
+  }
+}

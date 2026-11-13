@@ -1,0 +1,74 @@
+openapi: 3.0.3
+info:
+  title: Notification system
+  version: 0.1.0
+  description: HTTP contract for the notification system (currently an example key/value endpoint). Handlers are generated from this file; drift does not compile.
+paths:
+  /healthz:
+    get:
+      operationId: health
+      summary: Liveness - the process is up
+      responses:
+        "200":
+          description: Alive
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+  /readyz:
+    get:
+      operationId: ready
+      summary: Readiness - dependencies answer
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+        "503":
+          description: A dependency is down
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+  /v1/meta/{key}:
+    get:
+      operationId: getMeta
+      summary: Read one key/value pair
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 64 }
+      responses:
+        "200":
+          description: Found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Meta" }
+        "404":
+          description: No such key
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+components:
+  schemas:
+    Health:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        checks:
+          type: object
+          additionalProperties: { type: string }
+    Meta:
+      type: object
+      required: [key, value, updatedAt]
+      properties:
+        key: { type: string, maxLength: 64 }
+        value: { type: string, maxLength: 255 }
+        updatedAt: { type: string, format: date-time }
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }

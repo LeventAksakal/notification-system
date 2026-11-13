@@ -1,0 +1,73 @@
+# Quick start: `docker compose up --wait`, then http://localhost:8080/readyz
+# and Grafana at http://localhost:3000. Needs only Docker.
+#
+# Secrets are injected at runtime: export MYSQL_PASSWORD (and
+# MYSQL_ROOT_PASSWORD) before `up`. The fallbacks below are throwaway local
+# values so a first local run works; nothing outside this stack uses them.
+name: notifier
+
+x-dsn: &dsn
+  APP_DATABASE_DSN: app:${MYSQL_PASSWORD:-local-dev}@tcp(mysql:3306)/app
+
+services:
+  mysql:
+    image: mysql:8.4@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local-dev-root}
+      MYSQL_DATABASE: app
+      MYSQL_USER: app
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-local-dev}
+    volumes: [mysql:/var/lib/mysql]
+    healthcheck:
+      # TCP, not the socket: on first boot the init server answers socket
+      # pings with networking off, so a socket check reports ready too early.
+      test: ["CMD-SHELL", "mysqladmin --protocol=tcp -h127.0.0.1 -uapp -p\"$$MYSQL_PASSWORD\" ping --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 90
+
+  valkey:
+    image: valkey/valkey:9.0.7-alpine3.24@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  otel:
+    # Grafana, Loki, Tempo, Prometheus and an OTel collector in one dev image.
+    image: grafana/otel-lgtm:0.40.0@sha256:72e05804790e6e0d8c0b70a6d5ff1f721ef7b203463374631e99aa3429bd0cf6
+    ports: ["127.0.0.1:${GRAFANA_PORT:-3000}:3000"]
+
+  migrate:
+    build: .
+    image: notifier:local
+    command: ["migrate"]
+    environment:
+      <<: *dsn
+    depends_on:
+      mysql: { condition: service_healthy }
+    restart: "no"
+
+  app:
+    build: .
+    image: notifier:local
+    command: ["serve"]
+    environment:
+      <<: *dsn
+      APP_VALKEY_ADDR: valkey:6379
+      APP_OTLP_ENDPOINT: http://otel:4318
+    ports: ["127.0.0.1:${APP_PORT:-8080}:8080"] # APP_PORT if 8080 is taken
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      valkey: { condition: service_healthy }
+      otel: { condition: service_started }
+    stop_grace_period: 15s # above APP_SHUTDOWN_TIMEOUT so drains finish
+    healthcheck:
+      test: ["CMD", "/app", "healthcheck"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+
+volumes:
+  mysql:

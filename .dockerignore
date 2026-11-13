@@ -1,0 +1,10 @@
+.git
+.claude
+.agents
+.github
+docs
+tools
+*.md
+.env*
+Dockerfile
+docker-compose.yml
