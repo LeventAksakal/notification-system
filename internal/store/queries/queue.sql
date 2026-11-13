@@ -14,13 +14,14 @@ ORDER BY due_at
 LIMIT ?
 FOR UPDATE SKIP LOCKED;
 
--- name: LeaseNotification :execrows
--- pending -> processing for a row locked by ClaimCandidates in the same transaction.
+-- name: LeaseNotifications :execrows
+-- pending -> processing for the rows locked by ClaimCandidates in the same
+-- transaction, in one statement (one round trip, however many rows).
 UPDATE notifications
 SET status = 'processing',
     lease_until = NOW(3) + INTERVAL sqlc.arg(lease_us) MICROSECOND,
     claim_version = claim_version + 1
-WHERE id = sqlc.arg(id) AND status = 'pending';
+WHERE id IN (sqlc.slice(ids)) AND status = 'pending';
 
 -- name: FinishSent :execrows
 -- processing -> sent.
