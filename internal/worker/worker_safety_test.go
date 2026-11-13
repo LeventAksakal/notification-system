@@ -87,7 +87,7 @@ func TestWorkerMissedSlotIsReleasedNotSentLate(t *testing.T) {
 	jobs, _ := q.Claim(t.Context(), core.ChannelEmail, core.PriorityHigh, 1, time.Minute)
 	snd := &countingSender{fn: accept}
 	w := New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: snd})
-	cr := w.newChannelRun(core.ChannelEmail, 1)
+	cr := w.newChannelRun(core.ChannelEmail, testPlaces(1, 0))
 	tk, _, _ := cr.br.Allow()
 	tolerance := 5 * time.Millisecond
 	// The job reaches its send step three intervals after its slot (a slow
@@ -123,10 +123,10 @@ func TestWorkerHungChannelDoesNotStallTheOthers(t *testing.T) {
 	}}
 	cfg := testConfig()
 	cfg.Channels = []core.Channel{core.ChannelSMS, core.ChannelEmail}
-	cfg.Concurrency = 8 // 4 calls per channel
+	cfg.Concurrency = 8 // 2 places of its own per channel, 4 shared
 	lim := newGridLimiter(10*time.Millisecond, 50*time.Millisecond)
 	stop := run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: snd}))
-	waitFor(t, "the sms calls hang", func() bool { return smsNow.Load() == 4 })
+	waitFor(t, "the sms calls hang", func() bool { return smsNow.Load() == 6 })
 	before := q.countSent(core.ChannelEmail)
 	time.Sleep(time.Second)
 	got := q.countSent(core.ChannelEmail) - before
@@ -137,8 +137,8 @@ func TestWorkerHungChannelDoesNotStallTheOthers(t *testing.T) {
 	if got < 80 {
 		t.Errorf("email sent %d in 1 s while sms hangs, want at least 80 of its 100", got)
 	}
-	if smsMax.Load() > 4 {
-		t.Errorf("sms held %d calls, its share is 4", smsMax.Load())
+	if smsMax.Load() > 6 {
+		t.Errorf("sms held %d calls; its own 2 and the 4 shared are all it may take", smsMax.Load())
 	}
 }
 
@@ -173,7 +173,7 @@ func TestWorkerDoesNotSendWhenTheBreakerOpenedAfterTheClaim(t *testing.T) {
 	br := breaker.New(breaker.Config{Window: time.Minute, MinRequests: 1, FailureRatio: 0.5, Cooldown: time.Minute}, time.Now)
 	snd := &countingSender{fn: accept}
 	w := New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: snd, Breakers: map[core.Channel]*breaker.Breaker{core.ChannelSMS: br}})
-	cr := w.newChannelRun(core.ChannelSMS, 1)
+	cr := w.newChannelRun(core.ChannelSMS, testPlaces(1, 0))
 	tk, _, _ := br.Allow() // admitted while closed
 	other, _, _ := br.Allow()
 	br.Done(other, false) // another call fails: the breaker opens
@@ -195,4 +195,8 @@ func (q *memQueue) countSent(ch core.Channel) int {
 		}
 	}
 	return n
+}
+
+func testPlaces(own, shared int) callPlaces {
+	return callPlaces{own: make(chan struct{}, own), shared: make(chan struct{}, shared)}
 }
