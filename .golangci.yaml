@@ -1,5 +1,9 @@
 version: "2"
 
+# Integration-tagged files (test/support, later test/acceptance) are linted too.
+run:
+  build-tags: [integration]
+
 # Bug-finders only; style is gofmt's job. Each linter here catches a mistake
 # that compiles and passes review: unclosed bodies, lost contexts, swallowed
 # errors, SQL rows left open. Noisy style linters (wsl, nlreturn, varnamelen)
@@ -27,7 +31,7 @@ linters:
   settings:
     forbidigo:
       forbid:
-        - pattern: ^os\.Getenv$
+        - pattern: ^os\.(Getenv|LookupEnv|Environ)$
           msg: read settings through internal/config so every dial has a default, bounds and a doc
         - pattern: ^fmt\.Print
           msg: log with slog so lines carry the trace id
@@ -39,6 +43,12 @@ linters:
       - path: ^cmd/app/main\.go$
         linters: [forbidigo]
         text: os\.Getenv
+      # The provider double is a separate test tool with two settings of its
+      # own (PROVIDER_ADDR, PROVIDER_DEDUPE), not the service, so it reads
+      # them itself instead of through internal/config.
+      - path: ^cmd/fakeprovider/main\.go$
+        linters: [forbidigo]
+        text: os\.LookupEnv
       # Dev tools print to the terminal by design, and run commands and open
       # paths that come from their own CLI arguments (taint findings G702/G703
       # would flag the tool's whole purpose).
