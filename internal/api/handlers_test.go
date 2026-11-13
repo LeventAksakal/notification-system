@@ -48,17 +48,26 @@ func TestReadinessIs503WhenADependencyIsDown(t *testing.T) {
 	}
 }
 
-func TestOperationsNotBuiltYetAnswer501(t *testing.T) {
-	for _, tc := range []struct{ method, path, body string }{
-		{http.MethodGet, "/v1/metrics", ""},
-		{http.MethodGet, "/v1/ws", ""},
+func TestStreamAndMetricsRefuseBrokenParametersByName(t *testing.T) {
+	for _, tc := range []struct{ path, field string }{
+		{"/v1/ws?notificationId=nope", "notificationId"},
+		{"/v1/ws?batchId=123", "batchId"},
+		{"/v1/metrics?windowSeconds=0", "windowSeconds"},
+		{"/v1/metrics?windowSeconds=3601", "windowSeconds"},
 	} {
-		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
-			rec := serve(t, nil, tc.method, tc.path, tc.body)
-			if rec.Code != http.StatusNotImplemented || decodeError(t, rec).Code != "not_implemented" {
+		t.Run(tc.path, func(t *testing.T) {
+			rec := serve(t, nil, http.MethodGet, tc.path, "")
+			e := decodeError(t, rec)
+			if rec.Code != http.StatusBadRequest || e.Code != "invalid_request" || e.Details == nil || (*e.Details)[0].Field != tc.field {
 				t.Fatalf("got %d %s", rec.Code, rec.Body)
 			}
 		})
+	}
+}
+
+func TestStreamWithoutAHubIsUnavailable(t *testing.T) {
+	if rec := serve(t, nil, http.MethodGet, "/v1/ws", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
 }
 

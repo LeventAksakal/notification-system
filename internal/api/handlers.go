@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -14,23 +13,47 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/LeventAksakal/notification-system/internal/intake"
+	"github.com/LeventAksakal/notification-system/internal/realtime"
 )
 
 // Check reports whether one dependency answers.
 type Check func(ctx context.Context) error
 
-// Server implements the generated StrictServerInterface. Operations not yet
-// built live in unimplemented.go and answer 501.
+// Server implements the generated StrictServerInterface and the WebSocket
+// stream mounted beside it.
 type Server struct {
-	intake *intake.Service
-	checks map[string]Check
+	intake   *intake.Service
+	checks   map[string]Check
+	metrics  MetricsReader
+	hub      *realtime.Hub
+	wsBuffer int
+	streams  *streams
 }
 
 var _ StrictServerInterface = (*Server)(nil)
 
-// NewServer takes the intake service and the readiness checks by dependency name.
-func NewServer(svc *intake.Service, checks map[string]Check) *Server {
-	return &Server{intake: svc, checks: checks}
+// Options are the parts of the server beyond intake; a nil part answers 503
+// (stream) or 500 (metrics).
+type Options struct {
+	Metrics MetricsReader
+	// Hub fans status changes out to WebSocket subscribers.
+	Hub *realtime.Hub
+	// WSSendBuffer is how many events a subscriber may fall behind before it
+	// is disconnected (APP_WS_SEND_BUFFER).
+	WSSendBuffer int
+}
+
+// NewServer takes the intake service, the readiness checks by dependency
+// name, and the optional parts.
+func NewServer(svc *intake.Service, checks map[string]Check, opts ...Options) *Server {
+	s := &Server{intake: svc, checks: checks, wsBuffer: 256, streams: newStreams()}
+	for _, o := range opts {
+		s.metrics, s.hub = o.Metrics, o.Hub
+		if o.WSSendBuffer > 0 {
+			s.wsBuffer = o.WSSendBuffer
+		}
+	}
+	return s
 }
 
 // Handler returns the full HTTP stack: tracing, the correlation id, the body
@@ -106,13 +129,9 @@ func writeRequestError(w http.ResponseWriter, _ *http.Request, err error) {
 	writeError(w, http.StatusBadRequest, Error{Code: "invalid_request", Message: firstLine(err.Error())})
 }
 
-// writeResponseError turns a handler error into a response: 501 for an
-// operation not built yet, otherwise a 500 that does not leak the cause.
+// writeResponseError turns a handler error into a 500 that does not leak
+// the cause.
 func writeResponseError(w http.ResponseWriter, r *http.Request, err error) {
-	if errors.Is(err, ErrNotImplemented) {
-		writeError(w, http.StatusNotImplemented, Error{Code: "not_implemented", Message: err.Error()})
-		return
-	}
 	slog.ErrorContext(r.Context(), "request failed", "method", r.Method, "path", r.URL.Path, "err", err)
 	writeError(w, http.StatusInternalServerError, Error{Code: "internal", Message: "internal error"})
 }
