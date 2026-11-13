@@ -189,8 +189,15 @@ func waitReaped(t *testing.T, q *store.Queue, db *sql.DB, id string) {
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if _, err := q.ReapExpired(ctx); err != nil {
+		reaped, err := q.ReapExpired(ctx)
+		if err != nil {
 			t.Fatalf("reap: %v", err)
+		}
+		for _, j := range reaped {
+			// What the worker publishes: the row's identity, not a guess.
+			if j.ID == id && (j.Channel == "" || j.CorrelationID != "corr" || j.Attempts != 0) {
+				t.Fatalf("reaped job reported as %+v", j)
+			}
 		}
 		var st string
 		if err := db.QueryRowContext(ctx, "SELECT status FROM notifications WHERE id = ?", id).Scan(&st); err != nil {
