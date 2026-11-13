@@ -33,7 +33,8 @@ func NewServer(svc *intake.Service, checks map[string]Check) *Server {
 	return &Server{intake: svc, checks: checks}
 }
 
-// Handler returns the full HTTP stack: tracing, the correlation id, then the routes that live
+// Handler returns the full HTTP stack: tracing, the correlation id, the body
+// size limit, then the routes that live
 // outside the contract (/openapi.json, /docs, the WebSocket), then spec
 // validation (so a request the contract forbids never reaches a handler),
 // then the generated handlers.
@@ -63,7 +64,7 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.Handle("GET /docs", docsHandler())
 	mux.HandleFunc("GET /v1/ws", s.streamEvents)
 	mux.Handle("/", validated)
-	return otelhttp.NewHandler(withCorrelation(mux), "http"), nil
+	return otelhttp.NewHandler(withCorrelation(limitBody(mux)), "http"), nil
 }
 
 func (s *Server) Health(context.Context, HealthRequestObject) (HealthResponseObject, error) {
@@ -98,6 +99,10 @@ func writeError(w http.ResponseWriter, status int, body Error) {
 // writeRequestError handles a body or parameter the generated binder could
 // not decode (the validator normally refuses those first).
 func writeRequestError(w http.ResponseWriter, _ *http.Request, err error) {
+	if tooLarge(err) {
+		writeTooLarge(w)
+		return
+	}
 	writeError(w, http.StatusBadRequest, Error{Code: "invalid_request", Message: firstLine(err.Error())})
 }
 

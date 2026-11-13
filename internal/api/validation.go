@@ -17,6 +17,9 @@ import (
 // field; an unknown route gets 404 not_found.
 func writeValidationError(_ context.Context, err error, w http.ResponseWriter, _ *http.Request, opts middleware.ErrorHandlerOpts) {
 	switch {
+	case tooLarge(err):
+		writeTooLarge(w)
+		return
 	case opts.MatchedRoute == nil:
 		writeError(w, opts.StatusCode, Error{Code: "not_found", Message: "no such route"})
 		return
