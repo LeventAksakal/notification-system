@@ -29,7 +29,7 @@ One row per line of the brief that asks for something, in the brief's words. Sta
 | B3 | Bonus: Template System, message templates with variable substitution | A template plus variables produces the rendered content; a missing variable is refused | 0015 | open | |
 | B4 | Bonus: WebSocket Updates, real-time status updates via WebSocket | A subscriber sees each status change in order without polling | 0013 | open | |
 | B5 | Bonus: Distributed Tracing | One trace links the API request, the queue wait and the provider call | 0019 | open | |
-| B6 | Bonus: GitHub Actions CI/CD, automated testing and linting pipeline | The workflow is green on the default branch | none | open | |
+| B6 | Bonus: GitHub Actions CI/CD, automated testing and linting pipeline | The workflow is green on the default branch | none | passing | First run green on `39f2d5a`: https://github.com/LeventAksakal/notification-system/actions/runs/43471895619 |
 | D1 | Source code: repository with clean commit history | Linear history, conventional messages, each commit builds | none | open | |
 | D2 | README.md: setup instructions, architecture overview, API examples | A fresh clone followed step by step works | none | open | |
 | D3 | Docker Compose: one-command setup (`docker-compose up`) | Fresh clone, one command, stack healthy with no other setup | 0002 | open | |
