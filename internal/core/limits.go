@@ -37,6 +37,9 @@ const (
 	MaxIdempotencyKeyLen = 255
 	MaxCorrelationIDLen  = 128
 
+	// MaxRequestBodyBytes bounds a request body; a larger one is refused with 413.
+	MaxRequestBodyBytes = 8 << 20
+
 	// MaxErrorLen bounds a stored error message; longer ones are cut.
 	MaxErrorLen = 1024
 
