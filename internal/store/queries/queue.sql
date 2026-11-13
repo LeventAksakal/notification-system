@@ -22,9 +22,6 @@ SET status = 'processing',
     claim_version = claim_version + 1
 WHERE id = sqlc.arg(id) AND status = 'pending';
 
--- name: GetLease :one
-SELECT claim_version, lease_until FROM notifications WHERE id = ?;
-
 -- name: FinishSent :execrows
 -- processing -> sent.
 UPDATE notifications
