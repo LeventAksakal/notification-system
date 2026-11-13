@@ -83,10 +83,10 @@ func TestWorkersHoldTheRateAtTheProvider(t *testing.T) {
 		w := worker.New(worker.Config{
 			Concurrency: 32, MaxAttempts: 5, RetryBase: 100 * time.Millisecond, RetryCap: time.Second,
 			Lease: 2 * time.Second, ReapInterval: 500 * time.Millisecond, ShutdownTimeout: 5 * time.Second,
-			Weights: [3]int{70, 20, 10},
+			Weights: [3]int{70, 20, 10}, Horizon: 200 * time.Millisecond,
 		}, worker.Deps{
 			Queue:    &timedQueue{Queue: store.NewQueue(db), start: start},
-			Limiter:  limiter.New(vk, limit, 3, "rate:"),
+			Limiter:  limiter.New(vk, limit, 3, 200*time.Millisecond, "rate:"),
 			Sender:   provider.New(urls, 500*time.Millisecond, 32),
 			Breakers: brs,
 		})

@@ -45,7 +45,8 @@ func TestDeliveryDialsDefaultToTheContractTable(t *testing.T) {
 		}
 	}
 	if c.PriorityWeights != [3]int{70, 20, 10} || c.BreakerFailureRatio != 0.5 || c.MaxAttempts != 5 ||
-		c.RetryCap != 5*time.Minute || c.IdempotencyRetention != 24*time.Hour || c.WSSendBuffer != 256 {
+		c.RetryCap != 5*time.Minute || c.IdempotencyRetention != 24*time.Hour || c.WSSendBuffer != 256 ||
+		c.RateLimitHorizon != 200*time.Millisecond || c.RateLimitHeadroomPct != 3 {
 		t.Fatalf("defaults not applied: %+v", c)
 	}
 }
@@ -60,6 +61,9 @@ func TestBrokenDeliveryDialsAreRefused(t *testing.T) {
 		"provider URL no host": {"APP_PROVIDER_URL_SMS", "send"},
 		"retry cap below base": {"APP_RETRY_CAP", "10ms"},
 		"zero concurrency":     {"APP_WORKER_CONCURRENCY", "0"},
+		"horizon above 2s":     {"APP_RATE_LIMIT_HORIZON", "3s"},
+		"horizon below 10ms":   {"APP_RATE_LIMIT_HORIZON", "5ms"},
+		"lease below 1s":       {"APP_LEASE_DURATION", "500ms"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(env(map[string]string{"APP_DATABASE_DSN": "x", kv[0]: kv[1]}))
