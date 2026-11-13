@@ -3,25 +3,26 @@
 # Commands run under sh (Git Bash on Windows, sh on macOS and Linux).
 pre-commit:
   parallel: true
+  # No double quotes inside `run`: on Windows lefthook hands the script to sh
+  # through a command line, and a double quote ends the -c argument early.
   commands:
     gofmt:
       glob: "*.go"
       run: |
-        unformatted=$(gofmt -l {staged_files})
-        if [ -n "$unformatted" ]; then
-          echo "gofmt: these files need formatting (run gofmt -w):"
-          echo "$unformatted"
-          exit 1
-        fi
+        out=$(gofmt -l {staged_files}) || exit 1
+        case $out in
+          '') ;;
+          *) echo 'gofmt: these files need formatting (run gofmt -w):'; echo $out; exit 1 ;;
+        esac
     gitleaks:
       run: |
         if command -v gitleaks >/dev/null 2>&1; then
-          gitleaks protect --staged --redact
+          gitleaks git --pre-commit --staged --redact
         else
-          echo "gitleaks not installed; secret scan skipped (https://github.com/gitleaks/gitleaks)"
+          echo 'gitleaks not installed; secret scan skipped (https://github.com/gitleaks/gitleaks)'
         fi
     vet:
       glob: "*.go"
       run: |
-        pkgs=$(for f in {staged_files}; do echo "./$(dirname "$f")"; done | sort -u)
+        pkgs=$(for f in {staged_files}; do dirname $f; done | sort -u | sed 's|^|./|')
         go vet $pkgs
