@@ -83,6 +83,16 @@ tasks:
     desc: Unit tests (narrow with -- -run X ./pkg)
     cmds: ['{{.T}} gotestsum --format pkgname -- {{.CLI_ARGS | default "./..."}}']
 
+  test:integration:
+    desc: Integration tests against real MySQL, Valkey and the provider double (needs Docker)
+    cmds: ['{{.T}} gotestsum --format pkgname -- -tags integration {{.CLI_ARGS | default "./test/..."}}']
+
+  test:all:
+    desc: Unit tests, then integration tests
+    cmds:
+      - task: test
+      - task: test:integration
+
   vuln:
     desc: Known vulnerabilities in reachable code
     cmds: ['{{.T}} govulncheck ./...']

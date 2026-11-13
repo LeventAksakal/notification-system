@@ -1,3 +1,4 @@
+| `internal/fakeprovider`, `cmd/fakeprovider`, `test/support` | Provider double (faults, dedupe, delivery counts; compose service `provider`) and test helpers for MySQL, Valkey and the double |
 # Notification system
 
 An event-driven notification service. The notification features are not built yet: today the repo holds the service skeleton (config, telemetry, OpenAPI-first HTTP, sqlc, migrations), the compose stack and CI, with one example endpoint.

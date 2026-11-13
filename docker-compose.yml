@@ -39,8 +39,22 @@ services:
     image: grafana/otel-lgtm:0.40.0@sha256:72e05804790e6e0d8c0b70a6d5ff1f721ef7b203463374631e99aa3429bd0cf6
     ports: ["127.0.0.1:${GRAFANA_PORT:-3000}:3000"]
 
+  provider:
+    # Provider double (cmd/fakeprovider): the stand-in for the external
+    # provider. Control API under /_control/ (faults, dedupe, stats).
+    build: { context: ., target: fakeprovider }
+    image: notifier-fakeprovider:local
+    environment:
+      PROVIDER_DEDUPE: ${PROVIDER_DEDUPE:-true}
+    ports: ["127.0.0.1:${PROVIDER_PORT:-8090}:8090"] # PROVIDER_PORT if 8090 is taken
+    healthcheck:
+      test: ["CMD", "/fakeprovider", "healthcheck"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+
   migrate:
-    build: .
+    build: { context: ., target: app }
     image: notifier:local
     command: ["migrate"]
     environment:
@@ -50,7 +64,7 @@ services:
     restart: "no"
 
   app:
-    build: .
+    build: { context: ., target: app }
     image: notifier:local
     command: ["serve"]
     environment:
