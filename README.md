@@ -1,4 +1,3 @@
-| `internal/fakeprovider`, `cmd/fakeprovider`, `test/support` | Provider double (faults, dedupe, delivery counts; compose service `provider`) and test helpers for MySQL, Valkey and the double |
 # Notification system
 
 An event-driven notification service. The notification features are not built yet: today the repo holds the service skeleton (config, telemetry, OpenAPI-first HTTP, sqlc, migrations), the compose stack and CI, with one example endpoint.
@@ -25,6 +24,7 @@ docker compose up --build --wait
 | `internal/store` | SQL queries (sqlc), connection, embedded migrations |
 | `internal/obs` | Logs, traces and metrics to OpenTelemetry |
 | `cmd/app` | `serve`, `migrate`, `healthcheck` |
+| `internal/fakeprovider`, `cmd/fakeprovider`, `test/support` | Provider double (faults, dedupe, delivery counts; compose service `provider`) and test helpers for MySQL, Valkey and the double |
 | `docs/decisions` | Why things are the way they are (ADRs) |
 | `.agents/logs` | What the agents did, pivot by pivot |
 
