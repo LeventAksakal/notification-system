@@ -107,6 +107,9 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		return err
 	}
 	defer vk.Close()
+	if err := store.Warm(ctx, db, cfg.DBMaxOpenConns); err != nil {
+		return err
+	}
 
 	breakers := make(map[core.Channel]*breaker.Breaker, len(core.Channels))
 	for _, ch := range core.Channels {
