@@ -56,6 +56,23 @@ type Querier interface {
 	// Oldest first (attempts_notification_idx).
 	ListDeliveryAttempts(ctx context.Context, notificationID string) ([]DeliveryAttempt, error)
 	ListTemplates(ctx context.Context) ([]Template, error)
+	// Provider calls started in the window, per channel, from attempts_window_idx
+	// (started_at, channel, outcome) alone.
+	MetricsAttempts(ctx context.Context, windowUs interface{}) ([]MetricsAttemptsRow, error)
+	// Notifications that reached sent or failed in the window, per channel, from
+	// finished_idx (finished_at, status, channel) alone.
+	MetricsFinished(ctx context.Context, windowUs interface{}) ([]MetricsFinishedRow, error)
+	// Unfinished notifications per channel, on the database clock, read from
+	// claim_idx (status, channel, priority, due_at) alone: an index range over the
+	// pending and processing rows, no table reads. pending_due is what a worker
+	// may claim now; oldest_due_age_ms is how long the oldest of those has waited.
+	MetricsQueue(ctx context.Context) ([]MetricsQueueRow, error)
+	// Pending notifications shown as scheduled (never tried, due later): a
+	// claim_idx range over the not-yet-due pending rows, reading attempts.
+	MetricsScheduled(ctx context.Context) (int64, error)
+	// Stored status counts over the whole table, from list_status_idx alone (an
+	// index scan, no table reads).
+	MetricsStatusCounts(ctx context.Context) ([]MetricsStatusCountsRow, error)
 	// sqlc needs at least one query; the readiness probe can use it.
 	Ping(ctx context.Context) (int32, error)
 	// Runs inside a READ COMMITTED transaction: the expired leases (lease_idx),
