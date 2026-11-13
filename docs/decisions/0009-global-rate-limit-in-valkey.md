@@ -21,5 +21,7 @@ The brief: "maximum 100 messages per second per channel". With several workers (
 ## Decision
 Pending. Recommended: option 3. It satisfies the definition by construction and is the kindest traffic shape for a provider. Permits are taken before claiming so a claimed row never waits on the limiter while holding a lease. If Valkey is unreachable the workers stop sending (fail closed) and readiness reports it: exceeding a provider's limit gets the whole account throttled, which is worse than a pause. The limit is a dial per channel, default 100.
 
+Where the limit is measured matters (found 13 Nov while building the provider double): the provider counts by arrival time, and network jitter can squeeze 101 sends that left 10 ms apart into one second. A limiter set to exactly 100 will therefore be seen at 101 now and then. Options for the owner: run the limiter slightly under the limit (for example 98 per second), or state the limit as "sent" and assert it at the sender. The limit counts every request to the provider, failed ones included.
+
 ## Confirmation
-Acceptance test with 3 workers and a backlog on every channel: the provider double's arrival log shows at most 100 per channel in every sliding one-second window, and at least 95 per channel per second on average (the limit is used, not just respected). The load run reports both numbers.
+Acceptance test with 3 workers and a backlog on every channel: the provider double's request log (every request, whatever its outcome) shows at most 100 per channel in every sliding one-second window, and at least 95 per channel per second on average (the limit is used, not just respected). The load run reports both numbers.
