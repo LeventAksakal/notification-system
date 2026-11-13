@@ -1,0 +1,567 @@
+package intake
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/obs"
+	"github.com/LeventAksakal/notification-system/internal/store"
+	"github.com/LeventAksakal/notification-system/internal/store/sqlc"
+)
+
+// Service is the intake side of the system. It is safe for concurrent use.
+type Service struct {
+	db        *sql.DB
+	q         *sqlc.Queries
+	pub       core.Publisher
+	retention time.Duration
+	now       func() time.Time
+}
+
+// New returns a Service storing in db and announcing every committed status
+// change through pub. An Idempotency-Key is remembered for retention.
+func New(db *sql.DB, pub core.Publisher, retention time.Duration) *Service {
+	return &Service{db: db, q: sqlc.New(db), pub: pub, retention: retention, now: time.Now}
+}
+
+// Meta is what a create request carries besides its body.
+type Meta struct {
+	IdempotencyKey string // "" when absent
+	CorrelationID  string
+	Traceparent    string // "" when the request has no span context
+}
+
+// Notification is a stored notification as the API shows it.
+type Notification struct {
+	sqlc.Notification
+	// Scheduled: stored pending, never tried, due in the future (database clock).
+	Scheduled bool
+	// History is the attempt history, oldest first; only filled by Get.
+	History []sqlc.DeliveryAttempt
+}
+
+// Status is the API status: the stored one, or "scheduled".
+func (n Notification) Status() string {
+	if n.Scheduled {
+		return "scheduled"
+	}
+	return string(n.Notification.Status)
+}
+
+// BatchCreated is the answer to an accepted batch.
+type BatchCreated struct {
+	ID              string
+	Total           int
+	NotificationIDs []string // in request order
+	CreatedAt       time.Time
+}
+
+// Batch is one page of a batch with its counts per API status.
+type Batch struct {
+	sqlc.Batch
+	Counts     map[string]int
+	Items      []Notification
+	NextCursor string
+}
+
+// Filter narrows a notification list. Status is an API status.
+type Filter struct {
+	Status      string
+	Channel     core.Channel
+	BatchID     string
+	CreatedFrom *time.Time
+	CreatedTo   *time.Time
+	Limit       int
+	Cursor      string
+}
+
+// Page is one page of a list, newest first.
+type Page struct {
+	Items      []Notification
+	NextCursor string // "" on the last page
+}
+
+// errKeyTaken marks the duplicate-key error of the idempotency row itself.
+var errKeyTaken = errors.New("idempotency key taken")
+
+// maxTxAttempts bounds the retries of a create whose transaction lost a lock
+// race (deadlock, lock wait timeout) or found an expired key.
+const maxTxAttempts = 5
+
+// Create validates, renders and stores one notification. replayed reports
+// that the Idempotency-Key matched an earlier identical request, whose
+// notification is returned.
+func (s *Service) Create(ctx context.Context, r Request, m Meta) (n Notification, replayed bool, err error) {
+	templates, err := s.loadTemplates(ctx, []Request{r})
+	if err != nil {
+		return Notification{}, false, err
+	}
+	a, errs := Validate(r, templates, s.now())
+	if len(errs) > 0 {
+		return Notification{}, false, &ValidationError{Details: errs}
+	}
+	id := uuid.Must(uuid.NewV7())
+	createdAt := idTime(id)
+	params := sqlc.InsertNotificationParams{
+		ID:            id.String(),
+		Recipient:     a.To,
+		Channel:       sqlc.NotificationsChannel(a.Channel),
+		Priority:      sqlc.NotificationsPriority(a.Priority),
+		Content:       a.Content,
+		ScheduledAt:   nullTime(a.ScheduledAt),
+		CorrelationID: m.CorrelationID,
+		Traceparent:   sql.NullString{String: m.Traceparent, Valid: m.Traceparent != ""},
+		CreatedAt:     createdAt,
+	}
+	hash := requestHash("notification", r)
+	stored, err := s.store(ctx, m.IdempotencyKey, hash, sqlc.IdempotencyKeysResourceKindNotification, params.ID,
+		func(q *sqlc.Queries, _ *sql.Tx) error { return q.InsertNotification(ctx, params) })
+	if err != nil {
+		return Notification{}, false, err
+	}
+	n, err = s.get(ctx, stored)
+	if err != nil {
+		return Notification{}, false, err
+	}
+	if stored != params.ID {
+		return n, true, nil
+	}
+	lctx := obs.WithNotificationID(ctx, n.ID)
+	slog.InfoContext(lctx, "notification accepted", "channel", a.Channel, "priority", a.Priority, "scheduled", n.Scheduled)
+	s.publish(lctx, n.Notification)
+	return n, false, nil
+}
+
+// CreateBatch validates every item, then stores the batch and all of its
+// notifications in one transaction, or nothing (decision 0011).
+func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b BatchCreated, replayed bool, err error) {
+	if len(rs) == 0 || len(rs) > core.MaxBatchSize {
+		return BatchCreated{}, false, invalid("notifications", fmt.Sprintf("must hold 1 to %d notifications", core.MaxBatchSize))
+	}
+	templates, err := s.loadTemplates(ctx, rs)
+	if err != nil {
+		return BatchCreated{}, false, err
+	}
+	now := s.now()
+	items := make([]store.BatchItem, len(rs))
+	var all []FieldError
+	for i, r := range rs {
+		a, errs := Validate(r, templates, now)
+		for _, e := range errs {
+			e.Index = &i
+			all = append(all, e)
+		}
+		items[i] = store.BatchItem{BatchIndex: i, Recipient: a.To, Channel: string(a.Channel),
+			Priority: string(a.Priority), Content: a.Content, ScheduledAt: a.ScheduledAt}
+	}
+	if len(all) > 0 {
+		return BatchCreated{}, false, &ValidationError{Details: all}
+	}
+
+	batchID := uuid.Must(uuid.NewV7())
+	b = BatchCreated{ID: batchID.String(), Total: len(rs), CreatedAt: idTime(batchID), NotificationIDs: make([]string, len(rs))}
+	for i := range items {
+		items[i].ID = uuid.Must(uuid.NewV7()).String()
+		b.NotificationIDs[i] = items[i].ID
+	}
+	meta := store.BatchMeta{BatchID: b.ID, CorrelationID: m.CorrelationID, Traceparent: m.Traceparent, CreatedAt: b.CreatedAt}
+	hash := requestHash("batch", rs)
+	stored, err := s.store(ctx, m.IdempotencyKey, hash, sqlc.IdempotencyKeysResourceKindBatch, b.ID,
+		func(q *sqlc.Queries, tx *sql.Tx) error {
+			if err := q.InsertBatch(ctx, sqlc.InsertBatchParams{
+				ID: b.ID, Total: uint32(len(rs)), CorrelationID: m.CorrelationID, CreatedAt: b.CreatedAt, //nolint:gosec // at most MaxBatchSize
+			}); err != nil {
+				return fmt.Errorf("insert batch: %w", err)
+			}
+			return store.InsertBatchItems(ctx, tx, meta, items)
+		})
+	if err != nil {
+		return BatchCreated{}, false, err
+	}
+	if stored != b.ID {
+		b, err = s.batchCreated(ctx, stored)
+		return b, true, err
+	}
+
+	slog.InfoContext(ctx, "batch accepted", "batch_id", b.ID, "total", b.Total)
+	for _, it := range items {
+		s.publishEvent(obs.WithNotificationID(ctx, it.ID), core.Event{
+			NotificationID: it.ID, BatchID: b.ID, Status: core.StatusPending, At: b.CreatedAt, CorrelationID: m.CorrelationID,
+		})
+	}
+	return b, false, nil
+}
+
+// store runs write in a transaction that, with an Idempotency-Key, first
+// inserts the key row (decision 0012). The primary key decides a race: a
+// second request with the same key blocks on the first one's row lock and
+// gets a duplicate-key error once it commits. It returns the id of the
+// resource the request resolved to: resourceID when written now, the earlier
+// resource's id when the key replays.
+func (s *Service) store(ctx context.Context, key string, hash []byte, kind sqlc.IdempotencyKeysResourceKind, resourceID string,
+	write func(q *sqlc.Queries, tx *sql.Tx) error,
+) (string, error) {
+	var last error
+	for range maxTxAttempts {
+		err := s.inTx(ctx, func(q *sqlc.Queries, tx *sql.Tx) error {
+			if key != "" {
+				if err := q.InsertIdempotencyKey(ctx, sqlc.InsertIdempotencyKeyParams{
+					IdemKey: key, RequestHash: hash, ResourceKind: kind, ResourceID: resourceID,
+				}); err != nil {
+					if store.IsDuplicateKey(err) {
+						return errKeyTaken
+					}
+					return fmt.Errorf("insert idempotency key: %w", err)
+				}
+			}
+			return write(q, tx)
+		})
+		switch {
+		case err == nil:
+			return resourceID, nil
+		case errors.Is(err, errKeyTaken):
+			id, retry, err := s.replay(ctx, key, hash, kind)
+			if err != nil || !retry {
+				return id, err
+			}
+			last = errKeyTaken
+		case store.IsLockConflict(err):
+			last = err
+		default:
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("store after %d attempts: %w", maxTxAttempts, last)
+}
+
+// replay resolves a taken key: the earlier resource when the payload is the
+// same, ErrIdempotencyKeyReused when not. retry asks the caller to try the
+// insert again: the key expired (and was just forgotten) or vanished.
+func (s *Service) replay(ctx context.Context, key string, hash []byte, kind sqlc.IdempotencyKeysResourceKind) (id string, retry bool, err error) {
+	for range maxTxAttempts {
+		row, err := s.q.GetIdempotencyKey(ctx, key)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return "", true, nil
+		case store.IsLockConflict(err):
+			continue
+		case err != nil:
+			return "", false, fmt.Errorf("read idempotency key: %w", err)
+		}
+		if row.CreatedAt.Before(s.now().Add(-s.retention)) {
+			if _, err := s.q.DeleteExpiredIdempotencyKey(ctx, sqlc.DeleteExpiredIdempotencyKeyParams{
+				IdemKey: key, CreatedAt: s.now().Add(-s.retention).UTC(),
+			}); err != nil && !store.IsLockConflict(err) {
+				return "", false, fmt.Errorf("forget expired idempotency key: %w", err)
+			}
+			return "", true, nil
+		}
+		if row.ResourceKind != kind || !bytes.Equal(row.RequestHash, hash) {
+			return "", false, ErrIdempotencyKeyReused
+		}
+		return row.ResourceID, false, nil
+	}
+	return "", true, nil
+}
+
+func (s *Service) batchCreated(ctx context.Context, id string) (BatchCreated, error) {
+	b, err := s.q.GetBatch(ctx, id)
+	if err != nil {
+		return BatchCreated{}, fmt.Errorf("read batch %s: %w", id, err)
+	}
+	ids, err := s.q.ListBatchNotificationIDs(ctx, sql.NullString{String: id, Valid: true})
+	if err != nil {
+		return BatchCreated{}, fmt.Errorf("read batch %s ids: %w", id, err)
+	}
+	return BatchCreated{ID: b.ID, Total: int(b.Total), NotificationIDs: ids, CreatedAt: b.CreatedAt}, nil
+}
+
+// Get returns one notification with its attempt history.
+func (s *Service) Get(ctx context.Context, id string) (Notification, error) {
+	n, err := s.get(ctx, id)
+	if err != nil {
+		return Notification{}, err
+	}
+	n.History, err = s.q.ListDeliveryAttempts(ctx, id)
+	if err != nil {
+		return Notification{}, fmt.Errorf("read attempts of %s: %w", id, err)
+	}
+	if n.History == nil {
+		n.History = []sqlc.DeliveryAttempt{}
+	}
+	return n, nil
+}
+
+func (s *Service) get(ctx context.Context, id string) (Notification, error) {
+	row, err := s.q.GetNotification(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Notification{}, ErrNotFound
+	}
+	if err != nil {
+		return Notification{}, fmt.Errorf("read notification %s: %w", id, err)
+	}
+	return Notification{Notification: row.Notification, Scheduled: row.IsScheduled != 0}, nil
+}
+
+// List returns one page of notifications, newest first.
+func (s *Service) List(ctx context.Context, f Filter) (Page, error) {
+	limit := pageSize(f.Limit)
+	p := sqlc.ListNotificationsParams{Limit: int32(limit + 1)} //nolint:gosec // bounded by MaxPageSize
+	switch f.Status {
+	case "":
+	case "scheduled", "pending":
+		p.Status = sqlc.NullNotificationsStatus{NotificationsStatus: sqlc.NotificationsStatusPending, Valid: true}
+		only := int32(0)
+		if f.Status == "scheduled" {
+			only = 1
+		}
+		p.ScheduledOnly = sql.NullInt32{Int32: only, Valid: true}
+	default:
+		if !core.Status(f.Status).Valid() {
+			return Page{}, invalid("status", "unknown status")
+		}
+		p.Status = sqlc.NullNotificationsStatus{NotificationsStatus: sqlc.NotificationsStatus(f.Status), Valid: true}
+	}
+	if f.Channel != "" {
+		p.Channel = sqlc.NullNotificationsChannel{NotificationsChannel: sqlc.NotificationsChannel(f.Channel), Valid: true}
+	}
+	if f.BatchID != "" {
+		p.BatchID = sql.NullString{String: f.BatchID, Valid: true}
+	}
+	p.CreatedFrom, p.CreatedTo = nullTime(f.CreatedFrom), nullTime(f.CreatedTo)
+	if f.Cursor != "" {
+		id, err := DecodeListCursor(f.Cursor)
+		if err != nil {
+			return Page{}, err
+		}
+		p.BeforeID = sql.NullString{String: id, Valid: true}
+	}
+	rows, err := s.q.ListNotifications(ctx, p)
+	if err != nil {
+		return Page{}, fmt.Errorf("list notifications: %w", err)
+	}
+	page := Page{Items: make([]Notification, 0, min(len(rows), limit))}
+	for i, r := range rows {
+		if i == limit {
+			page.NextCursor = EncodeListCursor(page.Items[limit-1].ID)
+			break
+		}
+		page.Items = append(page.Items, Notification{Notification: r.Notification, Scheduled: r.IsScheduled != 0})
+	}
+	return page, nil
+}
+
+// Cancel moves a pending notification to cancelled (decision 0005).
+func (s *Service) Cancel(ctx context.Context, id string) (Notification, error) {
+	return s.transition(ctx, id, core.StatusPending, core.StatusCancelled, s.q.CancelNotification, ErrNotCancellable, "notification cancelled")
+}
+
+// Retry replays a failed notification: pending again, fresh attempt budget,
+// due now; its attempt history is kept.
+func (s *Service) Retry(ctx context.Context, id string) (Notification, error) {
+	return s.transition(ctx, id, core.StatusFailed, core.StatusPending, s.q.ReplayNotification, ErrNotRetryable, "notification replayed")
+}
+
+func (s *Service) transition(ctx context.Context, id string, from, to core.Status,
+	update func(context.Context, string) (int64, error), refused error, msg string,
+) (Notification, error) {
+	if err := core.Transition(from, to); err != nil {
+		return Notification{}, err
+	}
+	changed, err := update(ctx, id)
+	if err != nil {
+		return Notification{}, fmt.Errorf("%s %s to %s: %w", id, from, to, err)
+	}
+	if changed == 0 {
+		if _, err := s.get(ctx, id); err != nil {
+			return Notification{}, err
+		}
+		return Notification{}, refused
+	}
+	n, err := s.get(ctx, id)
+	if err != nil {
+		return Notification{}, err
+	}
+	lctx := obs.WithNotificationID(ctx, id)
+	slog.InfoContext(lctx, msg, "from", from, "to", to)
+	s.publishEvent(lctx, core.Event{
+		NotificationID: n.ID, BatchID: n.BatchID.String, Status: to, Attempts: int(n.Attempts),
+		Error: n.LastError.String, At: n.UpdatedAt, CorrelationID: n.CorrelationID,
+	})
+	return n, nil
+}
+
+// GetBatch returns a batch's counts per API status and one page of its items
+// in request order.
+func (s *Service) GetBatch(ctx context.Context, id string, limit int, cursor string) (Batch, error) {
+	after := -1
+	if cursor != "" {
+		i, err := DecodeBatchCursor(cursor)
+		if err != nil {
+			return Batch{}, err
+		}
+		after = i
+	}
+	b, err := s.q.GetBatch(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Batch{}, ErrNotFound
+	}
+	if err != nil {
+		return Batch{}, fmt.Errorf("read batch %s: %w", id, err)
+	}
+	out := Batch{Batch: b, Counts: map[string]int{}}
+	bid := sql.NullString{String: id, Valid: true}
+	counts, err := s.q.CountBatchByStatus(ctx, bid)
+	if err != nil {
+		return Batch{}, fmt.Errorf("count batch %s: %w", id, err)
+	}
+	for _, c := range counts {
+		out.Counts[asString(c.ApiStatus)] = int(c.N)
+	}
+	n := pageSize(limit)
+	rows, err := s.q.ListBatchItems(ctx, sqlc.ListBatchItemsParams{
+		BatchID: bid, AfterIndex: sql.NullInt32{Int32: int32(after), Valid: true}, Limit: int32(n + 1), //nolint:gosec // bounded
+	})
+	if err != nil {
+		return Batch{}, fmt.Errorf("list batch %s: %w", id, err)
+	}
+	out.Items = make([]Notification, 0, min(len(rows), n))
+	for i, r := range rows {
+		if i == n {
+			out.NextCursor = EncodeBatchCursor(int(out.Items[n-1].BatchIndex.Int32))
+			break
+		}
+		out.Items = append(out.Items, Notification{Notification: r.Notification, Scheduled: r.IsScheduled != 0})
+	}
+	return out, nil
+}
+
+func (s *Service) inTx(ctx context.Context, fn func(q *sqlc.Queries, tx *sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	if err := fn(s.q.WithTx(tx), tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// loadTemplates reads the bodies of the templates the requests name; an
+// unknown name is simply absent from the map.
+func (s *Service) loadTemplates(ctx context.Context, rs []Request) (map[string]string, error) {
+	out := map[string]string{}
+	tried := map[string]bool{}
+	for _, r := range rs {
+		if r.Template == nil || tried[r.Template.Name] {
+			continue
+		}
+		tried[r.Template.Name] = true
+		t, err := s.q.GetTemplate(ctx, r.Template.Name)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read template %q: %w", r.Template.Name, err)
+		}
+		out[t.Name] = t.Body
+	}
+	return out, nil
+}
+
+func (s *Service) publish(ctx context.Context, n sqlc.Notification) {
+	s.publishEvent(ctx, core.Event{
+		NotificationID: n.ID, BatchID: n.BatchID.String, Status: core.Status(n.Status), Attempts: int(n.Attempts),
+		At: n.UpdatedAt, CorrelationID: n.CorrelationID,
+	})
+}
+
+// publishEvent is best effort: an error is logged, never returned.
+func (s *Service) publishEvent(ctx context.Context, e core.Event) {
+	if err := s.pub.Publish(ctx, e); err != nil {
+		slog.WarnContext(ctx, "publish status change", "status", e.Status, "err", err)
+	}
+}
+
+// requestHash is the SHA-256 of the canonical payload: the kind and the
+// request as decoded, re-encoded with a fixed field order and sorted map keys,
+// the priority defaulted and times in UTC.
+func requestHash(kind string, v any) []byte {
+	canon := func(r Request) Request {
+		if r.Priority == "" {
+			r.Priority = core.PriorityNormal
+		}
+		if r.ScheduledAt != nil {
+			t := r.ScheduledAt.UTC()
+			r.ScheduledAt = &t
+		}
+		return r
+	}
+	switch x := v.(type) {
+	case Request:
+		v = canon(x)
+	case []Request:
+		c := make([]Request, len(x))
+		for i, r := range x {
+			c[i] = canon(r)
+		}
+		v = c
+	}
+	b, err := json.Marshal(struct {
+		Kind    string `json:"kind"`
+		Payload any    `json:"payload"`
+	}{kind, v})
+	if err != nil {
+		panic(fmt.Sprintf("encode request for hashing: %v", err)) // plain strings, maps and times always encode
+	}
+	sum := sha256.Sum256(b)
+	return sum[:]
+}
+
+// idTime is the creation time a UUIDv7 carries, to the millisecond; it is
+// stored as created_at, so id order and created_at order agree.
+func idTime(id uuid.UUID) time.Time {
+	sec, nsec := id.Time().UnixTime()
+	return time.Unix(sec, nsec).UTC().Truncate(time.Millisecond)
+}
+
+func nullTime(t *time.Time) sql.NullTime {
+	if t == nil {
+		return sql.NullTime{}
+	}
+	return sql.NullTime{Time: t.UTC(), Valid: true}
+}
+
+func pageSize(limit int) int {
+	switch {
+	case limit <= 0:
+		return core.DefaultPageSize
+	case limit > core.MaxPageSize:
+		return core.MaxPageSize
+	}
+	return limit
+}
+
+func asString(v any) string {
+	switch x := v.(type) {
+	case []byte:
+		return string(x)
+	case string:
+		return x
+	}
+	return fmt.Sprint(v)
+}

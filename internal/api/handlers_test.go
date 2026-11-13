@@ -50,9 +50,6 @@ func TestReadinessIs503WhenADependencyIsDown(t *testing.T) {
 
 func TestOperationsNotBuiltYetAnswer501(t *testing.T) {
 	for _, tc := range []struct{ method, path, body string }{
-		{http.MethodPost, "/v1/notifications", `{"to":"+905551234567","channel":"sms","content":"hi"}`},
-		{http.MethodGet, "/v1/notifications", ""},
-		{http.MethodGet, "/v1/templates", ""},
 		{http.MethodGet, "/v1/metrics", ""},
 		{http.MethodGet, "/v1/ws", ""},
 	} {
@@ -125,5 +122,33 @@ func TestUnknownRouteIs404(t *testing.T) {
 	rec := serve(t, nil, http.MethodGet, "/v1/nope", "")
 	if rec.Code != http.StatusNotFound || decodeError(t, rec).Code != "not_found" {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestEveryResponseCarriesTheCorrelationID(t *testing.T) {
+	h, err := NewServer(nil, nil).Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, header string
+		want         func(string) bool
+	}{
+		{"given id is echoed", "abc-123:x.y_z", func(got string) bool { return got == "abc-123:x.y_z" }},
+		{"absent id is generated", "", func(got string) bool { return len(got) == 36 }},
+		{"malformed id is replaced", "has space", func(got string) bool { return got != "has space" && len(got) == 36 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// An unknown route: the header is set even on an error response.
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/nope", nil)
+			if tc.header != "" {
+				req.Header.Set("X-Correlation-ID", tc.header)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if got := rec.Header().Get("X-Correlation-ID"); !tc.want(got) {
+				t.Fatalf("X-Correlation-ID = %q (status %d)", got, rec.Code)
+			}
+		})
 	}
 }

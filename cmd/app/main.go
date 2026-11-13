@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -24,9 +25,10 @@ import (
 
 	"github.com/LeventAksakal/notification-system/internal/api"
 	"github.com/LeventAksakal/notification-system/internal/config"
+	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/intake"
 	"github.com/LeventAksakal/notification-system/internal/obs"
 	"github.com/LeventAksakal/notification-system/internal/store"
-	"github.com/LeventAksakal/notification-system/internal/store/sqlc"
 )
 
 func main() {
@@ -105,17 +107,21 @@ func worker(ctx context.Context, cfg config.Config) error {
 	return nil
 }
 
-func serve(ctx context.Context, cfg config.Config, db interface {
-	sqlc.DBTX
-	PingContext(context.Context) error
-}) error {
+// noopPublisher drops status changes until the realtime slice replaces it
+// with the Valkey publisher.
+type noopPublisher struct{}
+
+func (noopPublisher) Publish(context.Context, core.Event) error { return nil }
+
+func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 	vk, err := connectValkey(cfg)
 	if err != nil {
 		return err
 	}
 	defer vk.Close()
 
-	srv := api.NewServer(sqlc.New(db), map[string]api.Check{
+	svc := intake.New(db, noopPublisher{}, cfg.IdempotencyRetention)
+	srv := api.NewServer(svc, map[string]api.Check{
 		"mysql":  db.PingContext,
 		"valkey": func(ctx context.Context) error { return vk.Do(ctx, vk.B().Ping().Build()).Error() },
 	})
