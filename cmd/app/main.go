@@ -1,6 +1,8 @@
-// Command app is the service binary. One image, three entry points:
+// Command app is the service binary. One image, four entry points:
 //
 //	app serve        run the HTTP API until SIGINT/SIGTERM
+//	                 (/openapi.json and /docs are served next to the API)
+//	app worker       run a delivery worker until SIGINT/SIGTERM
 //	app migrate      apply embedded migrations, then exit (compose runs it once)
 //	app healthcheck  GET /readyz on localhost; the distroless image has no curl
 package main
@@ -74,18 +76,42 @@ func run(ctx context.Context, cmd string) error {
 		return store.Migrate(ctx, db)
 	case "serve":
 		return serve(ctx, cfg, db)
+	case "worker":
+		return worker(ctx, cfg)
 	default:
-		return fmt.Errorf("unknown command %q (serve, migrate, healthcheck)", cmd)
+		return fmt.Errorf("unknown command %q (serve, worker, migrate, healthcheck)", cmd)
 	}
+}
+
+func connectValkey(cfg config.Config) (valkey.Client, error) {
+	vk, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{cfg.ValkeyAddr}, DisableCache: true})
+	if err != nil {
+		return nil, fmt.Errorf("valkey: %w", err)
+	}
+	return vk, nil
+}
+
+// worker is the delivery process. Skeleton: it holds its connections and
+// waits for SIGINT/SIGTERM; the delivery loop lands with its slice.
+func worker(ctx context.Context, cfg config.Config) error {
+	vk, err := connectValkey(cfg)
+	if err != nil {
+		return err
+	}
+	defer vk.Close()
+	slog.InfoContext(ctx, "worker started", "concurrency", cfg.WorkerConcurrency)
+	<-ctx.Done()
+	slog.InfoContext(context.WithoutCancel(ctx), "worker stopped")
+	return nil
 }
 
 func serve(ctx context.Context, cfg config.Config, db interface {
 	sqlc.DBTX
 	PingContext(context.Context) error
 }) error {
-	vk, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{cfg.ValkeyAddr}, DisableCache: true})
+	vk, err := connectValkey(cfg)
 	if err != nil {
-		return fmt.Errorf("valkey: %w", err)
+		return err
 	}
 	defer vk.Close()
 

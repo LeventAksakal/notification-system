@@ -2,84 +2,128 @@ package api
 
 import (
 	"context"
-	"database/sql"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"regexp"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/store"
-	"github.com/LeventAksakal/notification-system/internal/store/sqlc"
+	"github.com/LeventAksakal/notification-system/internal/core"
 )
 
-type fakeQ struct {
-	sqlc.Querier
-	rows map[string]sqlc.AppMetum
-}
-
-func (f fakeQ) GetMeta(_ context.Context, k string) (sqlc.AppMetum, error) {
-	if m, ok := f.rows[k]; ok {
-		return m, nil
-	}
-	return sqlc.AppMetum{}, sql.ErrNoRows
-}
-
-func serve(t *testing.T, checks map[string]Check, path string) *httptest.ResponseRecorder {
+func serve(t *testing.T, checks map[string]Check, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	q := fakeQ{rows: map[string]sqlc.AppMetum{"version": {K: "version", V: "1", UpdatedAt: time.Unix(0, 0)}}}
-	h, err := NewServer(q, checks).Handler()
+	h, err := NewServer(nil, checks).Handler()
 	if err != nil {
 		t.Fatal(err)
 	}
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req := httptest.NewRequestWithContext(t.Context(), method, path, r)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil))
+	h.ServeHTTP(rec, req)
 	return rec
 }
 
-func TestClientCanReadAKeyAndGets404ForAMissingOne(t *testing.T) {
-	if rec := serve(t, nil, "/v1/meta/version"); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"value":"1"`) {
-		t.Fatalf("found key: %d %s", rec.Code, rec.Body)
+func decodeError(t *testing.T, rec *httptest.ResponseRecorder) Error {
+	t.Helper()
+	var e Error
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("body is not an Error: %v: %s", err, rec.Body)
 	}
-	if rec := serve(t, nil, "/v1/meta/nope"); rec.Code != 404 {
-		t.Fatalf("missing key: %d %s", rec.Code, rec.Body)
-	}
-}
-
-func TestSpecRejectsAKeyLongerThanTheLimitBeforeTheHandler(t *testing.T) {
-	rec := serve(t, nil, "/v1/meta/"+strings.Repeat("k", store.KeyMaxLen+1))
-	if rec.Code != 400 {
-		t.Fatalf("got %d %s", rec.Code, rec.Body)
-	}
+	return e
 }
 
 func TestReadinessIs503WhenADependencyIsDown(t *testing.T) {
 	down := map[string]Check{"mysql": func(context.Context) error { return errors.New("refused") }}
-	if rec := serve(t, down, "/readyz"); rec.Code != 503 || !strings.Contains(rec.Body.String(), `"mysql":"down"`) {
+	if rec := serve(t, down, http.MethodGet, "/readyz", ""); rec.Code != 503 || !strings.Contains(rec.Body.String(), `"mysql":"down"`) {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
 }
 
-// Rules on every layer: the key limit is one number in the spec, the service
-// and the schema.
-func TestKeyLimitAgreesAcrossSpecServiceAndSchema(t *testing.T) {
-	spec, err := GetSwagger()
-	if err != nil {
-		t.Fatal(err)
+func TestOperationsNotBuiltYetAnswer501(t *testing.T) {
+	for _, tc := range []struct{ method, path, body string }{
+		{http.MethodPost, "/v1/notifications", `{"to":"+905551234567","channel":"sms","content":"hi"}`},
+		{http.MethodGet, "/v1/notifications", ""},
+		{http.MethodGet, "/v1/templates", ""},
+		{http.MethodGet, "/v1/metrics", ""},
+		{http.MethodGet, "/v1/ws", ""},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rec := serve(t, nil, tc.method, tc.path, tc.body)
+			if rec.Code != http.StatusNotImplemented || decodeError(t, rec).Code != "not_implemented" {
+				t.Fatalf("got %d %s", rec.Code, rec.Body)
+			}
+		})
 	}
-	if got := *spec.Paths.Find("/v1/meta/{key}").Get.Parameters[0].Value.Schema.Value.MaxLength; got != store.KeyMaxLen {
-		t.Errorf("spec maxLength %d, service %d", got, store.KeyMaxLen)
+}
+
+func TestSpecAndDocsAreServedOutsideTheContract(t *testing.T) {
+	rec := serve(t, nil, http.MethodGet, "/openapi.json", "")
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"openapi":"3.0.3"`) {
+		t.Fatalf("/openapi.json: %d %.200s", rec.Code, rec.Body)
 	}
-	ddl, err := os.ReadFile("../../schema/app_meta.sql")
-	if err != nil {
-		t.Fatal(err)
+	rec = serve(t, nil, http.MethodGet, "/docs", "")
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "/openapi.json") {
+		t.Fatalf("/docs: %d %.200s", rec.Code, rec.Body)
 	}
-	m := regexp.MustCompile(`(?m)^\s*k VARCHAR\((\d+)\)`).FindSubmatch(ddl)
-	if m == nil || string(m[1]) != strconv.Itoa(store.KeyMaxLen) {
-		t.Errorf("schema key column does not say VARCHAR(%d)", store.KeyMaxLen)
+}
+
+func TestRefusedRequestsNameTheOffendingField(t *testing.T) {
+	item := func(content string) string {
+		return `{"to":"+905551234567","channel":"sms","content":"` + content + `"}`
+	}
+	batch := func(items ...string) string { return `{"notifications":[` + strings.Join(items, ",") + `]}` }
+	over := strings.Repeat("x", core.MaxContentLen+1)
+	many := make([]string, core.MaxBatchSize+1)
+	for i := range many {
+		many[i] = item("hi")
+	}
+	three := 3
+
+	for _, tc := range []struct {
+		name, method, path, body string
+		want                     ErrorDetail
+	}{
+		{"missing field", http.MethodPost, "/v1/notifications", `{"channel":"sms","content":"hi"}`,
+			ErrorDetail{Field: "to"}},
+		{"field over its limit", http.MethodPost, "/v1/notifications", item(over),
+			ErrorDetail{Field: "content"}},
+		{"batch item over its limit", http.MethodPost, "/v1/notifications/batch", batch(item("a"), item("b"), item("c"), item(over)),
+			ErrorDetail{Field: "content", Index: &three}},
+		{"batch over 1000 items", http.MethodPost, "/v1/notifications/batch", batch(many...),
+			ErrorDetail{Field: "notifications"}},
+		{"bad query parameter", http.MethodGet, "/v1/notifications?limit=0", "",
+			ErrorDetail{Field: "limit"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serve(t, nil, tc.method, tc.path, tc.body)
+			e := decodeError(t, rec)
+			if rec.Code != http.StatusBadRequest || e.Code != "invalid_request" || e.Message == "" || e.Details == nil {
+				t.Fatalf("got %d %.300s", rec.Code, rec.Body)
+			}
+			for _, d := range *e.Details {
+				if d.Field == tc.want.Field && d.Reason != "" &&
+					(tc.want.Index == nil) == (d.Index == nil) &&
+					(tc.want.Index == nil || *tc.want.Index == *d.Index) {
+					return
+				}
+			}
+			t.Fatalf("no detail like %+v in %.300s", tc.want, rec.Body)
+		})
+	}
+}
+
+func TestUnknownRouteIs404(t *testing.T) {
+	rec := serve(t, nil, http.MethodGet, "/v1/nope", "")
+	if rec.Code != http.StatusNotFound || decodeError(t, rec).Code != "not_found" {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
 }

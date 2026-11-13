@@ -13,12 +13,6 @@ import (
 	"github.com/LeventAksakal/notification-system/migrations"
 )
 
-// KeyMaxLen is the app_meta key limit; the same number is in
-// api/openapi.yaml (maxLength) and schema/app_meta.sql (VARCHAR).
-// TestKeyLimitAgreesAcrossSpecServiceAndSchema in internal/api/handlers_test.go
-// asserts they agree.
-const KeyMaxLen = 64
-
 // Open connects to MySQL. parseTime is forced on so DATETIME scans into
 // time.Time, whatever the injected DSN says.
 func Open(ctx context.Context, dsn string, maxOpen int) (*sql.DB, error) {

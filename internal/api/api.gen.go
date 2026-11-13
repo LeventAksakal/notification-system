@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -20,7 +21,68 @@ import (
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/oapi-codegen/runtime"
+	openapi_types "github.com/oapi-codegen/runtime/types"
 )
+
+// Defines values for Channel.
+const (
+	Email Channel = "email"
+	Push  Channel = "push"
+	Sms   Channel = "sms"
+)
+
+// Valid indicates whether the value is a known member of the Channel enum.
+func (e Channel) Valid() bool {
+	switch e {
+	case Email:
+		return true
+	case Push:
+		return true
+	case Sms:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for DeliveryAttemptOutcome.
+const (
+	DeliveryAttemptOutcomeAccepted  DeliveryAttemptOutcome = "accepted"
+	DeliveryAttemptOutcomePermanent DeliveryAttemptOutcome = "permanent"
+	DeliveryAttemptOutcomeTransient DeliveryAttemptOutcome = "transient"
+)
+
+// Valid indicates whether the value is a known member of the DeliveryAttemptOutcome enum.
+func (e DeliveryAttemptOutcome) Valid() bool {
+	switch e {
+	case DeliveryAttemptOutcomeAccepted:
+		return true
+	case DeliveryAttemptOutcomePermanent:
+		return true
+	case DeliveryAttemptOutcomeTransient:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for FailureKind.
+const (
+	FailureKindExhausted FailureKind = "exhausted"
+	FailureKindPermanent FailureKind = "permanent"
+)
+
+// Valid indicates whether the value is a known member of the FailureKind enum.
+func (e FailureKind) Valid() bool {
+	switch e {
+	case FailureKindExhausted:
+		return true
+	case FailureKindPermanent:
+		return true
+	default:
+		return false
+	}
+}
 
 // Defines values for HealthStatus.
 const (
@@ -40,11 +102,162 @@ func (e HealthStatus) Valid() bool {
 	}
 }
 
+// Defines values for Priority.
+const (
+	High   Priority = "high"
+	Low    Priority = "low"
+	Normal Priority = "normal"
+)
+
+// Valid indicates whether the value is a known member of the Priority enum.
+func (e Priority) Valid() bool {
+	switch e {
+	case High:
+		return true
+	case Low:
+		return true
+	case Normal:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for Status.
+const (
+	Cancelled  Status = "cancelled"
+	Failed     Status = "failed"
+	Pending    Status = "pending"
+	Processing Status = "processing"
+	Scheduled  Status = "scheduled"
+	Sent       Status = "sent"
+)
+
+// Valid indicates whether the value is a known member of the Status enum.
+func (e Status) Valid() bool {
+	switch e {
+	case Cancelled:
+		return true
+	case Failed:
+		return true
+	case Pending:
+		return true
+	case Processing:
+		return true
+	case Scheduled:
+		return true
+	case Sent:
+		return true
+	default:
+		return false
+	}
+}
+
+// BatchCreate defines model for BatchCreate.
+type BatchCreate struct {
+	Notifications []NotificationCreate `json:"notifications"`
+}
+
+// BatchCreated defines model for BatchCreated.
+type BatchCreated struct {
+	CreatedAt time.Time          `json:"createdAt"`
+	Id        openapi_types.UUID `json:"id"`
+
+	// NotificationIds In the order of the request
+	NotificationIds []openapi_types.UUID `json:"notificationIds"`
+	Total           int                  `json:"total"`
+}
+
+// BatchStatus defines model for BatchStatus.
+type BatchStatus struct {
+	Counts    StatusCounts       `json:"counts"`
+	CreatedAt time.Time          `json:"createdAt"`
+	Id        openapi_types.UUID `json:"id"`
+
+	// Items One page of the batch's notifications, in the order of the request
+	Items      []Notification `json:"items"`
+	NextCursor *string        `json:"nextCursor,omitempty"`
+	Total      int            `json:"total"`
+}
+
+// Channel defines model for Channel.
+type Channel string
+
+// DeliveryAttempt defines model for DeliveryAttempt.
+type DeliveryAttempt struct {
+	AttemptNo  int     `json:"attemptNo"`
+	DurationMs int     `json:"durationMs"`
+	Error      *string `json:"error,omitempty"`
+
+	// HttpStatus Absent when no response arrived
+	HttpStatus *int `json:"httpStatus,omitempty"`
+
+	// Outcome `accepted`: 2xx. `transient`: will be retried (network error, timeout, 408, 425, 429, 5xx). `permanent`: any other 4xx.
+	Outcome           DeliveryAttemptOutcome `json:"outcome"`
+	ProviderMessageId *string                `json:"providerMessageId,omitempty"`
+	StartedAt         time.Time              `json:"startedAt"`
+}
+
+// DeliveryAttemptOutcome `accepted`: 2xx. `transient`: will be retried (network error, timeout, 408, 425, 429, 5xx). `permanent`: any other 4xx.
+type DeliveryAttemptOutcome string
+
+// DeliveryStats defines model for DeliveryStats.
+type DeliveryStats struct {
+	// Attempts Provider calls started in the window
+	Attempts int     `json:"attempts"`
+	Channel  Channel `json:"channel"`
+
+	// Failed Notifications that reached `failed` in the window
+	Failed int `json:"failed"`
+
+	// FailedAttempts Provider calls in the window that were not accepted
+	FailedAttempts int `json:"failedAttempts"`
+
+	// FailureRate failed / (sent + failed); 0 when both are 0
+	FailureRate float32 `json:"failureRate"`
+
+	// LatencyMs From due time to provider acceptance, over notifications sent in the window; zeros when none
+	LatencyMs LatencyMs `json:"latencyMs"`
+
+	// Sent Notifications that reached `sent` in the window
+	Sent int `json:"sent"`
+
+	// SuccessRate sent / (sent + failed); 0 when both are 0
+	SuccessRate float32 `json:"successRate"`
+}
+
+// DeliveryTotals defines model for DeliveryTotals.
+type DeliveryTotals struct {
+	Attempts       int     `json:"attempts"`
+	Failed         int     `json:"failed"`
+	FailedAttempts int     `json:"failedAttempts"`
+	FailureRate    float32 `json:"failureRate"`
+
+	// LatencyMs From due time to provider acceptance, over notifications sent in the window; zeros when none
+	LatencyMs   LatencyMs `json:"latencyMs"`
+	Sent        int       `json:"sent"`
+	SuccessRate float32   `json:"successRate"`
+}
+
 // Error defines model for Error.
 type Error struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	// Code invalid_request, not_found, not_cancellable, not_retryable, idempotency_key_reused, internal
+	Code    string         `json:"code"`
+	Details *[]ErrorDetail `json:"details,omitempty"`
+	Message string         `json:"message"`
 }
+
+// ErrorDetail defines model for ErrorDetail.
+type ErrorDetail struct {
+	Field string `json:"field"`
+
+	// Index Position of the item in a batch request
+	Index  *int   `json:"index,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// FailureKind `permanent`: the provider refused it. `exhausted`: every attempt failed.
+type FailureKind string
 
 // Health defines model for Health.
 type Health struct {
@@ -55,24 +268,267 @@ type Health struct {
 // HealthStatus defines model for Health.Status.
 type HealthStatus string
 
-// Meta defines model for Meta.
-type Meta struct {
-	Key       string    `json:"key"`
-	UpdatedAt time.Time `json:"updatedAt"`
-	Value     string    `json:"value"`
+// LatencyMs From due time to provider acceptance, over notifications sent in the window; zeros when none
+type LatencyMs struct {
+	P50 int `json:"p50"`
+	P95 int `json:"p95"`
+	P99 int `json:"p99"`
 }
+
+// Metrics defines model for Metrics.
+type Metrics struct {
+	Delivery DeliveryTotals `json:"delivery"`
+
+	// DeliveryByChannel One entry per channel, always all three
+	DeliveryByChannel []DeliveryStats `json:"deliveryByChannel"`
+	GeneratedAt       time.Time       `json:"generatedAt"`
+
+	// Queue One entry per channel, always all three
+	Queue []QueueDepth `json:"queue"`
+
+	// QueueDepth Every notification not yet finished - pending (due or not) plus processing
+	QueueDepth    int          `json:"queueDepth"`
+	Totals        StatusCounts `json:"totals"`
+	WindowSeconds int          `json:"windowSeconds"`
+}
+
+// Notification defines model for Notification.
+type Notification struct {
+	// Attempts Provider calls made in the current attempt budget
+	Attempts      int                 `json:"attempts"`
+	BatchId       *openapi_types.UUID `json:"batchId,omitempty"`
+	Channel       Channel             `json:"channel"`
+	Content       string              `json:"content"`
+	CorrelationId string              `json:"correlationId"`
+	CreatedAt     time.Time           `json:"createdAt"`
+
+	// DeliveryAttempts Only on GET by id; oldest first
+	DeliveryAttempts *[]DeliveryAttempt `json:"deliveryAttempts,omitempty"`
+
+	// DueAt Earliest time a worker may pick it up (the schedule, or the next retry)
+	DueAt time.Time `json:"dueAt"`
+
+	// FailureKind `permanent`: the provider refused it. `exhausted`: every attempt failed.
+	FailureKind *FailureKind `json:"failureKind,omitempty"`
+
+	// FinishedAt When it reached sent, failed or cancelled
+	FinishedAt        *time.Time         `json:"finishedAt,omitempty"`
+	Id                openapi_types.UUID `json:"id"`
+	LastError         *string            `json:"lastError,omitempty"`
+	Priority          Priority           `json:"priority"`
+	ProviderMessageId *string            `json:"providerMessageId,omitempty"`
+	ScheduledAt       *time.Time         `json:"scheduledAt,omitempty"`
+
+	// Status Stored states are pending, processing, sent, failed and cancelled. `scheduled` is shown
+	// for a pending notification whose due time is in the future and that was never tried.
+	// `sent` means the provider accepted it; the provider never confirms delivery.
+	Status    Status    `json:"status"`
+	To        string    `json:"to"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// NotificationCreate Exactly one of `content` and `template` is required.
+type NotificationCreate struct {
+	Channel  Channel   `json:"channel"`
+	Content  *string   `json:"content,omitempty"`
+	Priority *Priority `json:"priority,omitempty"`
+
+	// ScheduledAt Deliver no earlier than this. A time in the past means now; more than 30 days ahead is refused.
+	ScheduledAt *time.Time   `json:"scheduledAt,omitempty"`
+	Template    *TemplateRef `json:"template,omitempty"`
+	To          string       `json:"to"`
+}
+
+// NotificationPage defines model for NotificationPage.
+type NotificationPage struct {
+	Items []Notification `json:"items"`
+
+	// NextCursor Absent on the last page
+	NextCursor *string `json:"nextCursor,omitempty"`
+}
+
+// Priority defines model for Priority.
+type Priority string
+
+// QueueDepth defines model for QueueDepth.
+type QueueDepth struct {
+	Channel Channel `json:"channel"`
+
+	// OldestPendingAgeMs How long the oldest due notification has waited; 0 when none
+	OldestPendingAgeMs int `json:"oldestPendingAgeMs"`
+
+	// Pending Waiting and due now
+	Pending    int `json:"pending"`
+	Processing int `json:"processing"`
+
+	// Scheduled Waiting for a due time in the future (scheduled, or backing off before a retry)
+	Scheduled int `json:"scheduled"`
+}
+
+// Status Stored states are pending, processing, sent, failed and cancelled. `scheduled` is shown
+// for a pending notification whose due time is in the future and that was never tried.
+// `sent` means the provider accepted it; the provider never confirms delivery.
+type Status string
+
+// StatusCounts defines model for StatusCounts.
+type StatusCounts struct {
+	Cancelled  int `json:"cancelled"`
+	Failed     int `json:"failed"`
+	Pending    int `json:"pending"`
+	Processing int `json:"processing"`
+	Scheduled  int `json:"scheduled"`
+	Sent       int `json:"sent"`
+}
+
+// Template defines model for Template.
+type Template struct {
+	Body      string       `json:"body"`
+	CreatedAt time.Time    `json:"createdAt"`
+	Name      TemplateName `json:"name"`
+	UpdatedAt time.Time    `json:"updatedAt"`
+
+	// Variables Variable names found in the body
+	Variables []string `json:"variables"`
+}
+
+// TemplateName defines model for TemplateName.
+type TemplateName = string
+
+// TemplateRef defines model for TemplateRef.
+type TemplateRef struct {
+	Name      TemplateName       `json:"name"`
+	Variables *map[string]string `json:"variables,omitempty"`
+}
+
+// TemplateWrite defines model for TemplateWrite.
+type TemplateWrite struct {
+	Body string `json:"body"`
+}
+
+// CorrelationId defines model for CorrelationId.
+type CorrelationId = string
+
+// Cursor defines model for Cursor.
+type Cursor = string
+
+// IdempotencyKey defines model for IdempotencyKey.
+type IdempotencyKey = string
+
+// Limit defines model for Limit.
+type Limit = int
+
+// NotificationId defines model for NotificationId.
+type NotificationId = openapi_types.UUID
+
+// Conflict defines model for Conflict.
+type Conflict = Error
+
+// IdempotencyKeyReused defines model for IdempotencyKeyReused.
+type IdempotencyKeyReused = Error
+
+// InvalidRequest defines model for InvalidRequest.
+type InvalidRequest = Error
+
+// NotFound defines model for NotFound.
+type NotFound = Error
+
+// GetBatchParams defines parameters for GetBatch.
+type GetBatchParams struct {
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor Opaque; the `nextCursor` of the previous page
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// GetMetricsParams defines parameters for GetMetrics.
+type GetMetricsParams struct {
+	// WindowSeconds How far back `delivery` looks
+	WindowSeconds *int `form:"windowSeconds,omitempty" json:"windowSeconds,omitempty"`
+}
+
+// ListNotificationsParams defines parameters for ListNotifications.
+type ListNotificationsParams struct {
+	// Status `scheduled` selects pending notifications whose due time is in the future and that were never tried; `pending` selects the other pending ones.
+	Status  *Status             `form:"status,omitempty" json:"status,omitempty"`
+	Channel *Channel            `form:"channel,omitempty" json:"channel,omitempty"`
+	BatchId *openapi_types.UUID `form:"batchId,omitempty" json:"batchId,omitempty"`
+
+	// CreatedFrom Inclusive lower bound on `createdAt`
+	CreatedFrom *time.Time `form:"createdFrom,omitempty" json:"createdFrom,omitempty"`
+
+	// CreatedTo Exclusive upper bound on `createdAt`
+	CreatedTo *time.Time `form:"createdTo,omitempty" json:"createdTo,omitempty"`
+	Limit     *Limit     `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor Opaque; the `nextCursor` of the previous page
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// CreateNotificationParams defines parameters for CreateNotification.
+type CreateNotificationParams struct {
+	IdempotencyKey *IdempotencyKey `json:"Idempotency-Key,omitempty"`
+	XCorrelationID *CorrelationId  `json:"X-Correlation-ID,omitempty"`
+}
+
+// CreateBatchParams defines parameters for CreateBatch.
+type CreateBatchParams struct {
+	IdempotencyKey *IdempotencyKey `json:"Idempotency-Key,omitempty"`
+	XCorrelationID *CorrelationId  `json:"X-Correlation-ID,omitempty"`
+}
+
+// CreateNotificationJSONRequestBody defines body for CreateNotification for application/json ContentType.
+type CreateNotificationJSONRequestBody = NotificationCreate
+
+// CreateBatchJSONRequestBody defines body for CreateBatch for application/json ContentType.
+type CreateBatchJSONRequestBody = BatchCreate
+
+// PutTemplateJSONRequestBody defines body for PutTemplate for application/json ContentType.
+type PutTemplateJSONRequestBody = TemplateWrite
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
 	// Health Liveness - the process is up
 	// (GET /healthz)
 	Health(w http.ResponseWriter, r *http.Request)
-	// Ready Readiness - dependencies answer
+	// Ready Readiness - MySQL and Valkey answer
 	// (GET /readyz)
 	Ready(w http.ResponseWriter, r *http.Request)
-	// GetMeta Read one key/value pair
-	// (GET /v1/meta/{key})
-	GetMeta(w http.ResponseWriter, r *http.Request, key string)
+	// GetBatch Counts per status and the items of one batch
+	// (GET /v1/batches/{id})
+	GetBatch(w http.ResponseWriter, r *http.Request, id openapi_types.UUID, params GetBatchParams)
+	// GetMetrics Queue depth, success and failure rates, latency
+	// (GET /v1/metrics)
+	GetMetrics(w http.ResponseWriter, r *http.Request, params GetMetricsParams)
+	// ListNotifications List notifications, newest first
+	// (GET /v1/notifications)
+	ListNotifications(w http.ResponseWriter, r *http.Request, params ListNotificationsParams)
+	// CreateNotification Queue one notification
+	// (POST /v1/notifications)
+	CreateNotification(w http.ResponseWriter, r *http.Request, params CreateNotificationParams)
+	// CreateBatch Queue up to 1000 notifications atomically
+	// (POST /v1/notifications/batch)
+	CreateBatch(w http.ResponseWriter, r *http.Request, params CreateBatchParams)
+	// GetNotification Status, attempt count, last error and the attempt history of one notification
+	// (GET /v1/notifications/{id})
+	GetNotification(w http.ResponseWriter, r *http.Request, id NotificationId)
+	// CancelNotification Cancel a notification that has not been picked up
+	// (POST /v1/notifications/{id}/cancel)
+	CancelNotification(w http.ResponseWriter, r *http.Request, id NotificationId)
+	// RetryNotification Replay a dead letter
+	// (POST /v1/notifications/{id}/retry)
+	RetryNotification(w http.ResponseWriter, r *http.Request, id NotificationId)
+	// ListTemplates All templates, by name
+	// (GET /v1/templates)
+	ListTemplates(w http.ResponseWriter, r *http.Request)
+	// DeleteTemplate Delete a template
+	// (DELETE /v1/templates/{name})
+	DeleteTemplate(w http.ResponseWriter, r *http.Request, name TemplateName)
+	// GetTemplate Read one template
+	// (GET /v1/templates/{name})
+	GetTemplate(w http.ResponseWriter, r *http.Request, name TemplateName)
+	// PutTemplate Create or replace a template
+	// (PUT /v1/templates/{name})
+	PutTemplate(w http.ResponseWriter, r *http.Request, name TemplateName)
 }
 
 // ServerInterfaceWrapper converts contexts to parameters.
@@ -112,23 +568,486 @@ func (siw *ServerInterfaceWrapper) Ready(w http.ResponseWriter, r *http.Request)
 	handler.ServeHTTP(w, r)
 }
 
-// GetMeta operation middleware
-func (siw *ServerInterfaceWrapper) GetMeta(w http.ResponseWriter, r *http.Request) {
+// GetBatch operation middleware
+func (siw *ServerInterfaceWrapper) GetBatch(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 	_ = err
 
-	// ------------- Path parameter "key" -------------
-	var key string
+	// ------------- Path parameter "id" -------------
+	var id openapi_types.UUID
 
-	err = runtime.BindStyledParameterWithOptions("simple", "key", r.PathValue("key"), &key, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
 	if err != nil {
-		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "key", Err: err})
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetBatchParams
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "limit", r.URL.Query(), &params.Limit, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "limit"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "cursor" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "cursor", r.URL.Query(), &params.Cursor, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "cursor"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "cursor", Err: err})
+		}
 		return
 	}
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.GetMeta(w, r, key)
+		siw.Handler.GetBatch(w, r, id, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetMetrics operation middleware
+func (siw *ServerInterfaceWrapper) GetMetrics(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetMetricsParams
+
+	// ------------- Optional query parameter "windowSeconds" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "windowSeconds", r.URL.Query(), &params.WindowSeconds, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "windowSeconds"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "windowSeconds", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetMetrics(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListNotifications operation middleware
+func (siw *ServerInterfaceWrapper) ListNotifications(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListNotificationsParams
+
+	// ------------- Optional query parameter "status" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "status", r.URL.Query(), &params.Status, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "status"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "status", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "channel" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "channel", r.URL.Query(), &params.Channel, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "channel"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "channel", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "batchId" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "batchId", r.URL.Query(), &params.BatchId, runtime.BindQueryParameterOptions{Type: "string", Format: "uuid"})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "batchId"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "batchId", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "createdFrom" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "createdFrom", r.URL.Query(), &params.CreatedFrom, runtime.BindQueryParameterOptions{Type: "string", Format: "date-time"})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "createdFrom"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "createdFrom", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "createdTo" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "createdTo", r.URL.Query(), &params.CreatedTo, runtime.BindQueryParameterOptions{Type: "string", Format: "date-time"})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "createdTo"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "createdTo", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "limit", r.URL.Query(), &params.Limit, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "limit"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "cursor" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "cursor", r.URL.Query(), &params.Cursor, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "cursor"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "cursor", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListNotifications(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateNotification operation middleware
+func (siw *ServerInterfaceWrapper) CreateNotification(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params CreateNotificationParams
+
+	headers := r.Header
+
+	// ------------- Optional header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey IdempotencyKey
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = &IdempotencyKey
+
+	}
+
+	// ------------- Optional header parameter "X-Correlation-ID" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("X-Correlation-ID")]; found {
+		var XCorrelationID CorrelationId
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "X-Correlation-ID", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "X-Correlation-ID", valueList[0], &XCorrelationID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "X-Correlation-ID", Err: err})
+			return
+		}
+
+		params.XCorrelationID = &XCorrelationID
+
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateNotification(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateBatch operation middleware
+func (siw *ServerInterfaceWrapper) CreateBatch(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params CreateBatchParams
+
+	headers := r.Header
+
+	// ------------- Optional header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey IdempotencyKey
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = &IdempotencyKey
+
+	}
+
+	// ------------- Optional header parameter "X-Correlation-ID" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("X-Correlation-ID")]; found {
+		var XCorrelationID CorrelationId
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "X-Correlation-ID", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "X-Correlation-ID", valueList[0], &XCorrelationID, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "X-Correlation-ID", Err: err})
+			return
+		}
+
+		params.XCorrelationID = &XCorrelationID
+
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateBatch(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetNotification operation middleware
+func (siw *ServerInterfaceWrapper) GetNotification(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id NotificationId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetNotification(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CancelNotification operation middleware
+func (siw *ServerInterfaceWrapper) CancelNotification(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id NotificationId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CancelNotification(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RetryNotification operation middleware
+func (siw *ServerInterfaceWrapper) RetryNotification(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "id" -------------
+	var id NotificationId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", r.PathValue("id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RetryNotification(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListTemplates operation middleware
+func (siw *ServerInterfaceWrapper) ListTemplates(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListTemplates(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeleteTemplate operation middleware
+func (siw *ServerInterfaceWrapper) DeleteTemplate(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "name" -------------
+	var name TemplateName
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", r.PathValue("name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteTemplate(w, r, name)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetTemplate operation middleware
+func (siw *ServerInterfaceWrapper) GetTemplate(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "name" -------------
+	var name TemplateName
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", r.PathValue("name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetTemplate(w, r, name)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PutTemplate operation middleware
+func (siw *ServerInterfaceWrapper) PutTemplate(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "name" -------------
+	var name TemplateName
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", r.PathValue("name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PutTemplate(w, r, name)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -260,10 +1179,29 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/healthz", wrapper.Health)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/readyz", wrapper.Ready)
-	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/meta/{key}", wrapper.GetMeta)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/notifications", wrapper.ListNotifications)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/notifications", wrapper.CreateNotification)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/notifications/batch", wrapper.CreateBatch)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/notifications/{id}", wrapper.GetNotification)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/notifications/{id}/cancel", wrapper.CancelNotification)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/v1/notifications/{id}/retry", wrapper.RetryNotification)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/batches/{id}", wrapper.GetBatch)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/templates", wrapper.ListTemplates)
+	m.HandleFunc(http.MethodDelete+" "+options.BaseURL+"/v1/templates/{name}", wrapper.DeleteTemplate)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/templates/{name}", wrapper.GetTemplate)
+	m.HandleFunc(http.MethodPut+" "+options.BaseURL+"/v1/templates/{name}", wrapper.PutTemplate)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/v1/metrics", wrapper.GetMetrics)
 
 	return m
 }
+
+type ConflictJSONResponse Error
+
+type IdempotencyKeyReusedJSONResponse Error
+
+type InvalidRequestJSONResponse Error
+
+type NotFoundJSONResponse Error
 
 type HealthRequestObject struct {
 }
@@ -321,17 +1259,18 @@ func (response Ready503JSONResponse) VisitReadyResponse(w http.ResponseWriter) e
 	return err
 }
 
-type GetMetaRequestObject struct {
-	Key string `json:"key"`
+type GetBatchRequestObject struct {
+	Id     openapi_types.UUID `json:"id"`
+	Params GetBatchParams
 }
 
-type GetMetaResponseObject interface {
-	VisitGetMetaResponse(w http.ResponseWriter) error
+type GetBatchResponseObject interface {
+	VisitGetBatchResponse(w http.ResponseWriter) error
 }
 
-type GetMeta200JSONResponse Meta
+type GetBatch200JSONResponse BatchStatus
 
-func (response GetMeta200JSONResponse) VisitGetMetaResponse(w http.ResponseWriter) error {
+func (response GetBatch200JSONResponse) VisitGetBatchResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
@@ -343,9 +1282,23 @@ func (response GetMeta200JSONResponse) VisitGetMetaResponse(w http.ResponseWrite
 	return err
 }
 
-type GetMeta404JSONResponse Error
+type GetBatch400JSONResponse struct{ InvalidRequestJSONResponse }
 
-func (response GetMeta404JSONResponse) VisitGetMetaResponse(w http.ResponseWriter) error {
+func (response GetBatch400JSONResponse) VisitGetBatchResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetBatch404JSONResponse struct{ NotFoundJSONResponse }
+
+func (response GetBatch404JSONResponse) VisitGetBatchResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
@@ -357,17 +1310,518 @@ func (response GetMeta404JSONResponse) VisitGetMetaResponse(w http.ResponseWrite
 	return err
 }
 
+type GetMetricsRequestObject struct {
+	Params GetMetricsParams
+}
+
+type GetMetricsResponseObject interface {
+	VisitGetMetricsResponse(w http.ResponseWriter) error
+}
+
+type GetMetrics200JSONResponse Metrics
+
+func (response GetMetrics200JSONResponse) VisitGetMetricsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetMetrics400JSONResponse struct{ InvalidRequestJSONResponse }
+
+func (response GetMetrics400JSONResponse) VisitGetMetricsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListNotificationsRequestObject struct {
+	Params ListNotificationsParams
+}
+
+type ListNotificationsResponseObject interface {
+	VisitListNotificationsResponse(w http.ResponseWriter) error
+}
+
+type ListNotifications200JSONResponse NotificationPage
+
+func (response ListNotifications200JSONResponse) VisitListNotificationsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListNotifications400JSONResponse struct{ InvalidRequestJSONResponse }
+
+func (response ListNotifications400JSONResponse) VisitListNotificationsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateNotificationRequestObject struct {
+	Params CreateNotificationParams
+	Body   *CreateNotificationJSONRequestBody
+}
+
+type CreateNotificationResponseObject interface {
+	VisitCreateNotificationResponse(w http.ResponseWriter) error
+}
+
+type CreateNotification201ResponseHeaders struct {
+	IdempotentReplayed *string
+	XCorrelationID     *string
+}
+
+type CreateNotification201JSONResponse struct {
+	Body    Notification
+	Headers CreateNotification201ResponseHeaders
+}
+
+func (response CreateNotification201JSONResponse) VisitCreateNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if response.Headers.IdempotentReplayed != nil {
+		w.Header().Set("Idempotent-Replayed", fmt.Sprint(*response.Headers.IdempotentReplayed))
+	}
+	if response.Headers.XCorrelationID != nil {
+		w.Header().Set("X-Correlation-ID", fmt.Sprint(*response.Headers.XCorrelationID))
+	}
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateNotification400JSONResponse struct{ InvalidRequestJSONResponse }
+
+func (response CreateNotification400JSONResponse) VisitCreateNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateNotification422JSONResponse struct {
+	IdempotencyKeyReusedJSONResponse
+}
+
+func (response CreateNotification422JSONResponse) VisitCreateNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(422)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateBatchRequestObject struct {
+	Params CreateBatchParams
+	Body   *CreateBatchJSONRequestBody
+}
+
+type CreateBatchResponseObject interface {
+	VisitCreateBatchResponse(w http.ResponseWriter) error
+}
+
+type CreateBatch201ResponseHeaders struct {
+	IdempotentReplayed *string
+	XCorrelationID     *string
+}
+
+type CreateBatch201JSONResponse struct {
+	Body    BatchCreated
+	Headers CreateBatch201ResponseHeaders
+}
+
+func (response CreateBatch201JSONResponse) VisitCreateBatchResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if response.Headers.IdempotentReplayed != nil {
+		w.Header().Set("Idempotent-Replayed", fmt.Sprint(*response.Headers.IdempotentReplayed))
+	}
+	if response.Headers.XCorrelationID != nil {
+		w.Header().Set("X-Correlation-ID", fmt.Sprint(*response.Headers.XCorrelationID))
+	}
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateBatch400JSONResponse struct{ InvalidRequestJSONResponse }
+
+func (response CreateBatch400JSONResponse) VisitCreateBatchResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateBatch422JSONResponse struct {
+	IdempotencyKeyReusedJSONResponse
+}
+
+func (response CreateBatch422JSONResponse) VisitCreateBatchResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(422)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetNotificationRequestObject struct {
+	Id NotificationId `json:"id"`
+}
+
+type GetNotificationResponseObject interface {
+	VisitGetNotificationResponse(w http.ResponseWriter) error
+}
+
+type GetNotification200JSONResponse Notification
+
+func (response GetNotification200JSONResponse) VisitGetNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetNotification404JSONResponse struct{ NotFoundJSONResponse }
+
+func (response GetNotification404JSONResponse) VisitGetNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CancelNotificationRequestObject struct {
+	Id NotificationId `json:"id"`
+}
+
+type CancelNotificationResponseObject interface {
+	VisitCancelNotificationResponse(w http.ResponseWriter) error
+}
+
+type CancelNotification200JSONResponse Notification
+
+func (response CancelNotification200JSONResponse) VisitCancelNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CancelNotification404JSONResponse struct{ NotFoundJSONResponse }
+
+func (response CancelNotification404JSONResponse) VisitCancelNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CancelNotification409JSONResponse struct{ ConflictJSONResponse }
+
+func (response CancelNotification409JSONResponse) VisitCancelNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetryNotificationRequestObject struct {
+	Id NotificationId `json:"id"`
+}
+
+type RetryNotificationResponseObject interface {
+	VisitRetryNotificationResponse(w http.ResponseWriter) error
+}
+
+type RetryNotification200JSONResponse Notification
+
+func (response RetryNotification200JSONResponse) VisitRetryNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetryNotification404JSONResponse struct{ NotFoundJSONResponse }
+
+func (response RetryNotification404JSONResponse) VisitRetryNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetryNotification409JSONResponse struct{ ConflictJSONResponse }
+
+func (response RetryNotification409JSONResponse) VisitRetryNotificationResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListTemplatesRequestObject struct {
+}
+
+type ListTemplatesResponseObject interface {
+	VisitListTemplatesResponse(w http.ResponseWriter) error
+}
+
+type ListTemplates200JSONResponse struct {
+	Items []Template `json:"items"`
+}
+
+func (response ListTemplates200JSONResponse) VisitListTemplatesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteTemplateRequestObject struct {
+	Name TemplateName `json:"name"`
+}
+
+type DeleteTemplateResponseObject interface {
+	VisitDeleteTemplateResponse(w http.ResponseWriter) error
+}
+
+type DeleteTemplate204Response struct {
+}
+
+func (response DeleteTemplate204Response) VisitDeleteTemplateResponse(w http.ResponseWriter) error {
+	w.WriteHeader(204)
+	return nil
+}
+
+type DeleteTemplate404JSONResponse struct{ NotFoundJSONResponse }
+
+func (response DeleteTemplate404JSONResponse) VisitDeleteTemplateResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetTemplateRequestObject struct {
+	Name TemplateName `json:"name"`
+}
+
+type GetTemplateResponseObject interface {
+	VisitGetTemplateResponse(w http.ResponseWriter) error
+}
+
+type GetTemplate200JSONResponse Template
+
+func (response GetTemplate200JSONResponse) VisitGetTemplateResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetTemplate404JSONResponse struct{ NotFoundJSONResponse }
+
+func (response GetTemplate404JSONResponse) VisitGetTemplateResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PutTemplateRequestObject struct {
+	Name TemplateName `json:"name"`
+	Body *PutTemplateJSONRequestBody
+}
+
+type PutTemplateResponseObject interface {
+	VisitPutTemplateResponse(w http.ResponseWriter) error
+}
+
+type PutTemplate200JSONResponse Template
+
+func (response PutTemplate200JSONResponse) VisitPutTemplateResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PutTemplate400JSONResponse struct{ InvalidRequestJSONResponse }
+
+func (response PutTemplate400JSONResponse) VisitPutTemplateResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 // StrictServerInterface represents all server handlers.
 type StrictServerInterface interface {
 	// Health Liveness - the process is up
 	// (GET /healthz)
 	Health(ctx context.Context, request HealthRequestObject) (HealthResponseObject, error)
-	// Ready Readiness - dependencies answer
+	// Ready Readiness - MySQL and Valkey answer
 	// (GET /readyz)
 	Ready(ctx context.Context, request ReadyRequestObject) (ReadyResponseObject, error)
-	// GetMeta Read one key/value pair
-	// (GET /v1/meta/{key})
-	GetMeta(ctx context.Context, request GetMetaRequestObject) (GetMetaResponseObject, error)
+	// GetBatch Counts per status and the items of one batch
+	// (GET /v1/batches/{id})
+	GetBatch(ctx context.Context, request GetBatchRequestObject) (GetBatchResponseObject, error)
+	// GetMetrics Queue depth, success and failure rates, latency
+	// (GET /v1/metrics)
+	GetMetrics(ctx context.Context, request GetMetricsRequestObject) (GetMetricsResponseObject, error)
+	// ListNotifications List notifications, newest first
+	// (GET /v1/notifications)
+	ListNotifications(ctx context.Context, request ListNotificationsRequestObject) (ListNotificationsResponseObject, error)
+	// CreateNotification Queue one notification
+	// (POST /v1/notifications)
+	CreateNotification(ctx context.Context, request CreateNotificationRequestObject) (CreateNotificationResponseObject, error)
+	// CreateBatch Queue up to 1000 notifications atomically
+	// (POST /v1/notifications/batch)
+	CreateBatch(ctx context.Context, request CreateBatchRequestObject) (CreateBatchResponseObject, error)
+	// GetNotification Status, attempt count, last error and the attempt history of one notification
+	// (GET /v1/notifications/{id})
+	GetNotification(ctx context.Context, request GetNotificationRequestObject) (GetNotificationResponseObject, error)
+	// CancelNotification Cancel a notification that has not been picked up
+	// (POST /v1/notifications/{id}/cancel)
+	CancelNotification(ctx context.Context, request CancelNotificationRequestObject) (CancelNotificationResponseObject, error)
+	// RetryNotification Replay a dead letter
+	// (POST /v1/notifications/{id}/retry)
+	RetryNotification(ctx context.Context, request RetryNotificationRequestObject) (RetryNotificationResponseObject, error)
+	// ListTemplates All templates, by name
+	// (GET /v1/templates)
+	ListTemplates(ctx context.Context, request ListTemplatesRequestObject) (ListTemplatesResponseObject, error)
+	// DeleteTemplate Delete a template
+	// (DELETE /v1/templates/{name})
+	DeleteTemplate(ctx context.Context, request DeleteTemplateRequestObject) (DeleteTemplateResponseObject, error)
+	// GetTemplate Read one template
+	// (GET /v1/templates/{name})
+	GetTemplate(ctx context.Context, request GetTemplateRequestObject) (GetTemplateResponseObject, error)
+	// PutTemplate Create or replace a template
+	// (PUT /v1/templates/{name})
+	PutTemplate(ctx context.Context, request PutTemplateRequestObject) (PutTemplateResponseObject, error)
 }
 
 type StrictHandlerFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error)
@@ -457,25 +1911,331 @@ func (sh *strictHandler) Ready(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GetMeta operation middleware
-func (sh *strictHandler) GetMeta(w http.ResponseWriter, r *http.Request, key string) {
-	var request GetMetaRequestObject
+// GetBatch operation middleware
+func (sh *strictHandler) GetBatch(w http.ResponseWriter, r *http.Request, id openapi_types.UUID, params GetBatchParams) {
+	var request GetBatchRequestObject
 
-	request.Key = key
+	request.Id = id
+	request.Params = params
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
-		return sh.ssi.GetMeta(ctx, request.(GetMetaRequestObject))
+		return sh.ssi.GetBatch(ctx, request.(GetBatchRequestObject))
 	}
 	for _, middleware := range sh.middlewares {
-		handler = middleware(handler, "GetMeta")
+		handler = middleware(handler, "GetBatch")
 	}
 
 	response, err := handler(r.Context(), w, r, request)
 
 	if err != nil {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
-	} else if validResponse, ok := response.(GetMetaResponseObject); ok {
-		if err := validResponse.VisitGetMetaResponse(w); err != nil {
+	} else if validResponse, ok := response.(GetBatchResponseObject); ok {
+		if err := validResponse.VisitGetBatchResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetMetrics operation middleware
+func (sh *strictHandler) GetMetrics(w http.ResponseWriter, r *http.Request, params GetMetricsParams) {
+	var request GetMetricsRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetMetrics(ctx, request.(GetMetricsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetMetrics")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetMetricsResponseObject); ok {
+		if err := validResponse.VisitGetMetricsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListNotifications operation middleware
+func (sh *strictHandler) ListNotifications(w http.ResponseWriter, r *http.Request, params ListNotificationsParams) {
+	var request ListNotificationsRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListNotifications(ctx, request.(ListNotificationsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListNotifications")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListNotificationsResponseObject); ok {
+		if err := validResponse.VisitListNotificationsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateNotification operation middleware
+func (sh *strictHandler) CreateNotification(w http.ResponseWriter, r *http.Request, params CreateNotificationParams) {
+	var request CreateNotificationRequestObject
+
+	request.Params = params
+
+	var body CreateNotificationJSONRequestBody
+	if err := runtime.BindJSONBody(r, &body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateNotification(ctx, request.(CreateNotificationRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateNotification")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateNotificationResponseObject); ok {
+		if err := validResponse.VisitCreateNotificationResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateBatch operation middleware
+func (sh *strictHandler) CreateBatch(w http.ResponseWriter, r *http.Request, params CreateBatchParams) {
+	var request CreateBatchRequestObject
+
+	request.Params = params
+
+	var body CreateBatchJSONRequestBody
+	if err := runtime.BindJSONBody(r, &body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateBatch(ctx, request.(CreateBatchRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateBatch")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateBatchResponseObject); ok {
+		if err := validResponse.VisitCreateBatchResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetNotification operation middleware
+func (sh *strictHandler) GetNotification(w http.ResponseWriter, r *http.Request, id NotificationId) {
+	var request GetNotificationRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetNotification(ctx, request.(GetNotificationRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetNotification")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetNotificationResponseObject); ok {
+		if err := validResponse.VisitGetNotificationResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CancelNotification operation middleware
+func (sh *strictHandler) CancelNotification(w http.ResponseWriter, r *http.Request, id NotificationId) {
+	var request CancelNotificationRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CancelNotification(ctx, request.(CancelNotificationRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CancelNotification")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CancelNotificationResponseObject); ok {
+		if err := validResponse.VisitCancelNotificationResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RetryNotification operation middleware
+func (sh *strictHandler) RetryNotification(w http.ResponseWriter, r *http.Request, id NotificationId) {
+	var request RetryNotificationRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RetryNotification(ctx, request.(RetryNotificationRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RetryNotification")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RetryNotificationResponseObject); ok {
+		if err := validResponse.VisitRetryNotificationResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListTemplates operation middleware
+func (sh *strictHandler) ListTemplates(w http.ResponseWriter, r *http.Request) {
+	var request ListTemplatesRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListTemplates(ctx, request.(ListTemplatesRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListTemplates")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListTemplatesResponseObject); ok {
+		if err := validResponse.VisitListTemplatesResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DeleteTemplate operation middleware
+func (sh *strictHandler) DeleteTemplate(w http.ResponseWriter, r *http.Request, name TemplateName) {
+	var request DeleteTemplateRequestObject
+
+	request.Name = name
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteTemplate(ctx, request.(DeleteTemplateRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteTemplate")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteTemplateResponseObject); ok {
+		if err := validResponse.VisitDeleteTemplateResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetTemplate operation middleware
+func (sh *strictHandler) GetTemplate(w http.ResponseWriter, r *http.Request, name TemplateName) {
+	var request GetTemplateRequestObject
+
+	request.Name = name
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetTemplate(ctx, request.(GetTemplateRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetTemplate")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetTemplateResponseObject); ok {
+		if err := validResponse.VisitGetTemplateResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PutTemplate operation middleware
+func (sh *strictHandler) PutTemplate(w http.ResponseWriter, r *http.Request, name TemplateName) {
+	var request PutTemplateRequestObject
+
+	request.Name = name
+
+	var body PutTemplateJSONRequestBody
+	if err := runtime.BindJSONBody(r, &body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PutTemplate(ctx, request.(PutTemplateRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PutTemplate")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PutTemplateResponseObject); ok {
+		if err := validResponse.VisitPutTemplateResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -488,17 +2248,84 @@ func (sh *strictHandler) GetMeta(w http.ResponseWriter, r *http.Request, key str
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,
