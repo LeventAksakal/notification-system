@@ -21,7 +21,7 @@ That starts MySQL, Valkey, the API, three delivery workers, a local stand-in for
 | Provider stand-in: what it received | http://localhost:8090/_control/stats |
 | Grafana: traces, logs, metrics | http://localhost:3000 |
 
-`docker compose down` stops it; add `-v` to drop the database volume. If a port is taken, set `APP_PORT`, `PROVIDER_PORT` or `GRAFANA_PORT` before `docker compose up` (compose variables, listed under Settings).
+`docker compose down` stops it; add `-v` to drop the database volume. If a port is taken, set `APP_PORT`, `PROVIDER_PORT`, `GRAFANA_PORT` or `MYSQL_PORT` before `docker compose up` (compose variables, listed under Settings).
 
 ## Try it
 
@@ -199,7 +199,7 @@ Secrets (today only `APP_DATABASE_DSN`) have no default and are never committed.
 
 | Compose variable | Default | Meaning |
 |---|---|---|
-| `APP_PORT`, `PROVIDER_PORT`, `GRAFANA_PORT` | `8080`, `8090`, `3000` | Host ports of the API, the provider stand-in and Grafana |
+| `APP_PORT`, `PROVIDER_PORT`, `GRAFANA_PORT`, `MYSQL_PORT` | `8080`, `8090`, `3000`, `3306` | Host ports (loopback only) of the API, the provider stand-in, Grafana and MySQL (database `app`, user `app`) |
 | `MYSQL_PASSWORD`, `MYSQL_ROOT_PASSWORD` | `local-dev`, `local-dev-root` | Local database passwords |
 | `PROVIDER_URL_SMS`, `PROVIDER_URL_EMAIL`, `PROVIDER_URL_PUSH` | the stand-in | Where each channel's messages are sent |
 | `PROVIDER_DEDUPE` | `true` | Whether the stand-in honours `Idempotency-Key` |

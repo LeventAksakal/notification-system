@@ -19,6 +19,8 @@ services:
       MYSQL_USER: app
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-local-dev}
     volumes: [mysql:/var/lib/mysql]
+    # Loopback only, for a database client on the host (MYSQL_PORT if 3306 is taken).
+    ports: ["127.0.0.1:${MYSQL_PORT:-3306}:3306"]
     healthcheck:
       # TCP, not the socket: on first boot the init server answers socket
       # pings with networking off, so a socket check reports ready too early.
