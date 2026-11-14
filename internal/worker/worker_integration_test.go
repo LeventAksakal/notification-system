@@ -164,8 +164,13 @@ func TestWorkersHoldTheRateAtTheProvider(t *testing.T) {
 		if busiest > limit {
 			t.Errorf("%s: %d requests in one second, limit %d", ch, busiest, limit)
 		}
-		if avg < 95 {
-			t.Errorf("%s: average %.1f/s, want at least 95", ch, avg)
+		// A sanity floor only. This package's tests run beside the other
+		// packages' database tests, and throughput follows the machine
+		// (alone: 95 to 97 per second; in a full parallel run: 56 to 66, owner
+		// item 0011). The strict floors are the acceptance suite's
+		// (TestDeliveryR8RateLimit), which runs on its own.
+		if avg < 40 {
+			t.Errorf("%s: average %.1f/s, want at least 40", ch, avg)
 		}
 	}
 }

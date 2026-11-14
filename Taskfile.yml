@@ -66,7 +66,7 @@ tasks:
     cmds: ['go build -o .claude/bin/agentguard.exe ./tools/agentguard']
 
   gen:
-    desc: Regenerate migrations, SQL and API code from their sources
+    desc: Regenerate SQL and API code from their sources (migrations come from migrate:diff)
     cmds: ['go generate ./...']
 
   lint:
@@ -85,7 +85,12 @@ tasks:
 
   test:integration:
     desc: Integration tests against real MySQL, Valkey and the provider double (needs Docker)
-    cmds: ['{{.T}} gotestsum --format pkgname -- -tags integration {{.CLI_ARGS | default "./test/..."}}']
+    # Two runs, one after the other: the packages' own integration tests
+    # (index use, limiter, worker loop), then the black-box acceptance tests
+    # alone, because their rate floors need the machine to themselves.
+    cmds:
+      - '{{.T}} gotestsum --format pkgname -- -tags integration {{.CLI_ARGS | default "./internal/..."}}'
+      - '{{if not .CLI_ARGS}}{{.T}} gotestsum --format pkgname -- -tags integration ./test/...{{end}}'
 
   test:all:
     desc: Unit tests, then integration tests
