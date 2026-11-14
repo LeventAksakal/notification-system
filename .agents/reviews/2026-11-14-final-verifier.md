@@ -18,3 +18,15 @@ Compose proofs (project `notifier-prb`, app on port 18080 because 8080 is taken 
 README walk: the template example's `scheduledAt` in 2030 is refused (more than 30 days ahead); the retry example reads as if it applied to the cancelled id. Fixed in the README.
 
 Earlier delivery findings 2 to 6: closed, by reading the code.
+
+## Second pass on the four fix commits (fresh context, 14 Nov, about 03:45)
+
+Verdict: **pass with findings**. Findings 1, 2, 4, 6 and 7 above are closed. Proofs, each once: `go vet` pass; race tests pass (from the test cache, so not a fresh run); integration tests of `internal/realtime` 9.4 s and `internal/intake` 26.5 s pass; `TestGapOutage` 4 tests 38.3 s, `TestB4` 7 tests 34.4 s, `TestR13` 3 tests 28.8 s, all pass. A 1000-item batch with Valkey down answered in 342 ms (connection closed) and 1.325 s (Valkey not answering).
+
+| # | Severity | Finding | Where | Status |
+|---|---|---|---|---|
+| 9 | Medium, inferred | One failed publish opened a 500 ms window in which every event of the process was dropped, even with Valkey healthy; the hub stays live, so open streams silently miss events | `internal/realtime/publisher.go:122,146` | fixed `e4667b8`: window only on timeouts and connection errors, 100 ms, one probe at a time, closed by the first success |
+| 10 | Low, inferred | A replayed dead letter counts its whole age as latency | `internal/store/queries/intake.sql:41`, `metrics.go:96` | documented in the spec's `LatencyMs` description |
+| 11 | Low, inferred | The worker published a claimed group's events before scheduling its sends; a slow Valkey could push the group past its slots (released, not sent) | `internal/worker/worker.go:395` | fixed `655dd99`: sends are scheduled first; each result event waits for its `processing` event |
+
+Not checked by this pass: the full acceptance package (run by the coordinator: 59 tests, 212 s, pass), the compose stack, the sequencer at its cap under a real backlog.
