@@ -23,15 +23,50 @@ import (
 type Service struct {
 	db        *sql.DB
 	q         *sqlc.Queries
-	pub       core.Publisher
+	pub       BatchPublisher
 	retention time.Duration
 	now       func() time.Time
 }
 
+// BatchPublisher is a core.Publisher that also sends many events as one call
+// with one bounded wait (realtime.Publisher), so a batch's announcement never
+// costs one wait per item.
+type BatchPublisher interface {
+	core.Publisher
+	PublishAll(ctx context.Context, es []core.Event) error
+}
+
+// PublishBudget bounds the time a request spends announcing its changes when
+// pub has no batch form: every event of the request shares this one deadline.
+const PublishBudget = time.Second
+
 // New returns a Service storing in db and announcing every committed status
-// change through pub. An Idempotency-Key is remembered for retention.
+// change through pub. An Idempotency-Key is remembered for retention. A pub
+// without PublishAll is wrapped so a request still waits at most PublishBudget.
 func New(db *sql.DB, pub core.Publisher, retention time.Duration) *Service {
-	return &Service{db: db, q: sqlc.New(db), pub: pub, retention: retention, now: time.Now}
+	bp, ok := pub.(BatchPublisher)
+	if !ok {
+		bp = sequential{pub}
+	}
+	return &Service{db: db, q: sqlc.New(db), pub: bp, retention: retention, now: time.Now}
+}
+
+// sequential gives a plain core.Publisher a batch form: one event after the
+// other under one shared deadline, stopping at the first error.
+type sequential struct{ core.Publisher }
+
+func (p sequential) PublishAll(ctx context.Context, es []core.Event) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), PublishBudget)
+	defer cancel()
+	for i, e := range es {
+		if err := p.Publish(ctx, e); err != nil {
+			return fmt.Errorf("publish event %d of %d: %w", i+1, len(es), err)
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("publish: %d of %d events left: %w", len(es)-i-1, len(es), err)
+		}
+	}
+	return nil
 }
 
 // Meta is what a create request carries besides its body.
@@ -215,10 +250,15 @@ func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b Batc
 	}
 
 	slog.InfoContext(ctx, "batch accepted", "batch_id", b.ID, "total", b.Total)
-	for _, it := range items {
-		s.publishEvent(obs.WithNotification(ctx, it.ID, m.CorrelationID), core.Event{
+	events := make([]core.Event, len(items))
+	for i, it := range items {
+		events[i] = core.Event{
 			NotificationID: it.ID, BatchID: b.ID, Status: core.StatusPending, At: b.CreatedAt, CorrelationID: m.CorrelationID,
-		})
+		}
+	}
+	// One pipelined publish with one deadline, whatever the batch size.
+	if err := s.pub.PublishAll(ctx, events); err != nil {
+		slog.WarnContext(ctx, "publish batch status changes", "batch_id", b.ID, "count", len(events), "err", err)
 	}
 	return b, false, nil
 }
