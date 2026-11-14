@@ -73,6 +73,13 @@ func runMain(m *testing.M) int {
 	defer func() { _ = os.RemoveAll(dir) }()
 
 	flag.Parse()
+	if dlRateFloorOverride, err = dlReadRateFloor(); err != nil {
+		fmt.Fprintln(os.Stderr, "acceptance:", err)
+		return 2
+	}
+	if dlRateFloorOverride > 0 {
+		fmt.Fprintf(os.Stderr, "acceptance: %s=%g lowers each throughput floor to at most this value (caps, counts and correctness checks are unchanged)\n", dlRateFloorEnv, dlRateFloorOverride)
+	}
 	if *prebuilt != "" {
 		appBin, err = filepath.Abs(*prebuilt)
 		if err != nil {

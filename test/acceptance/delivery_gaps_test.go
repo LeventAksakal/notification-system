@@ -237,16 +237,20 @@ func (s *stack) dgFirstArrival(t *testing.T, channel string) time.Time {
 	return first
 }
 
-// B1: Bonus: Failure Handling - an outage that HANGS (decision 0008; verifier
-// finding 5 "one hung channel stalls the others: all channels share one pool
-// of slots"; gap "B1's outage is a fast 503, never a hang").
+// B1: Bonus: Failure Handling - an outage that HANGS (decision 0008; gap
+// "B1's outage is a fast 503, never a hang"): the breaker opens on timeouts
+// as it does on 503s, so no sms notification fails during the hang, sms
+// requests drop to probe level, and everything is sent once the hang ends.
+// Isolation of the other channels (verifier finding 5) is proved by
+// TestGapDeliveryB1HungChannelDoesNotStallOthers; here the breaker cuts the
+// hang short, so the fast channels' rates are logged, not asserted (an
+// absolute rate floor here measured the runner, not isolation).
 // Dials: dgB1Env with APP_MAX_ATTEMPTS=5; sms requests are held 2 s against a
 // 500 ms timeout for 6 s while email and push drain a 900 backlog each
 // (9 s at 97/s, so both are still busy when the outage ends).
 func TestGapDeliveryB1HangingOutage(t *testing.T) {
 	const perFast, perSMS = 900, 300
 	const outage = 6 * time.Second
-	const minFastRate = 85.0
 	s := startStack(t, stackOptions{Workers: 0, Env: dgB1Env(5)})
 	s.dlCreateMany(t, perSMS, func(i int) map[string]any { return msg("sms", fmt.Sprintf("gap B1 hang sms %d", i)) })
 	fast := []string{"email", "push"}
@@ -270,10 +274,7 @@ func TestGapDeliveryB1HangingOutage(t *testing.T) {
 		s.dlAllSent(t, 30*time.Second, perFast, "channel = ?", ch)
 		got := dlReceivedIn(s.dlRequests(fakeprovider.Filter{Channel: ch}), start, start.Add(outage))
 		rate := float64(got) / outage.Seconds()
-		t.Logf("%s during the %s sms hang: %d requests = %.1f/s", ch, outage, got, rate)
-		if rate < minFastRate {
-			t.Errorf("%s: %.1f requests/s during the sms hang, want at least %.0f (a hung channel must not stall the others)", ch, rate, minFastRate)
-		}
+		t.Logf("%s during the %s sms hang: %d requests = %.2f/s (logged only)", ch, outage, got, rate)
 	}
 
 	// Probe-level bound. Before the breaker can open, the first calls must
@@ -288,6 +289,74 @@ func TestGapDeliveryB1HangingOutage(t *testing.T) {
 		t.Errorf("sms requests during the hang: %d, want at most %d (probe level): the channel did not pause", smsDuring, smsBound)
 	}
 	s.dlAllSent(t, 40*time.Second, perSMS, "channel = 'sms'")
+}
+
+// dgInWindow keeps the requests of rs that arrived in [from, to).
+func dgInWindow(rs []fakeprovider.Request, from, to time.Time) []fakeprovider.Request {
+	var out []fakeprovider.Request
+	for _, r := range rs {
+		if !r.ReceivedAt.Before(from) && r.ReceivedAt.Before(to) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// B1: Bonus: Failure Handling - one hung channel does not stall the others
+// (decision 0008; verifier finding 5 "one hung channel stalls the others: all
+// channels share one pool of slots"; gap "B1's outage is a fast 503, never a
+// hang"). The breaker is kept out of it so the hang lasts the whole window.
+// Dials: dlFastEnv with APP_WORKER_CONCURRENCY=12, APP_PROVIDER_TIMEOUT=2s,
+// APP_LEASE_DURATION=5s, APP_BREAKER_MIN_REQUESTS=10000 (the breaker never
+// opens); 300 sms + 900 email + 900 push queued, 3 workers; every sms request
+// is held 5 s; the window is 6 s from the first sms arrival.
+// Why 40/s: with the defect reintroduced (one shared pool of provider-call
+// places) email and push measured 18.5 and 17.0/s; the correct build (places
+// per channel) measured 81-86/s on a loaded dev machine, and 56-60/s is the
+// worst seen for a correct build on a starved 2-core machine. 40 sits between
+// the two with room on both sides, so it is not a measure of the machine.
+// After the window the hang is cleared and everything must be sent: the hung
+// channel recovers on its own, with no breaker.
+func TestGapDeliveryB1HungChannelDoesNotStallOthers(t *testing.T) {
+	const perFast, perSMS = 900, 300
+	const window = 6 * time.Second
+	const minFastRate = 40.0
+	s := startStack(t, stackOptions{Workers: 0, Env: dlFastEnv(map[string]string{
+		"APP_WORKER_CONCURRENCY":   "12",
+		"APP_PROVIDER_TIMEOUT":     "2s",
+		"APP_LEASE_DURATION":       "5s",
+		"APP_BREAKER_MIN_REQUESTS": "10000",
+	})})
+	s.dlCreateMany(t, perSMS, func(i int) map[string]any { return msg("sms", fmt.Sprintf("gap B1 stall sms %d", i)) })
+	fast := []string{"email", "push"}
+	s.dlCreateMany(t, 2*perFast, func(i int) map[string]any {
+		return msg(fast[i%2], fmt.Sprintf("gap B1 stall fast %d", i))
+	})
+	s.dlFaults(t, fakeprovider.Fault{Channel: "sms", Mode: fakeprovider.ModeDelay, DelayMS: 5000})
+	for range 3 {
+		s.StartWorker()
+	}
+
+	start := s.dgFirstArrival(t, "sms")
+	dlWaitUntil(start.Add(window))
+	s.dlFaults(t)
+	cleared := time.Now()
+	t.Logf("sms hang cleared %s after the first sms arrival; stored counts %v", cleared.Sub(start).Round(time.Millisecond), s.dlCounts(t, "1=1"))
+
+	for _, ch := range fast {
+		s.dlAllSent(t, 60*time.Second, perFast, "channel = ?", ch)
+		in := dgInWindow(s.dlRequests(fakeprovider.Filter{Channel: ch}), start, start.Add(window))
+		rate := float64(len(in)) / window.Seconds()
+		t.Logf("%s during the %s sms hang: %d requests = %.2f/s; per 1 s bucket: %v", ch, window, len(in), rate, dlR8Histogram(in))
+		if rate < minFastRate {
+			t.Errorf("%s: %.2f requests/s during the sms hang, want at least %.2f (a hung channel must not stall the others)", ch, rate, minFastRate)
+		}
+	}
+
+	smsIn := dgInWindow(s.dlRequests(fakeprovider.Filter{Channel: "sms"}), start, start.Add(window))
+	t.Logf("sms during the hang: %d requests; per 1 s bucket: %v", len(smsIn), dlR8Histogram(smsIn))
+	s.dlAllSent(t, 60*time.Second, perSMS, "channel = 'sms'")
+	t.Logf("all %d sms sent %s after the hang was cleared", perSMS, time.Since(cleared).Round(time.Millisecond))
 }
 
 // B1: Bonus: Failure Handling - "no attempts are burned" while the channel is

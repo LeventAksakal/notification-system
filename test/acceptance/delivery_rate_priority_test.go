@@ -37,22 +37,26 @@ func TestDeliveryR8RateLimit(t *testing.T) {
 	// paces at 97 and a quiet machine measures 96-97; the floors below are
 	// lower so a loaded CI runner does not fail a correct build. The measured
 	// numbers are logged here and reported in docs/REQUIREMENTS.md.
+	// The cap (r8MaxPerSecond) is unconditional. Only the two throughput
+	// floors give way to ACCEPTANCE_RATE_FLOOR on a starved runner, where the
+	// worker gives up reserved slots on slow claims and late timers and the
+	// rate sags (measured 56-61/s on 2 cores with correct code).
 	const (
 		r8MaxPerSecond   = 100
-		r8MinWholeRate   = 90.0 // hard floor: the limit is used, not just respected
-		r8MinSteadyRate  = 93.0 // the drain without its first and last second
 		r8EdgeTrimLength = time.Second
 	)
+	r8MinWholeRate := dlRateFloor(t, "R8 whole drain", 90.0)   // the limit is used, not just respected
+	r8MinSteadyRate := dlRateFloor(t, "R8 steady state", 93.0) // the drain without its first and last second
 	st := s.Provider.Stats()
 	for _, ch := range chans {
 		cs := st.Channels[ch]
 		rs := s.dlRequests(fakeprovider.Filter{Channel: ch})
 		n, span, rate := dlRate(rs)
-		t.Logf("%s: %d requests over %s = %.1f/s average; busiest 1 s window %d requests", ch, n, span.Round(time.Millisecond), rate, cs.MaxRequestsPerSecond)
+		t.Logf("%s: %d requests over %s = %.2f/s average; busiest 1 s window %d requests", ch, n, span.Round(time.Millisecond), rate, cs.MaxRequestsPerSecond)
 		t.Logf("%s: requests per 1 s bucket from the first request: %v", ch, dlR8Histogram(rs))
 		steady := dlR8Trim(rs, r8EdgeTrimLength)
 		sn, sspan, srate := dlRate(steady)
-		t.Logf("%s: steady state (first and last %s dropped): %d requests over %s = %.1f/s", ch, r8EdgeTrimLength, sn, sspan.Round(time.Millisecond), srate)
+		t.Logf("%s: steady state (first and last %s dropped): %d requests over %s = %.2f/s", ch, r8EdgeTrimLength, sn, sspan.Round(time.Millisecond), srate)
 		if gi, gap := dlR8LargestGap(rs); gi > 0 {
 			t.Logf("%s: largest gap %s between request %d and %d, at +%s of %s", ch, gap.Round(time.Microsecond), gi-1, gi, rs[gi].ReceivedAt.Sub(rs[0].ReceivedAt).Round(time.Millisecond), span.Round(time.Millisecond))
 		}
@@ -60,10 +64,10 @@ func TestDeliveryR8RateLimit(t *testing.T) {
 			t.Errorf("%s: %d requests in one second at the provider, limit %d", ch, cs.MaxRequestsPerSecond, r8MaxPerSecond)
 		}
 		if rate < r8MinWholeRate {
-			t.Errorf("%s: average %.1f requests/s over the whole drain, want at least %.0f (the limit must be used)", ch, rate, r8MinWholeRate)
+			t.Errorf("%s: average %.2f requests/s over the whole drain, want at least %.2f (the limit must be used)", ch, rate, r8MinWholeRate)
 		}
 		if srate < r8MinSteadyRate {
-			t.Errorf("%s: steady-state average %.1f requests/s, want at least %.0f (the limit must be used)", ch, srate, r8MinSteadyRate)
+			t.Errorf("%s: steady-state average %.2f requests/s, want at least %.2f (the limit must be used)", ch, srate, r8MinSteadyRate)
 		}
 	}
 }
@@ -226,9 +230,10 @@ func TestDeliveryR9Priority(t *testing.T) {
 		}
 		s.dlAllSent(t, 30*time.Second, lowN, "1=1")
 		n, span, rate := dlRate(s.dlRequests(fakeprovider.Filter{Channel: "push"}))
-		t.Logf("low alone: %d requests over %s = %.1f/s", n, span.Round(time.Millisecond), rate)
-		if rate < dlMinRate {
-			t.Errorf("low alone drained at %.1f/s, want at least %.0f (unused shares are lent to low)", rate, dlMinRate)
+		t.Logf("low alone: %d requests over %s = %.2f/s", n, span.Round(time.Millisecond), rate)
+		minRate := dlRateFloor(t, "R9 low alone", dlMinRate)
+		if rate < minRate {
+			t.Errorf("low alone drained at %.2f/s, want at least %.2f (unused shares are lent to low)", rate, minRate)
 		}
 	})
 }

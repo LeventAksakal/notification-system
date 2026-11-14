@@ -226,12 +226,13 @@ func TestDeliveryB1BreakerPausesChannel(t *testing.T) {
 		t.Errorf("sms requests during the outage: %d, want fewer than %.0f (25%% of the limiter's rate): the channel did not pause", during, limit)
 	}
 
+	minFastRate := dlRateFloor(t, "B1 fast channels during the sms outage", 90.0)
 	for _, ch := range []string{"email", "push"} {
 		s.dlAllSent(t, 20*time.Second, perChannel, "channel = ?", ch)
 		n, span, rate := dlRate(s.dlRequests(fakeprovider.Filter{Channel: ch}))
-		t.Logf("%s during the sms outage: %d requests over %s = %.1f/s", ch, n, span.Round(time.Millisecond), rate)
-		if rate < 90 {
-			t.Errorf("%s drained at %.1f/s during the sms outage, want at least 90 (other channels keep their rate)", ch, rate)
+		t.Logf("%s during the sms outage: %d requests over %s = %.2f/s", ch, n, span.Round(time.Millisecond), rate)
+		if rate < minFastRate {
+			t.Errorf("%s drained at %.2f/s during the sms outage, want at least %.2f (other channels keep their rate)", ch, rate, minFastRate)
 		}
 	}
 	s.dlAllSent(t, 30*time.Second, perChannel, "channel = 'sms'")

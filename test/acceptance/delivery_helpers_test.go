@@ -13,10 +13,13 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +28,50 @@ import (
 
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
 )
+
+// dlRateFloorEnv names the test-run knob that relaxes throughput floors on a
+// constrained runner (CI's 2-core runner sets it to 40). It only ever lowers
+// "at least N requests per second" floors (each becomes min(strict, value));
+// it never touches a cap (at most 100 per second), a count or a correctness
+// assertion.
+const dlRateFloorEnv = "ACCEPTANCE_RATE_FLOOR"
+
+// dlRateFloorOverride is ACCEPTANCE_RATE_FLOOR as parsed by TestMain; 0 when
+// the variable is not set, so every floor stays strict.
+var dlRateFloorOverride float64
+
+// dlReadRateFloor reads ACCEPTANCE_RATE_FLOOR. Unset returns 0; set to
+// anything but a finite positive number is an error, and TestMain fails the
+// whole run on it rather than silently keeping or dropping the floors.
+func dlReadRateFloor() (float64, error) {
+	// A knob of the test run itself (how starved the runner is), not a
+	// setting of the service, so it is not read through internal/config.
+	raw, ok := os.LookupEnv(dlRateFloorEnv) //nolint:forbidigo // test-run knob, not a service setting
+	if !ok {
+		return 0, nil
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || math.IsInf(f, 0) || !(f > 0) {
+		return 0, fmt.Errorf("%s=%q: want a positive number of requests per second", dlRateFloorEnv, raw)
+	}
+	return f, nil
+}
+
+// dlRateFloor returns the throughput floor (requests per second) to assert
+// for what: strict by default; when ACCEPTANCE_RATE_FLOOR is set,
+// min(strict, override), so the knob can only ever lower a floor, never
+// raise it. It logs which one applies. Use it only for "at least N/s"
+// floors, never for a cap.
+func dlRateFloor(t *testing.T, what string, strict float64) float64 {
+	t.Helper()
+	if dlRateFloorOverride > 0 {
+		floor := min(strict, dlRateFloorOverride)
+		t.Logf("throughput floor %s: %.2f/s = min(strict default %.2f/s, %s=%.2f/s); the override only lowers a floor", what, floor, strict, dlRateFloorEnv, dlRateFloorOverride)
+		return floor
+	}
+	t.Logf("throughput floor %s: %.2f/s (strict default; %s not set)", what, strict, dlRateFloorEnv)
+	return strict
+}
 
 // dlFastEnv is the dial set the delivery tests share: short backoff, timeout,
 // lease and breaker timings so retries, crashes and outages resolve in
