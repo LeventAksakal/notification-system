@@ -22,3 +22,16 @@ Proofs, each once, on a clean tree:
 Checked, no defect: a late reply cannot place a slot early, and mapping lateness plus tolerance stay within one interval; a grant with N = 0 takes no slot; the probe ticket is cancelled on the uncertain path; the sample store is bounded by time and guarded by its mutex; a Valkey clock step larger than the uncertainty crosses the bounds and restarts the mapping; the log value handler guards a nil Stringer and leaves errors alone; metric labels come from closed sets and cost nothing without a collector; new goroutines are owned through `inflight`; product commits do not touch `test/acceptance/`; parameter errors leak no SQL, DSN or Go type name.
 
 Not checked: the compose stack (the guard refused the environment-variable prefix needed to move the ports, and writing a k6 script), so no Valkey restart under load, worker kill or MySQL hang; k6 thresholds; clock drift or WSL2 time steps measured for real. Test authorship by the test-writer role cannot be confirmed from git: one author, the same trailer.
+
+## After the report (coordinator, 14 Nov)
+
+| # | Finding | What was done | Check |
+|---|---|---|---|
+| 1 | An uncertain worker takes real slots to learn the clock | Fixed (`6ce91da`, `18118e3`, `ea459a8`): a Take of no slots reads Valkey's clock and reserves nothing; the channel reserves only once slots can be placed, and backs off between readings | `internal/limiter` integration test for n = 0; `internal/worker/clock_test.go` |
+| 2 | A hanging MySQL hangs the API | Fixed (`64e6b8d`): `APP_REQUEST_TIMEOUT` (default 15s) answers 503 with `Retry-After`; the driver gets dial, read and write timeouts when the DSN sets none | `TestR15APIUnavailableWhileMySQLHangs` |
+| 3 | The 503 body claimed nothing was stored | Fixed (`6ce91da`, spec 1.3.0): the body and the spec say the request may or may not have been stored and to repeat it with the same `Idempotency-Key` | spec text; `TestR15APIUnavailableWhileMySQLDown` |
+| 4 | CI cannot catch a throughput regression that stays above 40 | Kept: the two-core runner cannot hold the strict floors; they stay strict locally | owner item 0011 |
+| 5 | The isolation test misses a partial stall between 40 and 85 | Kept, same reason | owner item 0011 |
+| 6 | Clock bounds ignored drift | Fixed (`ea459a8`): each sample's bounds widen by its age times 200 ppm before they are intersected | `internal/worker/clock_test.go` |
+
+Found after the report, not by it: one acceptance run showed 106 requests in a second on one channel after a stall of several seconds. The report had checked that a clock step restarts the mapping, but slots already placed with the old mapping still went out. Fixed in `ea459a8` (sends placed before a step are released unsent, reason `clock_stepped`); what remains open is in owner item 0013.

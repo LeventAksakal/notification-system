@@ -19,7 +19,14 @@ Measured 14 Nov on the compose stack, busiest second per channel at the provider
 | the same with MySQL killed, Valkey killed, Valkey paused 14 times | 98, 98, 98 each |
 | 6 workers, 30,000 messages | 100, 100, 99 |
 
-In the six-worker run exactly one window of the 10,000 email arrivals reached 100; it starts with four arrivals inside 5 ms, a clump after a stall. No run went over 100.
+In the six-worker run exactly one window of the 10,000 email arrivals reached 100; it starts with four arrivals inside 5 ms, a clump after a stall. No compose run went over 100.
+
+One acceptance run did: 106 in a second on one channel, right after a stall of several seconds (MySQL claims over 2 s). Headroom does not cover this case. The likely cause is a step of the limiter's clock (the Docker VM's time catching up): the limiter then restarts its schedule at its new "now" while slots already handed out are still pending. A unit test with a stepping clock gives the same number (106 to 107, two workers, three channels). Since `ea459a8` a worker that sees the step releases every send placed before it (reason `clock_stepped` in `notifier.slots.given_up`); the same test then stays at the paced rate plus one.
+
+Still open after that fix, by reasoning, not seen:
+- A worker notices a step only on its next call to the limiter. If all its channels are stuck in a slow claim when the step happens, its old slots that come due before that call still leave, beside new slots of a worker that noticed first.
+- A step smaller than the offset uncertainty is not noticed; the overlap is then under one interval (one extra request at most).
+- Not reproduced on a real stack: only the unit test with a fake clock exists. A proof would step the clock of the Valkey container under load.
 
 ## Options
 1. Keep 3%. Trade-off: one more clumped arrival in such a window would show the provider 101.
