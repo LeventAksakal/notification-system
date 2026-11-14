@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -85,5 +87,73 @@ func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %s", err, want)
 		}
+	}
+}
+
+// secretFile writes content to a file in a fresh temp dir and returns its path.
+func secretFile(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "dsn")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestASecretIsReadFromTheFileItsFileVariableNames(t *testing.T) {
+	const dsn = "u:s3cret-file@tcp(db:3306)/app"
+	missing := filepath.Join(t.TempDir(), "absent")
+	for name, tc := range map[string]struct {
+		kv      map[string]string
+		want    string // the DSN loaded, when wantErr is empty
+		wantErr []string
+	}{
+		"file content is the value": {kv: map[string]string{"APP_DATABASE_DSN_FILE": secretFile(t, dsn)}, want: dsn},
+		"one trailing newline is trimmed": {
+			kv: map[string]string{"APP_DATABASE_DSN_FILE": secretFile(t, dsn+"\n")}, want: dsn},
+		"only one trailing newline is trimmed": {
+			kv: map[string]string{"APP_DATABASE_DSN_FILE": secretFile(t, dsn+"\n\n")}, want: dsn + "\n"},
+		"a CRLF ending counts as one newline": {
+			kv: map[string]string{"APP_DATABASE_DSN_FILE": secretFile(t, dsn+"\r\n")}, want: dsn},
+		"the plain variable still works": {kv: map[string]string{"APP_DATABASE_DSN": dsn}, want: dsn},
+		"both forms set": {
+			kv:      map[string]string{"APP_DATABASE_DSN": dsn, "APP_DATABASE_DSN_FILE": secretFile(t, dsn)},
+			wantErr: []string{"APP_DATABASE_DSN and APP_DATABASE_DSN_FILE are both set"}},
+		"missing file names the variable and the path": {
+			kv:      map[string]string{"APP_DATABASE_DSN_FILE": missing},
+			wantErr: []string{"APP_DATABASE_DSN_FILE", missing}},
+		"empty file": {
+			kv:      map[string]string{"APP_DATABASE_DSN_FILE": secretFile(t, "\n")},
+			wantErr: []string{"APP_DATABASE_DSN_FILE", "empty"}},
+		"a non-secret setting has no file form": {
+			kv:   map[string]string{"APP_DATABASE_DSN": dsn, "APP_HTTP_ADDR_FILE": secretFile(t, ":9999")},
+			want: dsn},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := Load(env(tc.kv))
+			if len(tc.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("want an error mentioning %q", tc.wantErr)
+				}
+				for _, w := range tc.wantErr {
+					if !strings.Contains(err.Error(), w) {
+						t.Errorf("error %q does not mention %q", err, w)
+					}
+				}
+				if strings.Contains(err.Error(), "s3cret") {
+					t.Errorf("error %q shows the secret", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.DatabaseDSN != tc.want {
+				t.Errorf("DSN %q, want %q", c.DatabaseDSN, tc.want)
+			}
+			if c.HTTPAddr != ":8080" {
+				t.Errorf("HTTP addr %q, want the default", c.HTTPAddr)
+			}
+		})
 	}
 }

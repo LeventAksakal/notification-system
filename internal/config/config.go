@@ -1,14 +1,17 @@
 // Package config is the one place the service reads its environment. Every
 // dial has a default, bounds and a doc line; config_test.go enforces that.
 // Secrets (the DSN) have no default: they are injected at runtime, never
-// committed.
+// committed, either as the variable itself or as <NAME>_FILE, the path of a
+// file mounted by the secrets manager.
 package config
 
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -131,28 +134,96 @@ var Dials = []Dial{
 		func(c *Config) *int { return &c.WSSendBuffer }),
 }
 
+// FileSuffix names the variable that holds the path of a secret's file: a
+// secret setting NAME may instead be given as NAME_FILE=/path, the way a
+// secrets manager mounts it (Kubernetes and Docker secrets, Vault agent).
+const FileSuffix = "_FILE"
+
+// Source says where a setting's value came from.
+type Source string
+
+// The sources of a value.
+const (
+	SourceDefault Source = "default"
+	SourceEnv     Source = "environment"
+	SourceFile    Source = "file"
+)
+
 // Load reads every dial through getenv (os.Getenv in main, a map in tests)
-// and returns all problems at once.
+// and returns all problems at once. A secret dial may be given as
+// <NAME>_FILE, a path whose content (one trailing newline trimmed) is the
+// value; setting both forms is an error.
 func Load(getenv func(string) string) (Config, error) {
+	c, _, errs := load(getenv, os.ReadFile)
+	return c, errors.Join(errs...)
+}
+
+// setting is one dial's raw value and where it came from.
+type setting struct {
+	raw string
+	src Source
+}
+
+// load is Load with the file reader injected; it also returns each dial's
+// raw value and source, in Dials order.
+func load(getenv func(string) string, readFile func(string) ([]byte, error)) (Config, []setting, []error) {
 	c := Config{ProviderURLs: make(map[core.Channel]string, len(core.Channels))}
+	settings := make([]setting, len(Dials))
 	var errs []error
-	for _, d := range Dials {
-		raw := getenv(d.Env)
-		if raw == "" {
-			raw = d.Default
+	for i, d := range Dials {
+		raw, src, err := resolve(d, getenv, readFile)
+		settings[i] = setting{raw: raw, src: src}
+		if err != nil {
+			errs = append(errs, err)
+			continue
 		}
 		if raw == "" && d.Required {
 			errs = append(errs, fmt.Errorf("%s is required: %s", d.Env, d.Doc))
 			continue
 		}
 		if err := d.apply(&c, raw); err != nil {
+			if d.Secret {
+				// A parse error may quote the value; a secret's is never shown.
+				err = errors.New("invalid value (not shown: secret)")
+			}
 			errs = append(errs, fmt.Errorf("%s: %w", d.Env, err))
 		}
 	}
 	if len(errs) == 0 && c.RetryCap < c.RetryBase {
 		errs = append(errs, fmt.Errorf("APP_RETRY_CAP %s is below APP_RETRY_BASE %s", c.RetryCap, c.RetryBase))
 	}
-	return c, errors.Join(errs...)
+	return c, settings, errs
+}
+
+// resolve returns a dial's raw value and where it came from. Errors name the
+// variable and the path, never a file's content.
+func resolve(d Dial, getenv func(string) string, readFile func(string) ([]byte, error)) (string, Source, error) {
+	raw := getenv(d.Env)
+	if d.Secret {
+		if path := getenv(d.Env + FileSuffix); path != "" {
+			if raw != "" {
+				return "", SourceFile, fmt.Errorf("%s and %s%s are both set; set one", d.Env, d.Env, FileSuffix)
+			}
+			b, err := readFile(path)
+			if err != nil {
+				var pe *fs.PathError
+				if errors.As(err, &pe) {
+					err = pe.Err
+				}
+				return "", SourceFile, fmt.Errorf("%s%s: cannot read %s: %w", d.Env, FileSuffix, path, err)
+			}
+			s := strings.TrimSuffix(string(b), "\n")
+			s = strings.TrimSuffix(s, "\r") // a CRLF ending is one newline too
+			if s == "" {
+				return "", SourceFile, fmt.Errorf("%s%s: %s is empty", d.Env, FileSuffix, path)
+			}
+			return s, SourceFile, nil
+		}
+	}
+	if raw != "" {
+		return raw, SourceEnv, nil
+	}
+	return d.Default, SourceDefault, nil
 }
 
 func providerURL(env string, ch core.Channel) Dial {

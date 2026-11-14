@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -80,5 +81,71 @@ func TestReadmeNamesEverySetting(t *testing.T) {
 	}
 	if len(missing) > 0 {
 		t.Errorf("README.md does not mention: %s", strings.Join(missing, ", "))
+	}
+}
+
+func TestEnvCheckReportsProblemsOrEverySettingWithItsSource(t *testing.T) {
+	const secret = "u:hunter2-very-secret@tcp(db:3306)/app" //nolint:gosec // G101: a fake secret the report must not show
+	for name, tc := range map[string]struct {
+		environ []string
+		ok      bool
+		want    []string // lines that must be in the report
+	}{
+		"defaults and an injected secret": {
+			environ: []string{"APP_DATABASE_DSN=" + secret, "PATH=/bin", "HOME=/root"},
+			ok:      true,
+			want: []string{"APP_DATABASE_DSN=(set)  # environment", "APP_HTTP_ADDR=:8080  # default",
+				"APP_RATE_LIMIT_HEADROOM_PERCENT=5  # default"},
+		},
+		"secret from a file, a setting from the environment": {
+			environ: []string{"APP_DATABASE_DSN_FILE=" + secretFile(t, secret+"\n"), "APP_WORKER_CONCURRENCY=8"},
+			ok:      true,
+			want:    []string{"APP_DATABASE_DSN=(set)  # file", "APP_WORKER_CONCURRENCY=8  # environment"},
+		},
+		"a typo is an unknown setting": {
+			environ: []string{"APP_DATABASE_DSN=" + secret, "APP_WORKER_CONCURENCY=8"},
+			want:    []string{"APP_WORKER_CONCURENCY: unknown setting (not declared in internal/config; see app env)"},
+		},
+		"a file form of a non-secret setting is unknown": {
+			environ: []string{"APP_DATABASE_DSN=" + secret, "APP_HTTP_ADDR_FILE=/run/secrets/addr"},
+			want:    []string{"APP_HTTP_ADDR_FILE: unknown setting (not declared in internal/config; see app env)"},
+		},
+		"what Load refuses, all at once": {
+			environ: []string{"APP_DB_MAX_OPEN_CONNS=0", "APP_XYZ=1"},
+			want: []string{"APP_XYZ: unknown setting (not declared in internal/config; see app env)",
+				"APP_DATABASE_DSN is required: " + Dials[1].Doc, "APP_DB_MAX_OPEN_CONNS: 0 outside [1..200]"},
+		},
+		"both forms of the secret": {
+			environ: []string{"APP_DATABASE_DSN=" + secret, "APP_DATABASE_DSN_FILE=" + secretFile(t, secret)},
+			want:    []string{"APP_DATABASE_DSN and APP_DATABASE_DSN_FILE are both set; set one"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lines, ok := Check(tc.environ)
+			out := strings.Join(lines, "\n")
+			if ok != tc.ok {
+				t.Errorf("ok %v, want %v; report:\n%s", ok, tc.ok, out)
+			}
+			for _, w := range tc.want {
+				if !slices.Contains(lines, w) {
+					t.Errorf("report lacks %q:\n%s", w, out)
+				}
+			}
+			if tc.ok && len(lines) != len(Dials) {
+				t.Errorf("%d lines, want one per setting (%d)", len(lines), len(Dials))
+			}
+			if strings.Contains(out, "hunter2") {
+				t.Errorf("report shows the secret:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestEnvExampleNamesTheFileFormOfEverySecret(t *testing.T) {
+	out := EnvExample()
+	for _, d := range Dials {
+		if d.Secret && !strings.Contains(out, d.Env+FileSuffix+"=") {
+			t.Errorf("%s: the %s form is not mentioned", d.Env, FileSuffix)
+		}
 	}
 }

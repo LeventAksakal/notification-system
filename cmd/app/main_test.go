@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,5 +54,32 @@ func TestShutdownDrainsInFlightRequestsAndLeaksNothing(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("serveHTTP: %v", err)
+	}
+}
+
+func TestEnvPrintsTheReferenceOrChecksTheEnvironment(t *testing.T) {
+	for name, tc := range map[string]struct {
+		args, environ []string
+		wantErr       bool
+		want          string
+	}{
+		"no argument prints the reference": {want: "# APP_HTTP_ADDR=:8080\n"},
+		"check passes":                     {args: []string{"check"}, environ: []string{"APP_DATABASE_DSN=u:pw-x9@tcp(db)/app"}, want: "APP_DATABASE_DSN=(set)  # environment\n"},
+		"check fails on a typo":            {args: []string{"check"}, environ: []string{"APP_DATABASE_DSN=u:pw-x9@tcp(db)/app", "APP_LOGLEVEL=debug"}, wantErr: true, want: "APP_LOGLEVEL: unknown setting"},
+		"an unknown argument is refused":   {args: []string{"chek"}, wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var out strings.Builder
+			err := env(&out, tc.args, tc.environ)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err %v, want error %v", err, tc.wantErr)
+			}
+			if !strings.Contains(out.String(), tc.want) {
+				t.Errorf("output lacks %q:\n%s", tc.want, out.String())
+			}
+			if strings.Contains(out.String(), "pw-x9") {
+				t.Errorf("output shows the secret:\n%s", out.String())
+			}
+		})
 	}
 }

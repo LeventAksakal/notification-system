@@ -6,6 +6,7 @@
 //	app migrate      apply embedded migrations, then exit (compose runs it once)
 //	app healthcheck  GET /readyz on localhost; the distroless image has no curl
 //	app env          print every application setting as an env file, then exit
+//	app env check    validate the environment against the settings, exit 0 or 1
 package main
 
 import (
@@ -13,11 +14,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,9 +60,8 @@ func run(ctx context.Context, cmd string) error {
 	case "healthcheck":
 		return healthcheck(ctx, "http://127.0.0.1:8080/readyz")
 	case "env":
-		// Reference only: no config, no connections, no telemetry.
-		_, err := fmt.Fprint(os.Stdout, config.EnvExample())
-		return err
+		// No config, no connections, no telemetry.
+		return env(os.Stdout, os.Args[2:], os.Environ()) //nolint:forbidigo // app env check validates the whole environment against internal/config
 	}
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -94,6 +96,31 @@ func run(ctx context.Context, cmd string) error {
 		return worker(ctx, cfg, db)
 	default:
 		return fmt.Errorf("unknown command %q (serve, worker, migrate, healthcheck, env)", cmd)
+	}
+}
+
+// errEnvCheck is the exit of an `app env check` that found problems; they
+// are on stdout already.
+var errEnvCheck = errors.New("env check: the environment does not match the settings")
+
+// env prints the settings reference (no argument) or checks environ against
+// it ("check"). It never prints a secret's value.
+func env(out io.Writer, args, environ []string) error {
+	switch {
+	case len(args) == 0:
+		_, err := fmt.Fprint(out, config.EnvExample())
+		return err
+	case len(args) == 1 && args[0] == "check":
+		lines, ok := config.Check(environ)
+		if _, err := fmt.Fprintln(out, strings.Join(lines, "\n")); err != nil {
+			return err
+		}
+		if !ok {
+			return errEnvCheck
+		}
+		return nil
+	default:
+		return fmt.Errorf("usage: app env [check], got %q", strings.Join(args, " "))
 	}
 }
 
