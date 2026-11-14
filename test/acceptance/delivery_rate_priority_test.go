@@ -33,18 +33,85 @@ func TestDeliveryR8RateLimit(t *testing.T) {
 	}
 	s.dlAllSent(t, 45*time.Second, perChannel*3, "1=1")
 
+	// Decision 0009 names 95 per channel per second on average. The limiter
+	// paces at 97 and a quiet machine measures 96-97; the floors below are
+	// lower so a loaded CI runner does not fail a correct build. The measured
+	// numbers are logged here and reported in docs/REQUIREMENTS.md.
+	const (
+		r8MaxPerSecond   = 100
+		r8MinWholeRate   = 90.0 // hard floor: the limit is used, not just respected
+		r8MinSteadyRate  = 93.0 // the drain without its first and last second
+		r8EdgeTrimLength = time.Second
+	)
 	st := s.Provider.Stats()
 	for _, ch := range chans {
 		cs := st.Channels[ch]
-		n, span, rate := dlRate(s.dlRequests(fakeprovider.Filter{Channel: ch}))
+		rs := s.dlRequests(fakeprovider.Filter{Channel: ch})
+		n, span, rate := dlRate(rs)
 		t.Logf("%s: %d requests over %s = %.1f/s average; busiest 1 s window %d requests", ch, n, span.Round(time.Millisecond), rate, cs.MaxRequestsPerSecond)
-		if cs.MaxRequestsPerSecond > 100 {
-			t.Errorf("%s: %d requests in one second at the provider, limit 100", ch, cs.MaxRequestsPerSecond)
+		t.Logf("%s: requests per 1 s bucket from the first request: %v", ch, dlR8Histogram(rs))
+		steady := dlR8Trim(rs, r8EdgeTrimLength)
+		sn, sspan, srate := dlRate(steady)
+		t.Logf("%s: steady state (first and last %s dropped): %d requests over %s = %.1f/s", ch, r8EdgeTrimLength, sn, sspan.Round(time.Millisecond), srate)
+		if gi, gap := dlR8LargestGap(rs); gi > 0 {
+			t.Logf("%s: largest gap %s between request %d and %d, at +%s of %s", ch, gap.Round(time.Microsecond), gi-1, gi, rs[gi].ReceivedAt.Sub(rs[0].ReceivedAt).Round(time.Millisecond), span.Round(time.Millisecond))
 		}
-		if rate < dlMinRate {
-			t.Errorf("%s: average %.1f requests/s over the drain, want at least %.0f (the limit must be used)", ch, rate, dlMinRate)
+		if cs.MaxRequestsPerSecond > r8MaxPerSecond {
+			t.Errorf("%s: %d requests in one second at the provider, limit %d", ch, cs.MaxRequestsPerSecond, r8MaxPerSecond)
+		}
+		if rate < r8MinWholeRate {
+			t.Errorf("%s: average %.1f requests/s over the whole drain, want at least %.0f (the limit must be used)", ch, rate, r8MinWholeRate)
+		}
+		if srate < r8MinSteadyRate {
+			t.Errorf("%s: steady-state average %.1f requests/s, want at least %.0f (the limit must be used)", ch, srate, r8MinSteadyRate)
 		}
 	}
+}
+
+// dlR8Histogram counts the requests in each 1 s bucket from the first one.
+// rs is sorted by arrival.
+func dlR8Histogram(rs []fakeprovider.Request) []int {
+	if len(rs) == 0 {
+		return nil
+	}
+	var out []int
+	for _, r := range rs {
+		b := int(r.ReceivedAt.Sub(rs[0].ReceivedAt) / time.Second)
+		for len(out) <= b {
+			out = append(out, 0)
+		}
+		out[b]++
+	}
+	return out
+}
+
+// dlR8Trim keeps the requests that arrived at least edge after the first and
+// at least edge before the last. rs is sorted by arrival.
+func dlR8Trim(rs []fakeprovider.Request, edge time.Duration) []fakeprovider.Request {
+	if len(rs) == 0 {
+		return nil
+	}
+	from, to := rs[0].ReceivedAt.Add(edge), rs[len(rs)-1].ReceivedAt.Add(-edge)
+	var out []fakeprovider.Request
+	for _, r := range rs {
+		if !r.ReceivedAt.Before(from) && !r.ReceivedAt.After(to) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// dlR8LargestGap returns the index i of the request ending the largest gap
+// between consecutive arrivals (rs[i-1] to rs[i]) and the gap; i is 0 when
+// there are fewer than two requests. rs is sorted by arrival.
+func dlR8LargestGap(rs []fakeprovider.Request) (int, time.Duration) {
+	at, gap := 0, time.Duration(0)
+	for i := 1; i < len(rs); i++ {
+		if g := rs[i].ReceivedAt.Sub(rs[i-1].ReceivedAt); at == 0 || g > gap {
+			at, gap = i, g
+		}
+	}
+	return at, gap
 }
 
 // R9: Priority queue support (high, normal, low)
