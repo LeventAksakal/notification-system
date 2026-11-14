@@ -27,5 +27,8 @@ Router, not a manual. Every line is something you could not work out from the co
 - Use the generated strict-server types; if the spec lacks a field, that is a contract change for the coordinator, not a local struct.
 - MySQL readiness must be checked over TCP (`--protocol=tcp`); the first-boot server answers socket pings with networking off.
 
+## Merging
+- Fast-forward `main` to the PR branch locally (`git merge --ff-only`, then `git push origin main`; GitHub marks the PR merged). Squash-merge a PR too large to read commit by commit. Never a merge commit, never GitHub's "Rebase and merge" (it rewrites the commits CI tested), never rebase a pushed branch.
+
 ## Roles
 Subagents: `researcher`, `test-writer`, `implementer`, `verifier` (`.claude/agents/`). The main thread coordinates and alone edits contracts (`api/`, `schema/`, `internal/core/`). Limits are enforced by `tools/agentguard` and at merge by `tools/ownercheck`; a deny message says what to do instead.

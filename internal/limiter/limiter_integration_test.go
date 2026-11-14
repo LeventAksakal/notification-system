@@ -17,10 +17,9 @@ import (
 	"github.com/LeventAksakal/notification-system/test/support"
 )
 
-// grant is one Take as a taker saw it: the call's local start and end.
+// grant is one Take that reserved something.
 type grant struct {
-	start, end time.Time
-	g          core.Grant
+	g core.Grant
 }
 
 // TestLimiterHoldsTheRateAcrossTakers runs three takers that reserve slots in
@@ -48,9 +47,7 @@ func TestLimiterHoldsTheRateAcrossTakers(t *testing.T) {
 		want := int(horizon/l.Interval()) + 1
 		wg.Go(func() {
 			for ctx.Err() == nil {
-				start := time.Now()
 				g, err := l.Take(ctx, core.ChannelSMS, want)
-				end := time.Now()
 				if err != nil {
 					if ctx.Err() == nil {
 						t.Errorf("take: %v", err)
@@ -59,7 +56,7 @@ func TestLimiterHoldsTheRateAcrossTakers(t *testing.T) {
 				}
 				if g.N > 0 {
 					mu.Lock()
-					grants = append(grants, grant{start: start, end: end, g: g})
+					grants = append(grants, grant{g: g})
 					mu.Unlock()
 				}
 				// As the worker: ask again once half a horizon can be reserved.
@@ -77,33 +74,31 @@ func TestLimiterHoldsTheRateAcrossTakers(t *testing.T) {
 	interval := grants[0].g.Interval
 	paced := int(math.Ceil(float64(time.Second) / float64(interval)))
 
-	// A slot's local time is known up to the round trip of its Take. Grants
-	// from one key are contiguous or separated by a restart; place each grant
-	// right after the previous one when its estimate is within the round trip.
-	firstAt := func(x grant) time.Time { return x.end.Add(x.g.First) }
+	// Slots are judged on the limiter's own clock, where they are exact:
+	// slot k of a grant is at At + First + k*Interval, in whole microseconds.
+	// (Placing them from the moment the reply arrived, as this test once did,
+	// measures the taker's scheduling: on a two-core runner it saw grants
+	// "overlap" by more than a round trip.) Grants of one key follow each
+	// other exactly, or after a gap when the schedule restarted at "now".
+	firstAt := func(x grant) time.Time { return x.g.At.Add(x.g.First) }
 	slices.SortFunc(grants, func(a, b grant) int { return firstAt(a).Compare(firstAt(b)) })
 	var slots []time.Time
 	var prevEnd time.Time
-	var prevRTT time.Duration
 	restarts := 0
 	for i, x := range grants {
 		at := firstAt(x)
-		rtt := x.end.Sub(x.start)
-		tol := max(rtt, prevRTT) + time.Millisecond
 		if i > 0 {
 			switch d := at.Sub(prevEnd); {
-			case d < -tol:
-				t.Fatalf("grant %d overlaps the previous one by %s (tolerance %s)", i, -d, tol)
-			case d <= tol:
-				at = prevEnd
-			default:
+			case d < 0:
+				t.Fatalf("grant %d overlaps the previous one by %s", i, -d)
+			case d > 0:
 				restarts++
 			}
 		}
 		for k := range x.g.N {
 			slots = append(slots, at.Add(time.Duration(k)*interval))
 		}
-		prevEnd, prevRTT = at.Add(time.Duration(x.g.N)*interval), rtt
+		prevEnd = at.Add(time.Duration(x.g.N) * interval)
 	}
 	for i := 1; i < len(slots); i++ {
 		if d := slots[i].Sub(slots[i-1]); d < interval {
