@@ -12,7 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync/atomic"
+	"io"
+	"log/slog"
+	"net"
+	"sync"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -28,9 +31,10 @@ const (
 	// one pipeline), so an unreachable Valkey delays a commit's caller by at
 	// most this much.
 	publishTimeout = time.Second
-	// publishHoldOff is how long publishes fail at once after one failed:
-	// during an outage only the first change of each hold-off waits.
-	publishHoldOff = 500 * time.Millisecond
+	// publishHoldOff is how long publishes fail at once after one timed out
+	// or lost its connection: during an outage only the first change of each
+	// hold-off waits. A successful publish ends it early.
+	publishHoldOff = 100 * time.Millisecond
 )
 
 // Origin says which kind of process published a change. The hub uses it to
@@ -82,9 +86,11 @@ func decode(b []byte) (Message, error) {
 	}}, nil
 }
 
-// ErrUnavailable is returned without trying while a recent publish failed:
-// Valkey is taken as down for publishHoldOff, so a burst of status changes
-// during an outage costs one bounded wait, not one per change.
+// ErrUnavailable is returned without trying while a recent publish timed out
+// or lost its connection: Valkey is taken as down for publishHoldOff, so a
+// burst of status changes during an outage costs one bounded wait, not one
+// per change. One probe publish at a time still tries, and its success ends
+// the hold-off.
 var ErrUnavailable = errors.New("status events: valkey unavailable")
 
 // Publisher is the core.Publisher that sends each change to Valkey.
@@ -93,8 +99,13 @@ type Publisher struct {
 	channel string
 	origin  Origin
 	now     func() time.Time
-	// downUntil (unix nanoseconds) is the end of the hold-off after a failure.
-	downUntil atomic.Int64
+
+	mu sync.Mutex
+	// down is set by a timeout or connection failure and cleared by the next
+	// success; downUntil is the end of the hold-off it started.
+	down      bool
+	downUntil time.Time
+	probing   bool // a publish is trying during the hold-off
 }
 
 var _ core.Publisher = (*Publisher)(nil)
@@ -113,19 +124,22 @@ func (p *Publisher) Publish(ctx context.Context, e core.Event) error {
 }
 
 // PublishAll sends es in order as one pipeline under one deadline of
-// publishTimeout, whatever their number. After a failure, calls fail at once
-// with ErrUnavailable for publishHoldOff.
+// publishTimeout, whatever their number. After a timeout or a connection
+// failure, calls fail at once with ErrUnavailable for publishHoldOff, except
+// one probe at a time; the first success ends the hold-off.
 func (p *Publisher) PublishAll(ctx context.Context, es []core.Event) error {
 	if len(es) == 0 {
 		return nil
 	}
-	if p.now().UnixNano() < p.downUntil.Load() {
+	probe, ok := p.admit()
+	if !ok {
 		return fmt.Errorf("publish %d status events: %w", len(es), ErrUnavailable)
 	}
 	cmds := make(valkey.Commands, 0, len(es))
 	for _, e := range es {
 		b, err := encode(Message{Event: e, Origin: p.origin})
 		if err != nil {
+			p.settle(ctx, probe, errAnswered)
 			return err
 		}
 		cmds = append(cmds, p.client.B().Publish().Channel(p.channel).Message(string(b)).Build())
@@ -133,18 +147,84 @@ func (p *Publisher) PublishAll(ctx context.Context, es []core.Event) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), publishTimeout)
 	defer cancel()
 	failed := 0
-	var first error
+	var first, conn error
 	for _, r := range p.client.DoMulti(ctx, cmds...) {
 		if err := r.Error(); err != nil {
 			failed++
 			if first == nil {
 				first = err
 			}
+			if conn == nil && connectionFailure(err) {
+				conn = err
+			}
 		}
 	}
+	switch {
+	case conn != nil:
+		p.settle(ctx, probe, conn)
+	case failed < len(es):
+		p.settle(ctx, probe, nil) // Valkey answered: it is up
+	default:
+		p.settle(ctx, probe, errAnswered)
+	}
 	if first != nil {
-		p.downUntil.Store(p.now().Add(publishHoldOff).UnixNano())
 		return fmt.Errorf("publish status events (%d of %d failed): %w", failed, len(es), first)
 	}
 	return nil
+}
+
+// errAnswered marks a call that failed without a sign that Valkey is down
+// (error replies only, or nothing sent): it neither starts nor ends a hold-off.
+var errAnswered = errors.New("answered with errors")
+
+// admit says whether a call may try now, and whether it is the probe of a
+// hold-off.
+func (p *Publisher) admit() (probe, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.down || !p.now().Before(p.downUntil) {
+		return false, true
+	}
+	if p.probing {
+		return false, false
+	}
+	p.probing = true
+	return true, true
+}
+
+// settle records the outcome of a call: err nil is a success, which ends a
+// hold-off; a connection failure starts one; errAnswered changes nothing.
+func (p *Publisher) settle(ctx context.Context, probe bool, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if probe {
+		p.probing = false
+	}
+	switch {
+	case err == nil:
+		if p.down {
+			p.down = false
+			slog.InfoContext(ctx, "status events publishing again")
+		}
+	case errors.Is(err, errAnswered):
+	default:
+		if !p.down {
+			slog.WarnContext(ctx, "status events: valkey unreachable; publishes fail at once until one succeeds",
+				"hold_off", publishHoldOff, "err", err)
+		}
+		p.down = true
+		p.downUntil = p.now().Add(publishHoldOff)
+	}
+}
+
+// connectionFailure reports whether err says Valkey did not answer in time or
+// the connection to it failed, as opposed to an error reply.
+func connectionFailure(err error) bool {
+	var reply *valkey.ValkeyError
+	if errors.As(err, &reply) {
+		return false
+	}
+	var ne net.Error
+	return errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ne) || errors.Is(err, valkey.ErrClosing) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed)
 }

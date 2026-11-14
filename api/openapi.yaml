@@ -560,7 +560,7 @@ components:
         updatedAt: { type: string, format: date-time }
     LatencyMs:
       type: object
-      description: From the first due time (creation, or the schedule if later) to provider acceptance, retries included, over notifications sent in the window; zeros when none
+      description: From the first due time (creation, or the schedule if later) to provider acceptance, retries included, over notifications sent in the window; zeros when none. A replayed dead letter counts from its original due time, so replays of old failures raise the upper percentiles
       required: [p50, p95, p99]
       properties:
         p50: { type: integer }
