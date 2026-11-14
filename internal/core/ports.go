@@ -94,7 +94,9 @@ type Limiter interface {
 	// ahead than the limiter's horizon. A slot that is not used is lost; a
 	// request must never leave before its slot, nor more than one interval
 	// after it, whatever the reply's delay was. An error means the limiter is
-	// unreachable: the caller sends nothing (fail closed).
+	// unreachable: the caller sends nothing (fail closed). With n = 0 nothing
+	// is reserved and the grant still carries At: a reading of the limiter's
+	// clock that costs no slot.
 	Take(ctx context.Context, channel Channel, n int) (Grant, error)
 }
 

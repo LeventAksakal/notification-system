@@ -14,7 +14,9 @@ info:
     - `400 invalid_request`: the body or a parameter breaks a rule (missing field, over a limit,
       unknown value). `404 not_found`. `409`: the resource is not in a state that allows the
       action. `422 idempotency_key_reused`: the key was used before with a different payload.
-      `503 unavailable` with `Retry-After`: the database cannot be reached; nothing was stored.
+      `503 unavailable` with `Retry-After`: the database cannot be reached or did not answer in
+      time. A create may or may not have been stored: repeat it with the same `Idempotency-Key`
+      and it is stored once.
     - `X-Correlation-ID` may be sent on any request; one is generated when absent. It is echoed
       on the response, stored on the notification, written on every log line about it and sent
       to the provider.
@@ -409,7 +411,7 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     ServiceUnavailable:
-      description: The database cannot be reached (`unavailable`); nothing was stored or changed, try again
+      description: The database cannot be reached or did not answer in time (`unavailable`). A change may or may not have been made; repeat a create with the same Idempotency-Key
       headers:
         Retry-After:
           description: Seconds to wait before trying again
