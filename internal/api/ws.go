@@ -15,6 +15,7 @@ import (
 	"github.com/LeventAksakal/notification-system/internal/core"
 	"github.com/LeventAksakal/notification-system/internal/intake"
 	"github.com/LeventAksakal/notification-system/internal/realtime"
+	"github.com/LeventAksakal/notification-system/internal/store"
 )
 
 const (
@@ -149,6 +150,10 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 func (s *Server) refuseLookup(w http.ResponseWriter, r *http.Request, err error, what string) {
 	if errors.Is(err, intake.ErrNotFound) {
 		writeError(w, http.StatusNotFound, notFound(what))
+		return
+	}
+	if store.IsUnavailable(err) {
+		writeUnavailable(w, r, err)
 		return
 	}
 	slog.ErrorContext(r.Context(), "websocket lookup failed", "what", what, "err", err)

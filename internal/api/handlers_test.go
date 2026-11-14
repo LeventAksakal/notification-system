@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/store"
 )
 
 func serve(t *testing.T, checks map[string]Check, method, path, body string) *httptest.ResponseRecorder {
@@ -194,5 +198,82 @@ func TestAMalformedIdempotencyKeyIs400NamingTheHeader(t *testing.T) {
 				t.Fatalf("got %d %.300s", rec.Code, rec.Body)
 			}
 		})
+	}
+}
+
+func TestMalformedParametersAre400WithTheErrorBody(t *testing.T) {
+	for _, tc := range []struct{ method, path, field string }{
+		{http.MethodGet, "/v1/notifications/not-a-uuid", "id"},
+		{http.MethodPost, "/v1/notifications/not-a-uuid/cancel", "id"},
+		{http.MethodGet, "/v1/batches/not-a-uuid", "id"},
+		{http.MethodGet, "/v1/notifications?status=sent&status=failed", "status"},
+		{http.MethodGet, "/v1/notifications?channel=sms&channel=push", "channel"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rec := serve(t, nil, tc.method, tc.path, "")
+			if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type %q, want application/json", ct)
+			}
+			e := decodeError(t, rec)
+			if rec.Code != http.StatusBadRequest || e.Code != "invalid_request" || e.Details == nil || (*e.Details)[0].Field != tc.field {
+				t.Fatalf("got %d %s", rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+type failingMetrics struct{ err error }
+
+func (f failingMetrics) Read(context.Context, time.Duration) (store.Metrics, error) {
+	return store.Metrics{}, f.err
+}
+
+func TestAnUnreachableDatabaseIs503WithRetryAfter(t *testing.T) {
+	refused := fmt.Errorf("metrics: %w", &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")})
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"a refused connection is unavailable", refused, http.StatusServiceUnavailable, "unavailable"},
+		{"any other failure stays internal", errors.New("boom"), http.StatusInternalServerError, "internal"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, err := NewServer(nil, nil, Options{Metrics: failingMetrics{tc.err}}).Handler()
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/metrics", nil))
+			if e := decodeError(t, rec); rec.Code != tc.status || e.Code != tc.code {
+				t.Fatalf("got %d %s", rec.Code, rec.Body)
+			}
+			ra := rec.Header().Get("Retry-After")
+			if tc.status == http.StatusServiceUnavailable && ra != "1" {
+				t.Errorf("Retry-After %q, want 1", ra)
+			}
+			if tc.status != http.StatusServiceUnavailable && ra != "" {
+				t.Errorf("Retry-After %q on a %d", ra, tc.status)
+			}
+		})
+	}
+}
+
+func TestServerSpansAreNamedByRoutePattern(t *testing.T) {
+	mux, generated := http.NewServeMux(), http.NewServeMux()
+	nop := func(http.ResponseWriter, *http.Request) {}
+	mux.HandleFunc("GET /openapi.json", nop)
+	mux.HandleFunc("/", nop)
+	generated.HandleFunc("GET /v1/notifications/{id}", nop)
+	name := spanName(mux, generated)
+	for path, want := range map[string]string{
+		"/v1/notifications/0190d6c6-1f43-7bf6-a7a4-6f3c2b1e9d10": "GET /v1/notifications/{id}",
+		"/openapi.json": "GET /openapi.json",
+		"/nope":         "GET unmatched",
+	} {
+		if got := name("http", httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)); got != want {
+			t.Errorf("%s: span %q, want %q", path, got, want)
+		}
 	}
 }

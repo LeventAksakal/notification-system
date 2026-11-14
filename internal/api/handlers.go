@@ -3,9 +3,12 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/getkin/kin-openapi/openapi3filter"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/LeventAksakal/notification-system/internal/intake"
 	"github.com/LeventAksakal/notification-system/internal/realtime"
+	"github.com/LeventAksakal/notification-system/internal/store"
 )
 
 // Check reports whether one dependency answers.
@@ -73,10 +77,10 @@ func (s *Server) Handler() (http.Handler, error) {
 	spec.Servers = nil // validate paths without matching a host
 
 	generated := http.NewServeMux()
-	HandlerFromMux(NewStrictHandlerWithOptions(s, nil, StrictHTTPServerOptions{
+	HandlerWithOptions(NewStrictHandlerWithOptions(s, nil, StrictHTTPServerOptions{
 		RequestErrorHandlerFunc:  writeRequestError,
 		ResponseErrorHandlerFunc: writeResponseError,
-	}), generated)
+	}), StdHTTPServerOptions{BaseRouter: generated, ErrorHandlerFunc: writeParamError})
 	validated := middleware.OapiRequestValidatorWithOptions(spec, &middleware.Options{
 		Options:              openapi3filter.Options{MultiError: true},
 		ErrorHandlerWithOpts: writeValidationError,
@@ -87,7 +91,8 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.Handle("GET /docs", docsHandler())
 	mux.HandleFunc("GET /v1/ws", s.streamEvents)
 	mux.Handle("/", validated)
-	return otelhttp.NewHandler(withCorrelation(limitBody(mux)), "http"), nil
+	return otelhttp.NewHandler(withCorrelation(limitBody(mux)), "http",
+		otelhttp.WithSpanNameFormatter(spanName(mux, generated))), nil
 }
 
 func (s *Server) Health(context.Context, HealthRequestObject) (HealthResponseObject, error) {
@@ -129,9 +134,88 @@ func writeRequestError(w http.ResponseWriter, _ *http.Request, err error) {
 	writeError(w, http.StatusBadRequest, Error{Code: "invalid_request", Message: firstLine(err.Error())})
 }
 
-// writeResponseError turns a handler error into a 500 that does not leak
-// the cause.
+// writeResponseError turns a handler error into 503 unavailable when the
+// database cannot be reached, else into a 500 that does not leak the cause.
 func writeResponseError(w http.ResponseWriter, r *http.Request, err error) {
+	if store.IsUnavailable(err) {
+		writeUnavailable(w, r, err)
+		return
+	}
 	slog.ErrorContext(r.Context(), "request failed", "method", r.Method, "path", r.URL.Path, "err", err)
 	writeError(w, http.StatusInternalServerError, Error{Code: "internal", Message: "internal error"})
+}
+
+// retryAfterSeconds is the Retry-After of a 503 unavailable.
+const retryAfterSeconds = 1
+
+// writeUnavailable answers 503 unavailable: the database cannot be reached
+// and nothing was stored (api/openapi.yaml, ServiceUnavailable). The cause is
+// logged once here, at WARN: the outage is an operating condition, and the
+// readiness probe reports it too. Driver errors carry the address, never the
+// DSN's credentials.
+func writeUnavailable(w http.ResponseWriter, r *http.Request, err error) {
+	slog.WarnContext(r.Context(), "database unreachable; answered 503", "method", r.Method, "path", r.URL.Path, "err", err)
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+	writeError(w, http.StatusServiceUnavailable, Error{Code: "unavailable",
+		Message: "the database cannot be reached; nothing was stored; retry later"})
+}
+
+// writeParamError handles a path, query or header parameter the generated
+// wrapper could not bind (a malformed id, a single-value parameter given
+// twice): 400 invalid_request naming the parameter, like every refusal.
+func writeParamError(w http.ResponseWriter, _ *http.Request, err error) {
+	name, reason := paramOf(err)
+	body := Error{Code: "invalid_request", Message: firstLine(err.Error())}
+	if name != "" {
+		body.Message = name + ": " + reason
+		body.Details = &[]ErrorDetail{{Field: name, Reason: reason}}
+	}
+	writeError(w, http.StatusBadRequest, body)
+}
+
+// paramOf names the parameter of a generated binding error and says what is
+// wrong with it.
+func paramOf(err error) (name, reason string) {
+	var (
+		format   *InvalidParamFormatError
+		tooMany  *TooManyValuesForParamError
+		required *RequiredParamError
+		header   *RequiredHeaderError
+		unmarsh  *UnmarshalingParamError
+		cookie   *UnescapedCookieParamError
+	)
+	switch {
+	case errors.As(err, &format):
+		return format.ParamName, "malformed value"
+	case errors.As(err, &tooMany):
+		return tooMany.ParamName, fmt.Sprintf("expected one value, got %d", tooMany.Count)
+	case errors.As(err, &required):
+		return required.ParamName, "required"
+	case errors.As(err, &header):
+		return header.ParamName, "required"
+	case errors.As(err, &unmarsh):
+		return unmarsh.ParamName, "malformed value"
+	case errors.As(err, &cookie):
+		return cookie.ParamName, "malformed value"
+	}
+	return "", ""
+}
+
+// spanName names a server span by method and matched route pattern, never
+// the raw path, so span names stay low-cardinality. Routes of the contract
+// are looked up in generated; the others in mux.
+func spanName(mux, generated *http.ServeMux) func(string, *http.Request) string {
+	return func(_ string, r *http.Request) string {
+		_, pattern := mux.Handler(r)
+		if pattern == "/" {
+			_, pattern = generated.Handler(r)
+		}
+		if pattern == "" {
+			return r.Method + " unmatched"
+		}
+		if _, path, ok := strings.Cut(pattern, " "); ok {
+			pattern = path
+		}
+		return r.Method + " " + pattern
+	}
 }
