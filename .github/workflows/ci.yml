@@ -27,9 +27,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the commit subject check reads the pushed range
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+      # The same rule as the commit-msg hook, for clones that never installed it.
+      # A pull request is checked out as a merge commit; the range names the
+      # branch's own commits instead.
+      - name: Commit subjects follow the conventional format
+        env:
+          RANGE: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || format('{0}..{1}', github.event.before, github.sha) }}
+        run: go run ./tools/commitcheck -range "$RANGE"
       - name: Builds for every dev machine
         run: |
           go build ./...
@@ -45,6 +54,11 @@ jobs:
         run: go test -race ./...
       - name: Package integration tests (MySQL, Valkey in containers), with the race detector
         run: go test -race -tags integration ./internal/...
+      # The worker's own rate test once more, without the detector: with it the
+      # in-process provider double counts arrivals in clumps whenever the
+      # instrumented process stalls, so the cap is judged here.
+      - name: Worker rate at the provider double, without the race detector
+        run: go test -tags integration ./internal/worker -run '^TestWorkersHoldTheRateAtTheProvider$' -count=1
       # No -race here: these tests drive the built binary from outside, so the
       # detector would only instrument the harness and the provider double and
       # take CPU the workers need. The rate floors need a machine that can keep

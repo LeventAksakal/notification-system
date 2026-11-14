@@ -1,0 +1,85 @@
+# Releases are cut by hand, never by a push: run this workflow from the Actions
+# tab (or `gh workflow run release -f version=v1.0.0-rc.1`) on main.
+#
+#   v1.2.3-rc.1  a release candidate: image tagged with the version, GitHub
+#                pre-release
+#   v1.2.3       a release: the same, plus the image tag `latest`
+#
+# It releases only what CI already passed: the commit must be on main with a
+# green `ci` run. It builds the service image, scans it as CI does, pushes it
+# to this repository's package registry and creates the tag and the release
+# with notes generated from the commit subjects (Conventional Commits).
+# Nothing is deployed: where the image runs is the operator's choice, and so
+# are its settings and secrets (`app env`, `app env check`).
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "v1.2.3 for a release, v1.2.3-rc.1 for a release candidate"
+        required: true
+        type: string
+
+permissions:
+  contents: write # the tag and the release
+  packages: write # the image
+  actions: read # to see that ci passed on this commit
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: The version is semantic and new
+        run: |
+          if ! printf '%s' "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$'; then
+            echo "::error::version '$VERSION' is neither v1.2.3 nor v1.2.3-rc.1"; exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "::error::tag $VERSION exists already"; exit 1
+          fi
+      - name: The commit is on main and ci passed on it
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$GITHUB_SHA is not on main"; exit 1; }
+          green=$(gh run list --workflow ci --commit "$GITHUB_SHA" --status success --limit 1 --json databaseId --jq length)
+          [ "$green" = "1" ] || { echo "::error::no green ci run for $GITHUB_SHA"; exit 1; }
+      - name: Build the image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          docker build --target app \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            -t "$image:$VERSION" .
+      - name: No HIGH or CRITICAL CVEs in the image
+        run: >-
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE"
+          image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "$IMAGE:$VERSION"
+      - name: Push the image
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$VERSION"
+          case "$VERSION" in
+            *-rc.*) ;;
+            *) docker tag "$IMAGE:$VERSION" "$IMAGE:latest" && docker push "$IMAGE:latest" ;;
+          esac
+      - name: Tag and release
+        run: |
+          flags="--generate-notes"
+          case "$VERSION" in *-rc.*) flags="$flags --prerelease" ;; esac
+          # shellcheck disable=SC2086 # flags is a list of words on purpose
+          gh release create "$VERSION" --target "$GITHUB_SHA" --title "$VERSION" $flags \
+            --notes "Image: \`$IMAGE:$VERSION\`"
