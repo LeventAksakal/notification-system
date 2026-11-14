@@ -26,6 +26,7 @@ type Config struct {
 	LogLevel          slog.Level
 	DBMaxOpenConns    int
 	ReadHeaderTimeout time.Duration
+	RequestTimeout    time.Duration
 	ShutdownTimeout   time.Duration
 
 	// ProviderURLs holds the provider endpoint of each channel.
@@ -78,6 +79,8 @@ var Dials = []Dial{
 	integer("APP_DB_MAX_OPEN_CONNS", "10", "MySQL pool size", 1, 200, func(c *Config) *int { return &c.DBMaxOpenConns }),
 	duration("APP_READ_HEADER_TIMEOUT", "5s", "time a client has to send request headers", time.Second, time.Minute,
 		func(c *Config) *time.Duration { return &c.ReadHeaderTimeout }),
+	duration("APP_REQUEST_TIMEOUT", "15s", "longest a request may take before it is answered 503", time.Second, 5*time.Minute,
+		func(c *Config) *time.Duration { return &c.RequestTimeout }),
 	duration("APP_SHUTDOWN_TIMEOUT", "10s", "grace period for in-flight requests on SIGTERM", time.Second, 2*time.Minute,
 		func(c *Config) *time.Duration { return &c.ShutdownTimeout }),
 

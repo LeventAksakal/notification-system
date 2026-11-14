@@ -32,6 +32,9 @@ type Server struct {
 	hub      *realtime.Hub
 	wsBuffer int
 	streams  *streams
+	// requestTimeout is every contract request's deadline but the health
+	// endpoints' (withTimeout).
+	requestTimeout time.Duration
 }
 
 var _ StrictServerInterface = (*Server)(nil)
@@ -45,16 +48,22 @@ type Options struct {
 	// WSSendBuffer is how many events a subscriber may fall behind before it
 	// is disconnected (APP_WS_SEND_BUFFER).
 	WSSendBuffer int
+	// RequestTimeout is the longest a request may take before it is
+	// answered 503 (APP_REQUEST_TIMEOUT); 0 means DefaultRequestTimeout.
+	RequestTimeout time.Duration
 }
 
 // NewServer takes the intake service, the readiness checks by dependency
 // name, and the optional parts.
 func NewServer(svc *intake.Service, checks map[string]Check, opts ...Options) *Server {
-	s := &Server{intake: svc, checks: checks, wsBuffer: 256, streams: newStreams()}
+	s := &Server{intake: svc, checks: checks, wsBuffer: 256, streams: newStreams(), requestTimeout: DefaultRequestTimeout}
 	for _, o := range opts {
 		s.metrics, s.hub = o.Metrics, o.Hub
 		if o.WSSendBuffer > 0 {
 			s.wsBuffer = o.WSSendBuffer
+		}
+		if o.RequestTimeout > 0 {
+			s.requestTimeout = o.RequestTimeout
 		}
 	}
 	return s
@@ -90,7 +99,7 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.Handle("GET /openapi.json", specHandler(specJSON))
 	mux.Handle("GET /docs", docsHandler())
 	mux.HandleFunc("GET /v1/ws", s.streamEvents)
-	mux.Handle("/", validated)
+	mux.Handle("/", withTimeout(s.requestTimeout, validated))
 	return otelhttp.NewHandler(withCorrelation(limitBody(mux)), "http",
 		otelhttp.WithSpanNameFormatter(spanName(mux, generated))), nil
 }
@@ -117,11 +126,18 @@ func (s *Server) Ready(ctx context.Context, _ ReadyRequestObject) (ReadyResponse
 	return Ready200JSONResponse(out), nil
 }
 
-// writeError writes the contract's Error body.
+// writeError writes the contract's Error body, with its length, so a client
+// has the whole answer even while the server still holds the connection.
 func writeError(w http.ResponseWriter, status int, body Error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		b = []byte(`{"code":"internal","message":"internal error"}`)
+	}
+	b = append(b, '\n')
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+	_, _ = w.Write(b)
 }
 
 // writeRequestError handles a body or parameter the generated binder could
@@ -148,16 +164,18 @@ func writeResponseError(w http.ResponseWriter, r *http.Request, err error) {
 // retryAfterSeconds is the Retry-After of a 503 unavailable.
 const retryAfterSeconds = 1
 
-// writeUnavailable answers 503 unavailable: the database cannot be reached
-// and nothing was stored (api/openapi.yaml, ServiceUnavailable). The cause is
-// logged once here, at WARN: the outage is an operating condition, and the
-// readiness probe reports it too. Driver errors carry the address, never the
-// DSN's credentials.
+// writeUnavailable answers 503 unavailable: the database could not be
+// reached, or did not answer in time (api/openapi.yaml, ServiceUnavailable).
+// The request may or may not have been stored: a connection lost during a
+// commit the server did apply looks the same. The client repeats it with
+// the same Idempotency-Key. The cause is logged once here, at WARN: the
+// outage is an operating condition, and the readiness probe reports it too.
+// Driver errors carry the address, never the DSN's credentials.
 func writeUnavailable(w http.ResponseWriter, r *http.Request, err error) {
 	slog.WarnContext(r.Context(), "database unreachable; answered 503", "method", r.Method, "path", r.URL.Path, "err", err)
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 	writeError(w, http.StatusServiceUnavailable, Error{Code: "unavailable",
-		Message: "the database cannot be reached; nothing was stored; retry later"})
+		Message: "the database cannot be reached; the request may or may not have been stored; repeat it with the same Idempotency-Key"})
 }
 
 // writeParamError handles a path, query or header parameter the generated

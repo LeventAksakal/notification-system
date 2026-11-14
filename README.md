@@ -150,7 +150,7 @@ Delivery is at-least-once. Duplicates are prevented on our side: client retries 
 
 - `GET /v1/metrics` is computed from MySQL on every call and is not cached, so it always agrees with what a client just did; put it behind the same authentication and rate limiting as the rest of the API before exposing it.
 - The API has no authentication of its own; it is meant to sit behind a gateway.
-- If MySQL is down the API answers 503 with `Retry-After` and readiness is 503; workers keep running and resume by themselves. A send whose result could not be written is sent again when its lease ends: in a kill of MySQL mid-drain, about 100 of 9,000 were requested twice (same `Idempotency-Key`).
+- If MySQL is down, or accepts connections and does not answer within `APP_REQUEST_TIMEOUT`, the API answers 503 with `Retry-After` and readiness is 503; a create that got a 503 may still have been stored, so repeat it with the same `Idempotency-Key`; workers keep running and resume by themselves. A send whose result could not be written is sent again when its lease ends: in a kill of MySQL mid-drain, about 100 of 9,000 were requested twice (same `Idempotency-Key`).
 - If Valkey is down the API keeps accepting and answering, workers stop sending (they cannot see the shared rate limit), `/readyz` is 503, and WebSocket streams are closed rather than left with holes. Delivery resumes by itself when Valkey is back.
 
 ### What comes next at larger scale
@@ -168,6 +168,7 @@ Every application setting is an `APP_*` environment variable declared once in [`
 | `APP_VALKEY_ADDR` | `localhost:6379` | Valkey address |
 | `APP_HTTP_ADDR` | `:8080` | Listen address of `app serve` |
 | `APP_READ_HEADER_TIMEOUT` | `5s` | Time a client has to send its request headers |
+| `APP_REQUEST_TIMEOUT` | `15s` | Longest a request may take before it is answered 503 (not the WebSocket stream) |
 | `APP_SHUTDOWN_TIMEOUT` | `10s` | Grace on SIGTERM for in-flight requests (serve) and sends (worker) |
 | `APP_PROVIDER_URL_SMS`, `APP_PROVIDER_URL_EMAIL`, `APP_PROVIDER_URL_PUSH` | `http://localhost:8090/send` | Provider URL per channel |
 | `APP_PROVIDER_TIMEOUT` | `5s` | One provider call |

@@ -13,12 +13,50 @@ import (
 	"github.com/LeventAksakal/notification-system/migrations"
 )
 
+// Driver timeouts used when the DSN sets none. Without them a call on a
+// dead connection (a MySQL that hangs rather than refuses) waits for the
+// kernel's TCP timeout, minutes; a worker's claim has no request deadline.
+const (
+	defaultDialTimeout = 5 * time.Second
+	defaultIOTimeout   = 30 * time.Second // per read or write, not per query
+)
+
 // Open connects to MySQL. parseTime is forced on so DATETIME scans into
 // time.Time, whatever the injected DSN says.
 func Open(ctx context.Context, dsn string, maxOpen int) (*sql.DB, error) {
+	cfg, err := driverConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := mysql.NewConnector(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("mysql connector: %w", err)
+	}
+	db := sql.OpenDB(conn)
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxOpen)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping mysql: %w", err)
+	}
+	return db, nil
+}
+
+// driverConfig parses dsn and applies what Open forces or defaults.
+func driverConfig(dsn string) (*mysql.Config, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err) // the error never echoes the password
+	}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = defaultDialTimeout
+	}
+	if cfg.ReadTimeout == 0 {
+		cfg.ReadTimeout = defaultIOTimeout
+	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = defaultIOTimeout
 	}
 	cfg.ParseTime = true
 	cfg.Loc = time.UTC
@@ -34,19 +72,7 @@ func Open(ctx context.Context, dsn string, maxOpen int) (*sql.DB, error) {
 		cfg.Params = map[string]string{}
 	}
 	cfg.Params["time_zone"] = "'+00:00'"
-	conn, err := mysql.NewConnector(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("mysql connector: %w", err)
-	}
-	db := sql.OpenDB(conn)
-	db.SetMaxOpenConns(maxOpen)
-	db.SetMaxIdleConns(maxOpen)
-	db.SetConnMaxLifetime(5 * time.Minute)
-	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("ping mysql: %w", err)
-	}
-	return db, nil
+	return cfg, nil
 }
 
 // Migrate applies every pending migration embedded in the binary.

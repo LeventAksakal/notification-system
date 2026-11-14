@@ -177,7 +177,8 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 			}
 			return nil
 		},
-	}, api.Options{Metrics: store.NewMetricsReader(db), Hub: hub, WSSendBuffer: cfg.WSSendBuffer})
+	}, api.Options{Metrics: store.NewMetricsReader(db), Hub: hub, WSSendBuffer: cfg.WSSendBuffer,
+		RequestTimeout: cfg.RequestTimeout})
 	h, err := srv.Handler()
 	if err != nil {
 		return err
