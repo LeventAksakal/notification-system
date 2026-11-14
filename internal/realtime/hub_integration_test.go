@@ -14,6 +14,7 @@ import (
 
 	"github.com/LeventAksakal/notification-system/internal/core"
 	"github.com/LeventAksakal/notification-system/internal/realtime"
+	"github.com/LeventAksakal/notification-system/internal/realtime/realtimetest"
 	"github.com/LeventAksakal/notification-system/test/support"
 )
 
@@ -139,5 +140,64 @@ func TestHubEndsSubscriptionsWhenItStops(t *testing.T) {
 	}
 	if _, err := h.Subscribe(realtime.Filter{}, 4); !errors.Is(err, realtime.ErrClosed) {
 		t.Fatalf("subscribe after stop: want ErrClosed, got %v", err)
+	}
+}
+
+// CONTRACT "Events": an API instance that loses its event feed closes its
+// streams and refuses new ones until the feed is back.
+func TestHubEndsStreamsWhenItsFeedDropsAndRefusesUntilBack(t *testing.T) {
+	addr := support.Valkey(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	proxy := realtimetest.NewProxy(t, addr)
+	defer proxy.Close() // before goleak checks (t.Cleanup runs later)
+	pubClient, subClient := client(t, addr), client(t, proxy.Addr)
+	defer pubClient.Close()
+	defer subClient.Close()
+	h, stop := startHub(t, subClient)
+	defer stop()
+
+	open, err := h.Subscribe(realtime.Filter{}, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.Close()
+
+	select {
+	case _, ok := <-open.C:
+		if ok {
+			t.Fatal("an event arrived after the feed was cut")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("open subscription still running 5s after the feed dropped")
+	}
+	if !errors.Is(open.Err(), realtime.ErrFeedLost) {
+		t.Fatalf("ended with %v, want ErrFeedLost", open.Err())
+	}
+	if h.Live() {
+		t.Fatal("hub reports live without its feed")
+	}
+	if _, err := h.Subscribe(realtime.Filter{}, 16); !errors.Is(err, realtime.ErrFeedLost) {
+		t.Fatalf("subscribe without a feed: got %v, want ErrFeedLost", err)
+	}
+
+	proxy.Reopen(t)
+	deadline := time.Now().Add(15 * time.Second)
+	for !h.Live() {
+		if time.Now().After(deadline) {
+			t.Fatal("hub not live 15s after the feed came back")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	again, err := h.Subscribe(realtime.Filter{}, 16)
+	if err != nil {
+		t.Fatalf("subscribe after the feed came back: %v", err)
+	}
+	defer again.Close()
+	e := core.Event{NotificationID: "back", Status: core.StatusPending, At: time.Now().UTC()}
+	if err := realtime.NewPublisher(pubClient, realtime.OriginAPI).Publish(t.Context(), e); err != nil {
+		t.Fatal(err)
+	}
+	if got := next(t, again); got.NotificationID != "back" {
+		t.Fatalf("after recovery: got %+v", got)
 	}
 }
