@@ -26,3 +26,10 @@ pre-commit:
       run: |
         pkgs=$(for f in {staged_files}; do dirname $f; done | sort -u | sed 's|^|./|')
         go vet $pkgs
+
+# The subject of every commit: type(scope): description (Conventional Commits).
+# CI checks the same for every commit of a pull request.
+commit-msg:
+  commands:
+    conventional:
+      run: go run ./tools/commitcheck {1}

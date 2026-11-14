@@ -9,7 +9,7 @@ Router, not a manual. Every line is something you could not work out from the co
 - Work log: `.agents/logs/YYYY-MM/DD.md`, one line per pivot or mistake caught.
 
 ## Commands (all via Go; lefthook and gitleaks are separate, optional installs)
-- `lefthook install` once per clone: pre-commit runs gofmt, gitleaks and go vet on staged files.
+- `lefthook install` once per clone: pre-commit runs gofmt, gitleaks and go vet on staged files. commit-msg holds the subject to Conventional Commits (`tools/commitcheck`; CI checks every commit of a pull request).
 - `go tool -modfile=tools.mod task --list` lists every command. Alias it: `T="go tool -modfile=tools.mod"`.
 - While iterating: `go test ./internal/<pkg> -run <Test>`; the narrowest check that can fail.
 - `task gen`: regenerate API (oapi-codegen) and SQL (sqlc) code. Never hand-edit `*.gen.go` or `internal/store/sqlc/`.
@@ -26,6 +26,9 @@ Router, not a manual. Every line is something you could not work out from the co
 - Wrap errors with `fmt.Errorf("doing x: %w", err)`; compare with `errors.Is`. Map `sql.ErrNoRows` to a typed 404 response, not a 500.
 - Use the generated strict-server types; if the spec lacks a field, that is a contract change for the coordinator, not a local struct.
 - MySQL readiness must be checked over TCP (`--protocol=tcp`); the first-boot server answers socket pings with networking off.
+
+## Pushing
+- CI minutes are billed (private repository). Batch commits locally, run the gate locally (`task check`, then `task test:integration`; pin a test to two cores to imitate the runner), and push once per change set. Never push to see what CI says.
 
 ## Merging
 - Fast-forward `main` to the PR branch locally (`git merge --ff-only`, then `git push origin main`; GitHub marks the PR merged). Squash-merge a PR too large to read commit by commit. Never a merge commit, never GitHub's "Rebase and merge" (it rewrites the commits CI tested), never rebase a pushed branch.
