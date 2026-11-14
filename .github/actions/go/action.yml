@@ -1,0 +1,33 @@
+# Go toolchain plus a module and build cache of the calling job's own.
+# setup-go's built-in cache has one key per repository, so parallel jobs would
+# all restore whichever job saved first (a lint cache holds no race builds).
+# Here each job names its cache. The key changes with the Go version, go.sum or
+# tools.sum; the build cache keeps compiled dependencies, which is most of the
+# compile time. Saved only when the key missed and the job passed; a pull
+# request restores the cache saved on main.
+name: go
+description: Set up Go with a module and build cache per job
+inputs:
+  cache-key:
+    description: Name of the job's cache (one per job)
+    required: true
+  extra-cache-path:
+    description: Another directory to keep in the same cache
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - id: go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+        cache: false
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+          ${{ inputs.extra-cache-path }}
+        key: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-${{ inputs.cache-key }}-${{ hashFiles('go.sum', 'tools.sum') }}
+        restore-keys: go-${{ runner.os }}-${{ steps.go.outputs.go-version }}-${{ inputs.cache-key }}-

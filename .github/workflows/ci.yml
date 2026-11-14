@@ -1,6 +1,15 @@
-# One gate, the same checks as local, most run directly. Every action is pinned by
-# commit SHA: tags can be moved, and in March 2026 trivy-action's were
-# (CVE-2026-33634). Trivy itself runs from its image, pinned by digest.
+# Six jobs in parallel, none waiting for another: each failure names its own
+# job and step, and the wall time is the slowest job (acceptance, about 4 min
+# with a warm cache) instead of the sum (18 to 21 min as one job). The cost is
+# per-job setup (about 25 s: Go download, cache restore) and per-job rounding
+# up to the minute. Nothing waits for the static jobs: of the last four failed
+# runs three failed in the integration tests, so a `needs:` would slow every
+# green run to save minutes on a rare lint failure. Measurements:
+# docs/REQUIREMENTS.md, the row "did you really write CI idiomatically".
+#
+# Every action is pinned by commit SHA: tags can be moved, and in March 2026
+# trivy-action's were (CVE-2026-33634). Trivy itself runs from its image,
+# pinned by digest.
 name: ci
 
 on:
@@ -19,19 +28,21 @@ env:
   T: go tool -modfile=tools.mod
   TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
 
+# Linux only: it is what the image runs on. Windows, macOS and Linux are dev
+# machines, not deploy targets; the cross-compile step catches a build break
+# on them without a runner per OS.
 jobs:
-  # Linux only: it is what the image runs on. Windows, macOS and Linux are
-  # dev machines, not deploy targets; the cross-compile step below catches a
-  # build break on them in one job, without a runner per OS.
-  gate:
+  build:
+    name: "static: build, generated code, vulnerabilities, commit subjects"
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # the commit subject check reads the pushed range
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: ./.github/actions/go
         with:
-          go-version-file: go.mod
+          cache-key: build
       # The same rule as the commit-msg hook, for clones that never installed it.
       # A pull request is checked out as a merge commit; the range names the
       # branch's own commits instead.
@@ -48,10 +59,48 @@ jobs:
         run: |
           go generate ./...
           git diff --exit-code
+      - name: Known vulnerabilities
+        run: $T govulncheck ./...
+
+  # Lint is CPU-bound and the drift check waits on Docker pulls and a MySQL
+  # boot; together they still finish before the acceptance job, and one job
+  # costs a billed minute less than two.
+  lint:
+    name: "static: lint, migration drift"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/go
+        with:
+          cache-key: lint
+          extra-cache-path: ~/.cache/golangci-lint
       - name: Lint (fails on silent typecheck errors)
         run: go run ./tools/lintguard ./...
+      - name: Migrations match schema/
+        run: $T task migrate:check
+
+  unit:
+    name: "unit tests (race detector)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/go
+        with:
+          cache-key: unit
       - name: Race tests
         run: go test -race ./...
+
+  integration:
+    name: "package integration tests (MySQL, Valkey)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/go
+        with:
+          cache-key: integration
       - name: Package integration tests (MySQL, Valkey in containers), with the race detector
         run: go test -race -tags integration ./internal/...
       # The worker's own rate test once more, without the detector: with it the
@@ -59,29 +108,47 @@ jobs:
       # instrumented process stalls, so the cap is judged here.
       - name: Worker rate at the provider double, without the race detector
         run: go test -tags integration ./internal/worker -run '^TestWorkersHoldTheRateAtTheProvider$' -count=1
-      # No -race here: these tests drive the built binary from outside, so the
-      # detector would only instrument the harness and the provider double and
-      # take CPU the workers need. The rate floors need a machine that can keep
-      # time to 10 ms; this runner has two cores, so only the cap (never more
-      # than 100 in a second) and a sanity floor are asserted here. The strict
-      # floors run with `task test:all` on a developer machine.
-      - name: Acceptance tests (built binary, MySQL, Valkey, provider double)
+
+  # No -race here: these tests drive the built binary from outside, so the
+  # detector would only instrument the harness and the provider double and
+  # take CPU the workers need. The rate floors need a machine that can keep
+  # time to 10 ms; this runner has two cores, so only the cap (never more
+  # than 100 in a second) and a sanity floor are asserted here. The strict
+  # floors run with `task test:all` on a developer machine.
+  acceptance:
+    name: "acceptance tests (built binary, MySQL, Valkey, provider double)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/go
+        with:
+          cache-key: acceptance
+      - name: Acceptance tests
         env:
           ACCEPTANCE_RATE_FLOOR: "40"
         run: go test -tags integration ./test/...
-      - name: Known vulnerabilities
-        run: $T govulncheck ./...
-      - name: Migrations match schema/
-        run: $T task migrate:check
-      - name: Build image
-        run: docker build -t notifier:ci .
+
+  # No Go on the runner: the image compiles inside Docker. No layer cache
+  # either: the compile layer (70 s) re-runs on every commit, and the layers a
+  # cache would keep (golang pull 12 s, module download 5 s) cost about as much
+  # to export and restore.
+  image:
+    name: "image: build, CVE scan, stack comes up"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # One build for the app and the provider double: they share the build stage.
+      - name: Build images
+        run: docker compose build app provider
       - name: No HIGH or CRITICAL CVEs in the image
         run: >-
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE"
-          image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed notifier:ci
+          image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed notifier:local
       - name: Stack comes up healthy
         run: |
-          docker compose up --wait --wait-timeout 180
+          docker compose up --no-build --wait --wait-timeout 180
           curl -fsS http://127.0.0.1:8080/readyz
       - name: Stack logs on failure
         if: failure()
