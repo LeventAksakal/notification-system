@@ -89,11 +89,11 @@ func New(client valkey.Client, perSecond, headroomPct int, horizon time.Duration
 func (l *Limiter) Interval() time.Duration { return l.interval }
 
 // Take reserves up to n consecutive slots on channel, none further ahead
-// than the horizon. Grant.At is Valkey's clock when the script ran.
+// than the horizon. Grant.At is Valkey's clock when the script ran. With
+// n <= 0 the script still runs, reserves nothing and writes nothing: a
+// reading of Valkey's clock that costs no slot.
 func (l *Limiter) Take(ctx context.Context, channel core.Channel, n int) (core.Grant, error) {
-	if n <= 0 {
-		return core.Grant{Interval: l.interval}, nil
-	}
+	n = max(n, 0)
 	vals, err := script.Exec(ctx, l.client, []string{l.prefix + string(channel)},
 		[]string{fmt.Sprint(l.interval.Microseconds()), fmt.Sprint(l.horizon.Microseconds()), fmt.Sprint(n)}).AsIntSlice()
 	if err != nil {

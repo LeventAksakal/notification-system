@@ -165,6 +165,14 @@ func TestLimiterGrantCarriesValkeysClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A Take of no slots reads the clock and reserves nothing.
+	g0, err := l.Take(t.Context(), core.ChannelPush, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g0.N != 0 || g0.At.Before(g1.At) || g0.Interval != g1.Interval {
+		t.Fatalf("Take of 0: want no slot, At not before the first grant's (%s), the interval; got %+v", g1.At, g0)
+	}
 	g2, err := l.Take(t.Context(), core.ChannelPush, 3)
 	if err != nil {
 		t.Fatal(err)
