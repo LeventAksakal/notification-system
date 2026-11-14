@@ -435,3 +435,47 @@ func TestBackoff(t *testing.T) {
 		t.Errorf("full jitter lower bound: got %s", got)
 	}
 }
+
+// slowPublisher takes delay per batch call, like a slow Valkey, and records
+// each event when its call is over. Single events (the results) go out at
+// once, so a result not held back for its processing event would overtake it.
+type slowPublisher struct {
+	recPublisher
+	delay time.Duration
+}
+
+func (p *slowPublisher) PublishAll(ctx context.Context, es []core.Event) error {
+	sleep(ctx, p.delay)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.events = append(p.events, es...)
+	return nil
+}
+
+func TestWorkerSlowPublishCostsNoSlotAndKeepsEventOrder(t *testing.T) {
+	q := newMemQueue()
+	q.add(12, core.ChannelSMS, core.PriorityHigh)
+	pub := &slowPublisher{delay: 300 * time.Millisecond}
+	stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{accept}, Publisher: pub}))
+	waitFor(t, "all 12 sent", func() bool { return q.count(core.StatusSent) == 12 })
+	waitFor(t, "every result published", func() bool {
+		pub.mu.Lock()
+		defer pub.mu.Unlock()
+		return len(pub.events) == 24
+	})
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	q.mu.Lock()
+	released := q.released
+	q.mu.Unlock()
+	if released != 0 {
+		t.Errorf("%d jobs released unsent while the publish was slow, want none", released)
+	}
+	for i := range 12 {
+		id := fmt.Sprintf("sms-high-%d", i)
+		if got := pub.statuses(id); fmt.Sprint(got) != "[processing sent]" {
+			t.Errorf("%s events: want [processing sent], got %v", id, got)
+		}
+	}
+}

@@ -92,7 +92,7 @@ func TestWorkerMissedSlotIsReleasedNotSentLate(t *testing.T) {
 	tolerance := 5 * time.Millisecond
 	// The job reaches its send step three intervals after its slot (a slow
 	// claim, a timer late under load).
-	w.sendAt(t.Context(), t.Context(), cr, jobs[0], time.Now().Add(-3*tolerance), tk, tolerance)
+	w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now().Add(-3*tolerance), tk, tolerance)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if snd.calls.Load() != 0 || q.released != 1 || q.rows[jobs[0].ID].status != core.StatusPending {
@@ -177,7 +177,7 @@ func TestWorkerDoesNotSendWhenTheBreakerOpenedAfterTheClaim(t *testing.T) {
 	tk, _, _ := br.Allow() // admitted while closed
 	other, _, _ := br.Allow()
 	br.Done(other, false) // another call fails: the breaker opens
-	w.sendAt(t.Context(), t.Context(), cr, jobs[0], time.Now(), tk, 5*time.Millisecond)
+	w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now(), tk, 5*time.Millisecond)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if snd.calls.Load() != 0 || q.released != 1 {
