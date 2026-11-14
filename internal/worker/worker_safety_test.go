@@ -196,9 +196,9 @@ func TestWorkerDoesNotSendASlotPlacedBeforeAClockStep(t *testing.T) {
 	// The slot is placed under the mapping's generation; then a Take shows
 	// the limiter's clock 5 s ahead of where the mapping had it.
 	now, remote := time.Now(), time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
-	_, _, gen, _ := w.clock.observe(now, now.Add(time.Millisecond), remote)
-	if _, _, _, restarted := w.clock.observe(now.Add(time.Second), now.Add(time.Second+time.Millisecond), remote.Add(6*time.Second)); !restarted {
-		t.Fatal("a 5 s step did not restart the mapping")
+	_, _, gen, _ := w.clock.observe(now, now.Add(time.Millisecond), remote, 5*time.Millisecond)
+	if _, _, _, r := w.clock.observe(now.Add(time.Second), now.Add(time.Second+time.Millisecond), remote.Add(6*time.Second), 5*time.Millisecond); !r.voids {
+		t.Fatal("a 5 s step did not void the mapping's generation")
 	}
 	w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now(), tk, 5*time.Millisecond, gen)
 	q.mu.Lock()

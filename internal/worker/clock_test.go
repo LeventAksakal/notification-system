@@ -49,11 +49,11 @@ func TestClockMapBounds(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := newClockMap(epoch, 10*time.Second)
+			c := newClockMap(epoch, 10*time.Second, 1200*time.Millisecond)
 			base := -time.Duration(remote0.UnixNano())
 			var lower, upper time.Duration
 			for _, s := range tc.samples {
-				lower, upper, _, _ = c.observe(epoch.Add(us(s.sent)), epoch.Add(us(s.got)), remote0.Add(us(s.at)))
+				lower, upper, _, _ = c.observe(epoch.Add(us(s.sent)), epoch.Add(us(s.got)), remote0.Add(us(s.at)), 0)
 			}
 			if lower-base != tc.lower || upper-base != tc.upper {
 				t.Fatalf("bounds [%s, %s], want [%s, %s]", lower-base, upper-base, tc.lower, tc.upper)
@@ -70,15 +70,76 @@ func TestClockMapGenerationMovesOnlyOnARestart(t *testing.T) {
 	epoch := time.Now()
 	remote0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
-	c := newClockMap(epoch, 10*time.Second)
-	_, _, g0, _ := c.observe(epoch.Add(ms(100)), epoch.Add(ms(102)), remote0.Add(ms(101)))
-	_, _, g1, r1 := c.observe(epoch.Add(ms(200)), epoch.Add(ms(230)), remote0.Add(ms(215))) // agrees, looser
-	if g1 != g0 || r1 || !c.current(g0) {
+	c := newClockMap(epoch, 10*time.Second, 1200*time.Millisecond)
+	_, _, g0, _ := c.observe(epoch.Add(ms(100)), epoch.Add(ms(102)), remote0.Add(ms(101)), 10*time.Millisecond)
+	_, _, g1, r1 := c.observe(epoch.Add(ms(200)), epoch.Add(ms(230)), remote0.Add(ms(215)), 10*time.Millisecond) // agrees, looser
+	if g1 != g0 || r1.happened || !c.current(g0) {
 		t.Fatalf("an agreeing sample moved the generation: %d -> %d (restarted %v)", g0, g1, r1)
 	}
-	_, _, g2, r2 := c.observe(epoch.Add(ms(300)), epoch.Add(ms(302)), remote0.Add(ms(5_301))) // 5 s step
-	if g2 == g0 || !r2 || c.current(g0) || !c.current(g2) {
+	_, _, g2, r2 := c.observe(epoch.Add(ms(300)), epoch.Add(ms(302)), remote0.Add(ms(5_301)), 10*time.Millisecond) // 5 s step
+	if g2 == g0 || !r2.voids || c.current(g0) || !c.current(g2) {
 		t.Fatalf("a 5 s step: generation %d -> %d (restarted %v); the old one must be void", g0, g2, r2)
+	}
+}
+
+func TestClockMapVoidsOnlyForAForwardStepOfAnInterval(t *testing.T) {
+	epoch := time.Now()
+	remote0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
+	const interval = 10 * time.Millisecond
+	// A step moves Valkey's clock by d at local moment after; every sample
+	// is a 100 us round trip, one every 100 ms from 100 ms on.
+	type step struct {
+		after time.Duration
+		d     time.Duration
+	}
+	cases := []struct {
+		name     string
+		interval time.Duration // passed with every sample
+		steps    []step
+		voids    []bool // per step, whether its restart voided
+	}{
+		{"a forward step under an interval restarts without voiding",
+			interval, []step{{ms(1_000), ms(1)}}, []bool{false}},
+		{"a forward step of just over an interval voids",
+			interval, []step{{ms(1_000), interval + ms(1)}}, []bool{true}},
+		{"a backward step voids nothing however large",
+			interval, []step{{ms(1_000), -ms(500)}}, []bool{false}},
+		{"small forward steps inside one second void once they add up to an interval",
+			interval, []step{{ms(1_000), ms(4)}, {ms(1_300), ms(4)}, {ms(1_600), ms(4)}, {ms(1_900), ms(4)}}, []bool{false, false, true, false}},
+		{"small forward steps further apart than the span never add up",
+			interval, []step{{ms(1_000), ms(4)}, {ms(2_500), ms(4)}, {ms(4_000), ms(4)}, {ms(5_500), ms(4)}}, []bool{false, false, false, false}},
+		{"with no interval known any forward step voids",
+			0, []step{{ms(1_000), ms(1)}}, []bool{true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newClockMap(epoch, 10*time.Second, 1200*time.Millisecond)
+			var shift time.Duration
+			var got []bool
+			var prev uint64
+			k := 0
+			for at := ms(100); at <= ms(7_000); at += ms(100) {
+				if k < len(tc.steps) && at >= tc.steps[k].after {
+					shift += tc.steps[k].d
+					k++
+				}
+				_, _, gen, r := c.observe(epoch.Add(at), epoch.Add(at+100*time.Microsecond), remote0.Add(at+50*time.Microsecond+shift), tc.interval)
+				if r.voids != (gen != prev) || r.voids != !c.current(prev) {
+					t.Fatalf("restart voids %v, generation %d -> %d", r.voids, prev, gen)
+				}
+				prev = gen
+				if r.happened {
+					got = append(got, r.voids)
+					if (tc.steps[k-1].d > 0) != (r.step > 0) || (r.step > 0 && r.step < tc.steps[k-1].d) {
+						t.Fatalf("step estimate %s for a step of %s: it must bound the step from above", r.step, tc.steps[k-1].d)
+					}
+				}
+			}
+			if !slices.Equal(got, tc.voids) {
+				t.Fatalf("restarts voided %v, want %v", got, tc.voids)
+			}
+		})
 	}
 }
 
@@ -86,11 +147,11 @@ func TestClockMapUncertainty(t *testing.T) {
 	epoch := time.Now()
 	remote0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
-	c := newClockMap(epoch, 10*time.Second)
+	c := newClockMap(epoch, 10*time.Second, 1200*time.Millisecond)
 	if u := c.uncertainty(epoch); u != unknown {
 		t.Fatalf("no sample: uncertainty %s, want unknown", u)
 	}
-	c.observe(epoch.Add(ms(100)), epoch.Add(ms(102)), remote0.Add(ms(101)))
+	c.observe(epoch.Add(ms(100)), epoch.Add(ms(102)), remote0.Add(ms(101)), 10*time.Millisecond)
 	if u := c.uncertainty(epoch.Add(ms(102))); u != ms(2) {
 		t.Fatalf("one fresh sample: uncertainty %s, want its round trip 2ms", u)
 	}
@@ -296,8 +357,8 @@ func TestWorkerDeliveryMetrics(t *testing.T) {
 		cr := w.newChannelRun(core.ChannelSMS, testPlaces(1, 0))
 		tk, _, _ := cr.br.Allow()
 		now, remote := time.Now(), time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
-		_, _, gen, _ := w.clock.observe(now, now.Add(time.Millisecond), remote)
-		w.clock.observe(now.Add(time.Second), now.Add(time.Second+time.Millisecond), remote.Add(6*time.Second)) // a 5 s step
+		_, _, gen, _ := w.clock.observe(now, now.Add(time.Millisecond), remote, 5*time.Millisecond)
+		w.clock.observe(now.Add(time.Second), now.Add(time.Second+time.Millisecond), remote.Add(6*time.Second), 5*time.Millisecond) // a 5 s step
 		w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now(), tk, 5*time.Millisecond, gen)
 		if n := counted(collect(t, reader), "notifier.slots.given_up", sms, attribute.String("reason", "clock_stepped")); n != 1 || snd.calls.Load() != 0 {
 			t.Fatalf("given_up{reason=clock_stepped} = %d and %d calls, want 1 and 0", n, snd.calls.Load())
@@ -566,4 +627,105 @@ func per100(sends []time.Time, from time.Time, n int) []int {
 		}
 	}
 	return out
+}
+
+// R8 across steps of the limiter's clock that do not restart its schedule:
+// a forward step of s makes the new slots arrive s early against the old
+// mapping's, so the streams overlap for s. Under one interval that is at most
+// one request more in a second and nothing is voided; from one interval on
+// (one step, or several close together) the old slots are voided. A backward
+// step leaves a gap and voids nothing.
+func TestWorkersAcrossSmallLimiterClockSteps(t *testing.T) {
+	const interval, perChannel = 10 * time.Millisecond, 300
+	paced := int(time.Second / interval)
+	cases := []struct {
+		name  string
+		steps []time.Duration // one every every, once the stream is steady
+		every time.Duration
+		// voids: some slots are given up as clock_stepped; slack: the most
+		// sends a sliding second may hold above the paced rate.
+		voids bool
+		slack int
+	}{
+		{"small forward steps void nothing and keep the paced rate",
+			[]time.Duration{time.Millisecond, time.Millisecond, time.Millisecond, time.Millisecond, time.Millisecond, time.Millisecond}, 300 * time.Millisecond, false, 2},
+		{"a forward step of just over one interval voids the old slots",
+			[]time.Duration{interval + time.Millisecond}, 0, true, 1},
+		{"a backward step voids nothing",
+			[]time.Duration{-3 * interval}, 0, false, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			chans := []core.Channel{core.ChannelSMS, core.ChannelEmail, core.ChannelPush}
+			q := newMemQueue()
+			for _, ch := range chans {
+				q.add(perChannel, ch, core.PriorityNormal)
+			}
+			lim := newSteppingLimiter(interval, 100*time.Millisecond)
+			snd := &channelSender{at: map[core.Channel][]time.Time{}}
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			defer func() { _ = mp.Shutdown(context.Background()) }()
+			cfg := testConfig()
+			cfg.Channels = chans
+			cfg.Horizon = 100 * time.Millisecond
+			cfg.SendAlign = 100 * time.Millisecond
+			var stops []func() error
+			for range 2 {
+				stops = append(stops, run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: snd, Meter: mp})))
+			}
+			waitFor(t, "a steady stream before the steps", func() bool { return snd.count() >= 150 })
+			for i, d := range tc.steps {
+				if i > 0 {
+					time.Sleep(tc.every)
+				}
+				lim.step(d)
+			}
+			deadline := time.Now().Add(20 * time.Second)
+			for q.count(core.StatusSent) < perChannel*len(chans) && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			for _, stop := range stops {
+				if err := stop(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rm := collect(t, reader)
+			stepped := counted(rm, "notifier.slots.given_up", attribute.String("reason", "clock_stepped"))
+			others := counted(rm, "notifier.slots.given_up") - stepped
+			t.Logf("slots given up: %d clock_stepped, %d for other reasons", stepped, others)
+			// The pace allows five intervals, a backward step's gap, and one
+			// interval for each slot given up for another reason (a loaded
+			// machine misses some): what it catches is slots voided.
+			allow := 5 * interval
+			for _, d := range tc.steps {
+				allow += max(-d, 0)
+			}
+			allow += time.Duration(others) * interval
+			if (stepped > 0) != tc.voids {
+				t.Errorf("%d slots given up as clock_stepped, want voided %v", stepped, tc.voids)
+			}
+			for _, ch := range chans {
+				sends := snd.times(ch)
+				slices.SortFunc(sends, func(a, b time.Time) int { return a.Compare(b) })
+				if len(sends) != perChannel {
+					t.Errorf("%s: %d of %d sent", ch, len(sends), perChannel)
+					continue
+				}
+				most, _ := busiestFrom(sends)
+				// From the 10th send on the stream is steady: the last leaves
+				// about one interval per send later; a void costs a horizon.
+				span := sends[len(sends)-1].Sub(sends[9])
+				want := time.Duration(len(sends)-10) * interval
+				t.Logf("%s: busiest sliding second %d (paced %d); sends 10..%d took %s (paced %s); %d clock_stepped",
+					ch, most, paced, len(sends), span.Round(time.Millisecond), want, stepped)
+				if most > paced+tc.slack {
+					t.Errorf("%s: busiest sliding second %d sends, want at most %d", ch, most, paced+tc.slack)
+				}
+				if !tc.voids && span > want+allow {
+					t.Errorf("%s: sends 10..%d took %s, want at most %s: the paced rate was not kept", ch, len(sends), span, want+allow)
+				}
+			}
+		})
+	}
 }

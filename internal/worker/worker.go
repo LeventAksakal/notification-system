@@ -150,7 +150,7 @@ func New(cfg Config, deps Deps) *Worker {
 		breakers[ch] = br
 	}
 	deps.Breakers = breakers
-	return &Worker{cfg: cfg, deps: deps, clock: newClockMap(time.Now(), clockWindow), m: newMetrics(deps.Meter)}
+	return &Worker{cfg: cfg, deps: deps, clock: newClockMap(time.Now(), clockWindow, time.Second+cfg.Horizon+cfg.SendAlign), m: newMetrics(deps.Meter)}
 }
 
 // storeTimeout bounds one result write; it is not cut short by shutdown, so a
@@ -342,9 +342,9 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			}
 			uncertainty := unknown // a grant without At cannot be placed
 			if !g.At.IsZero() {
-				lower, upper, _, restarted := w.clock.observe(sent, got, g.At)
+				lower, upper, _, restart := w.clock.observe(sent, got, g.At, g.Interval)
 				uncertainty = upper - lower
-				w.logClockStep(ctx, cr.ch, restarted, uncertainty)
+				w.logClockStep(ctx, cr.ch, restart, uncertainty)
 			}
 			if uncertainty >= interval {
 				if !clockUncertain {
@@ -409,15 +409,20 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		var gen uint64
 		if !g.At.IsZero() {
 			var lower time.Duration
-			var restarted bool
-			lower, upper, gen, restarted = w.clock.observe(sent, got, g.At)
+			var restart clockRestart
+			lower, upper, gen, restart = w.clock.observe(sent, got, g.At, g.Interval)
 			uncertainty = upper - lower
-			w.logClockStep(ctx, cr.ch, restarted, uncertainty)
-			if restarted && g.N > 0 {
-				// A clock stepped: the limiter's schedule may have restarted at
-				// its new "now" while slots of the old one are still pending
-				// (the new generation voids those). This grant is on the new
-				// schedule and could leave beside them: it is not used.
+			w.logClockStep(ctx, cr.ch, restart, uncertainty)
+			if restart.voids && g.N > 0 {
+				// Valkey's clock stepped forward by up to an interval or more
+				// (clockMap.gen): this grant's slots would overlap the pending
+				// ones of the old mapping by that much (or the limiter's
+				// schedule restarted at its new "now" beside all of them). The
+				// new generation voids those, and this grant, which could
+				// leave beside them, is not used either. A restart that does
+				// not void showed a forward step under an interval, which adds
+				// at most one request to a second, or a backward one, which
+				// leaves a gap: the grant is used as placed.
 				<-cr.claiming
 				cr.br.Cancel(first)
 				w.m.gaveUp(ctx, cr.ch, giveUpClockStepped, g.N)
@@ -427,8 +432,9 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		if g.N > 0 && uncertainty >= g.Interval {
 			// The cap cannot be guaranteed: none of these slots is used. Rare:
 			// the mapping was checked before the Take, and a sample that
-			// restarted it is handled above; the next turn reads the clock
-			// without reserving.
+			// restarted it and voids is handled above (one that restarted it
+			// without voiding may land here, its round trip being slow); the
+			// next turn reads the clock without reserving.
 			<-cr.claiming
 			cr.br.Cancel(first)
 			w.m.gaveUp(ctx, cr.ch, giveUpClockUncertain, g.N)
@@ -477,12 +483,18 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 }
 
 // logClockStep reports a restart of the clock mapping: a sample contradicted
-// the window beyond the drift allowance, so one of the clocks stepped. Slots
-// placed with the old mapping are void from then on (group.gen).
-func (w *Worker) logClockStep(ctx context.Context, ch core.Channel, restarted bool, uncertainty time.Duration) {
-	if restarted {
-		slog.WarnContext(ctx, "limiter clock stepped; offset mapping restarted", "channel", ch,
-			"uncertainty_us", uncertainty.Microseconds())
+// the window beyond the drift allowance, so one of the clocks stepped by up to
+// step_us (negative: backward). A restart that voids the slots placed with the
+// old mapping (group.gen) costs throughput and is a warning; a small one, as
+// a VM's periodic time sync makes, voids nothing and is only debug.
+func (w *Worker) logClockStep(ctx context.Context, ch core.Channel, r clockRestart, uncertainty time.Duration) {
+	switch {
+	case r.voids:
+		slog.WarnContext(ctx, "limiter clock stepped; offset mapping restarted, pending slots void", "channel", ch,
+			"step_us", r.step.Microseconds(), "uncertainty_us", uncertainty.Microseconds())
+	case r.happened:
+		slog.DebugContext(ctx, "limiter clock stepped slightly; offset mapping restarted", "channel", ch,
+			"step_us", r.step.Microseconds(), "uncertainty_us", uncertainty.Microseconds())
 	}
 }
 
@@ -631,8 +643,8 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job,
 		return
 	}
 	if !w.clock.current(gen) {
-		// A clock step may have restarted the limiter's schedule: this slot
-		// is on the old one and could leave beside the new one's.
+		// A forward clock step of an interval or more (clockMap.gen): this
+		// slot is on the old mapping and could leave beside the new one's.
 		callDone()
 		cr.br.Cancel(tk)
 		w.m.gaveUp(ctx, cr.ch, giveUpClockStepped, 1)
