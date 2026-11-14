@@ -1,10 +1,11 @@
-// Command app is the service binary. One image, four entry points:
+// Command app is the service binary. One image, five entry points:
 //
 //	app serve        run the HTTP API until SIGINT/SIGTERM
 //	                 (/openapi.json and /docs are served next to the API)
 //	app worker       run a delivery worker until SIGINT/SIGTERM
 //	app migrate      apply embedded migrations, then exit (compose runs it once)
 //	app healthcheck  GET /readyz on localhost; the distroless image has no curl
+//	app env          print every application setting as an env file, then exit
 package main
 
 import (
@@ -52,8 +53,13 @@ func main() {
 }
 
 func run(ctx context.Context, cmd string) error {
-	if cmd == "healthcheck" {
+	switch cmd {
+	case "healthcheck":
 		return healthcheck(ctx, "http://127.0.0.1:8080/readyz")
+	case "env":
+		// Reference only: no config, no connections, no telemetry.
+		_, err := fmt.Fprint(os.Stdout, config.EnvExample())
+		return err
 	}
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -87,7 +93,7 @@ func run(ctx context.Context, cmd string) error {
 	case "worker":
 		return worker(ctx, cfg, db)
 	default:
-		return fmt.Errorf("unknown command %q (serve, worker, migrate, healthcheck)", cmd)
+		return fmt.Errorf("unknown command %q (serve, worker, migrate, healthcheck, env)", cmd)
 	}
 }
 
