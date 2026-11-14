@@ -13,3 +13,5 @@ Assumption taken: (b) for now; no test covers it. (a) touches `internal/core` an
 ## 3. Events have no commit sequence
 Question: ordering between processes (API create vs worker claim) is restored in the hub from `(status, attempts)`, the publisher's role and `at` (see `internal/realtime/order.go`). A per-notification sequence (e.g. `claim_version` plus a status step, or `updated_at` from the row) carried in `core.Event` would make ordering and snapshot de-duplication exact instead of rule-based.
 Assumption taken: rule-based ordering, as built. Residual: a release or reap racing a reclaim, judged by `at` across two worker clocks.
+
+Seen 14 Nov (fix lane, by reasoning; not reproduced): when a job is released and claimed again before the first claim's `processing` publish has returned, the release's `pending` event and the second claim's `processing` and `sent` events wait on different publishes and can reach Valkey in either order. A subscriber can then see `sent` followed by a late `pending`. It needs a slow Valkey and a release at the same time; the REST API stays correct. The sequence number asked about above would close it; nothing else was done.
