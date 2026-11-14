@@ -293,7 +293,20 @@ func (w *Worker) refill() time.Duration { return max(w.cfg.Horizon/2, time.Milli
 func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, inflight *sync.WaitGroup) {
 	limiterDown := false
 	clockUncertain := false
+	probeWait := w.cfg.IdleMin
 	interval := time.Millisecond // until the first grant says
+	unreachable := func(err error) {
+		if !limiterDown {
+			slog.ErrorContext(ctx, "rate limiter unreachable; channel sends nothing", "channel", cr.ch, "err", err)
+			limiterDown = true
+		}
+	}
+	reachable := func() {
+		if limiterDown {
+			slog.InfoContext(ctx, "rate limiter reachable again", "channel", cr.ch)
+			limiterDown = false
+		}
+	}
 	for ctx.Err() == nil {
 		now := time.Now()
 		cr.mu.Lock()
@@ -307,6 +320,49 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			sleep(ctx, w.cfg.IdleMin)
 			continue
 		}
+		if w.clock.uncertainty(time.Now()) >= interval {
+			// Slots could not be placed within one interval (a cold start, a
+			// long idle, a clock step, slow replies): read Valkey's clock with
+			// a Take of no slots, which costs the other workers nothing, and
+			// reserve only once the offset is known well enough.
+			sent := time.Now()
+			g, err := w.deps.Limiter.Take(ctx, cr.ch, 0)
+			got := time.Now()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				unreachable(err)
+				sleep(ctx, w.cfg.IdleMax)
+				continue
+			}
+			reachable()
+			if g.Interval > 0 {
+				interval = g.Interval
+			}
+			uncertainty := unknown // a grant without At cannot be placed
+			if !g.At.IsZero() {
+				lower, upper, _, restarted := w.clock.observe(sent, got, g.At)
+				uncertainty = upper - lower
+				w.logClockStep(ctx, cr.ch, restarted, uncertainty)
+			}
+			if uncertainty >= interval {
+				if !clockUncertain {
+					slog.WarnContext(ctx, "limiter clock offset too uncertain to hold the rate; channel sends nothing",
+						"channel", cr.ch, "uncertainty_us", uncertainty.Microseconds(), "interval_us", interval.Microseconds())
+					clockUncertain = true
+				}
+				sleep(ctx, probeWait)
+				probeWait = min(2*probeWait, w.cfg.IdleMax)
+				continue
+			}
+			probeWait = w.cfg.IdleMin
+			if clockUncertain {
+				slog.InfoContext(ctx, "limiter clock offset known again", "channel", cr.ch,
+					"uncertainty_us", uncertainty.Microseconds())
+				clockUncertain = false
+			}
+		}
 		first, ok, wait := cr.br.Allow()
 		if !ok {
 			sleep(ctx, min(wait, w.cfg.IdleMax))
@@ -319,10 +375,8 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			return
 		}
 		want := int(w.cfg.Horizon/interval) + 1
-		if first.Probe() || clockUncertain {
-			// The probe is one call; while the clock mapping is too loose to
-			// use, one slot is enough to learn from and little to lose.
-			want = 1
+		if first.Probe() {
+			want = 1 // the probe is one call
 		}
 		sent := time.Now()
 		g, err := w.deps.Limiter.Take(ctx, cr.ch, want)
@@ -333,17 +387,11 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			if ctx.Err() != nil {
 				return
 			}
-			if !limiterDown {
-				slog.ErrorContext(ctx, "rate limiter unreachable; channel sends nothing", "channel", cr.ch, "err", err)
-				limiterDown = true
-			}
+			unreachable(err)
 			sleep(ctx, w.cfg.IdleMax)
 			continue
 		}
-		if limiterDown {
-			slog.InfoContext(ctx, "rate limiter reachable again", "channel", cr.ch)
-			limiterDown = false
-		}
+		reachable()
 		if g.Interval > 0 {
 			interval = g.Interval
 		}
@@ -356,15 +404,31 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		// whatever the reply's delay; a request may so be up to uncertainty
 		// late from the mapping alone, and the group's tolerance gives that
 		// up: mapping error plus timer lateness stay within one interval.
-		uncertainty := time.Duration(math.MaxInt64) // a grant without At cannot be placed
+		uncertainty := unknown // a grant without At cannot be placed
 		var upper time.Duration
+		var gen uint64
 		if !g.At.IsZero() {
 			var lower time.Duration
-			lower, upper = w.clock.observe(sent, got, g.At)
+			var restarted bool
+			lower, upper, gen, restarted = w.clock.observe(sent, got, g.At)
 			uncertainty = upper - lower
+			w.logClockStep(ctx, cr.ch, restarted, uncertainty)
+			if restarted && g.N > 0 {
+				// A clock stepped: the limiter's schedule may have restarted at
+				// its new "now" while slots of the old one are still pending
+				// (the new generation voids those). This grant is on the new
+				// schedule and could leave beside them: it is not used.
+				<-cr.claiming
+				cr.br.Cancel(first)
+				w.m.gaveUp(ctx, cr.ch, giveUpClockStepped, g.N)
+				continue
+			}
 		}
 		if g.N > 0 && uncertainty >= g.Interval {
-			// The cap cannot be guaranteed: none of these slots is used.
+			// The cap cannot be guaranteed: none of these slots is used. Rare:
+			// the mapping was checked before the Take, and a sample that
+			// restarted it is handled above; the next turn reads the clock
+			// without reserving.
 			<-cr.claiming
 			cr.br.Cancel(first)
 			w.m.gaveUp(ctx, cr.ch, giveUpClockUncertain, g.N)
@@ -373,7 +437,6 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 					"channel", cr.ch, "uncertainty_us", uncertainty.Microseconds(), "interval_us", g.Interval.Microseconds())
 				clockUncertain = true
 			}
-			sleep(ctx, w.cfg.IdleMin)
 			continue
 		}
 		if g.N > 0 && clockUncertain {
@@ -407,17 +470,53 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		go func() { // owned by Run through inflight
 			defer inflight.Done()
 			defer func() { <-cr.claiming }()
-			w.claimGroup(ctx, sendCtx, cr, slots, tickets, tolerance, inflight)
+			w.claimGroup(ctx, sendCtx, cr, group{slots: slots, tickets: tickets, tolerance: tolerance, gen: gen}, inflight)
 		}()
 		sleep(ctx, time.Until(got.Add(pause)))
 	}
 }
 
+// logClockStep reports a restart of the clock mapping: a sample contradicted
+// the window beyond the drift allowance, so one of the clocks stepped. Slots
+// placed with the old mapping are void from then on (group.gen).
+func (w *Worker) logClockStep(ctx context.Context, ch core.Channel, restarted bool, uncertainty time.Duration) {
+	if restarted {
+		slog.WarnContext(ctx, "limiter clock stepped; offset mapping restarted", "channel", ch,
+			"uncertainty_us", uncertainty.Microseconds())
+	}
+}
+
+// group is one grant's slots as placed on the local clock: their moments,
+// breaker tickets, how late each may leave, and the clock mapping's
+// generation they were placed under.
+type group struct {
+	slots     []time.Time
+	tickets   []breaker.Ticket
+	tolerance time.Duration
+	gen       uint64
+}
+
 // claimGroup claims rows for a group of slots and starts one send per row,
 // each at its slot. A slot whose moment passed (by more than tolerance)
-// before a row was there for it is lost; so is a slot no row was found for.
-func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, slots []time.Time, tickets []breaker.Ticket, tolerance time.Duration, inflight *sync.WaitGroup) {
+// before a row was there for it is lost; so is a slot no row was found for,
+// and every slot of a group whose clock generation has moved on.
+func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr group, inflight *sync.WaitGroup) {
+	slots, tickets, tolerance := gr.slots, gr.tickets, gr.tolerance
 	i := 0
+	// stepped gives up the slots left when a clock step voided the group.
+	stepped := func() bool {
+		if w.clock.current(gr.gen) {
+			return false
+		}
+		w.m.gaveUp(ctx, cr.ch, giveUpClockStepped, len(slots)-i)
+		for ; i < len(slots); i++ {
+			cr.br.Cancel(tickets[i])
+		}
+		return true
+	}
+	if stepped() {
+		return
+	}
 	skipMissed := func(now time.Time) {
 		from := i
 		for i < len(slots) && now.After(slots[i].Add(tolerance)) {
@@ -433,12 +532,17 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, slots 
 		cr.pause(time.Now().Add(w.cfg.IdleMax))
 	}
 	skipMissed(time.Now())
+	voided := stepped() // the claimed rows then all go back below
 	// The group's claims are announced in one publish, beside the sends: a
 	// slow Valkey costs no slot. Each job's result event waits for it, so a
 	// job's processing event still goes out before its result.
 	announced := w.announce(sendCtx, jobs, inflight)
 	for _, job := range jobs {
 		jctx := jobContext(sendCtx, job)
+		if voided {
+			w.release(jctx, job, announced, "limiter clock stepped") // its slot is counted above
+			continue
+		}
 		if i == len(slots) {
 			w.m.gaveUp(ctx, cr.ch, giveUpClaimOutlasted, 1)
 			w.release(jctx, job, announced, "claim outlasted its slots")
@@ -449,7 +553,7 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, slots 
 		inflight.Add(1)
 		go func() { // owned by Run through inflight
 			defer inflight.Done()
-			w.sendAt(ctx, jctx, cr, job, announced, at, tk, tolerance)
+			w.sendAt(ctx, jctx, cr, job, announced, at, tk, tolerance, gr.gen)
 		}()
 	}
 	for ; i < len(slots); i++ {
@@ -475,9 +579,10 @@ func (w *Worker) announce(ctx context.Context, jobs []core.Job, inflight *sync.W
 }
 
 // sendAt sends job at its slot moment at, or releases it unsent when that
-// cannot happen within tolerance. Its result is published after announced
-// is closed (nil: at once).
-func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job, announced <-chan struct{}, at time.Time, tk breaker.Ticket, tolerance time.Duration) {
+// cannot happen within tolerance or a clock step has voided the slot's
+// generation gen. Its result is published after announced is closed (nil:
+// at once).
+func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job, announced <-chan struct{}, at time.Time, tk breaker.Ticket, tolerance time.Duration, gen uint64) {
 	sleep(ctx, time.Until(at))
 	if ctx.Err() != nil {
 		cr.br.Cancel(tk)
@@ -507,6 +612,15 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job,
 		cr.br.Cancel(tk)
 		w.m.gaveUp(ctx, cr.ch, giveUpSlotMissed, 1)
 		w.release(jctx, job, announced, "slot missed")
+		return
+	}
+	if !w.clock.current(gen) {
+		// A clock step may have restarted the limiter's schedule: this slot
+		// is on the old one and could leave beside the new one's.
+		callDone()
+		cr.br.Cancel(tk)
+		w.m.gaveUp(ctx, cr.ch, giveUpClockStepped, 1)
+		w.release(jctx, job, announced, "limiter clock stepped")
 		return
 	}
 	if !cr.br.Current(tk) {

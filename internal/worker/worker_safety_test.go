@@ -92,7 +92,7 @@ func TestWorkerMissedSlotIsReleasedNotSentLate(t *testing.T) {
 	tolerance := 5 * time.Millisecond
 	// The job reaches its send step three intervals after its slot (a slow
 	// claim, a timer late under load).
-	w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now().Add(-3*tolerance), tk, tolerance)
+	w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now().Add(-3*tolerance), tk, tolerance, 0)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if snd.calls.Load() != 0 || q.released != 1 || q.rows[jobs[0].ID].status != core.StatusPending {
@@ -177,7 +177,30 @@ func TestWorkerDoesNotSendWhenTheBreakerOpenedAfterTheClaim(t *testing.T) {
 	tk, _, _ := br.Allow() // admitted while closed
 	other, _, _ := br.Allow()
 	br.Done(other, false) // another call fails: the breaker opens
-	w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now(), tk, 5*time.Millisecond)
+	w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now(), tk, 5*time.Millisecond, 0)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if snd.calls.Load() != 0 || q.released != 1 {
+		t.Errorf("want no request and the job released; got %d requests, %d released", snd.calls.Load(), q.released)
+	}
+}
+
+func TestWorkerDoesNotSendASlotPlacedBeforeAClockStep(t *testing.T) {
+	q := newMemQueue()
+	q.add(1, core.ChannelSMS, core.PriorityHigh)
+	jobs, _ := q.Claim(t.Context(), core.ChannelSMS, core.PriorityHigh, 1, time.Minute)
+	snd := &countingSender{fn: accept}
+	w := New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: snd})
+	cr := w.newChannelRun(core.ChannelSMS, testPlaces(1, 0))
+	tk, _, _ := cr.br.Allow()
+	// The slot is placed under the mapping's generation; then a Take shows
+	// the limiter's clock 5 s ahead of where the mapping had it.
+	now, remote := time.Now(), time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	_, _, gen, _ := w.clock.observe(now, now.Add(time.Millisecond), remote)
+	if _, _, _, restarted := w.clock.observe(now.Add(time.Second), now.Add(time.Second+time.Millisecond), remote.Add(6*time.Second)); !restarted {
+		t.Fatal("a 5 s step did not restart the mapping")
+	}
+	w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now(), tk, 5*time.Millisecond, gen)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if snd.calls.Load() != 0 || q.released != 1 {

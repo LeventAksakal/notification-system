@@ -24,6 +24,7 @@ const (
 	giveUpBreakerOpened  giveUp = "breaker_opened"
 	giveUpLeaseTooShort  giveUp = "lease_too_short"
 	giveUpClockUncertain giveUp = "clock_uncertain"
+	giveUpClockStepped   giveUp = "clock_stepped"
 )
 
 // metrics are the worker's OpenTelemetry instruments. Attributes are the

@@ -18,10 +18,11 @@ import (
 func TestClockMapBounds(t *testing.T) {
 	epoch := time.Now()
 	remote0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
-	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
-	// A sample is a Take: local ms since epoch before and after, remote ms
+	us := func(n int) time.Duration { return time.Duration(n) * time.Microsecond }
+	// A sample is a Take: local us since epoch before and after, remote us
 	// since remote0 at the reservation. Offsets are reported relative to
-	// local epoch minus remote0.
+	// local epoch minus remote0, in ns. A sample of age a is widened by
+	// a*200e-6 on each side (20 us per 100 ms).
 	type sample struct{ sent, got, at int }
 	cases := []struct {
 		name         string
@@ -29,17 +30,22 @@ func TestClockMapBounds(t *testing.T) {
 		lower, upper time.Duration
 	}{
 		{"one sample bounds the offset by its round trip",
-			[]sample{{100, 110, 105}}, ms(-5), ms(5)},
+			[]sample{{100_000, 110_000, 105_000}}, -5_000_000, 5_000_000},
 		{"a faster round trip tightens the bounds",
-			[]sample{{100, 110, 105}, {200, 202, 201}}, ms(-1), ms(1)},
-		{"a slow round trip does not loosen them",
-			[]sample{{200, 202, 201}, {300, 340, 301}}, ms(-1), ms(1)},
+			[]sample{{100_000, 110_000, 105_000}, {200_000, 202_000, 201_000}}, -1_000_000, 1_000_000},
+		{"a slow round trip does not loosen them beyond the drift",
+			[]sample{{200_000, 202_000, 201_000}, {300_000, 340_000, 301_000}}, -1_000_000, 1_027_600},
 		{"bounds from different samples combine",
-			[]sample{{100, 120, 119}, {200, 220, 201}}, ms(-1), ms(1)},
+			[]sample{{100_000, 120_000, 119_000}, {200_000, 220_000, 201_000}}, -1_000_000, 1_020_000},
 		{"samples older than the window expire",
-			[]sample{{100, 102, 101}, {20_100, 20_140, 20_120}}, ms(-20), ms(20)},
+			[]sample{{100_000, 102_000, 101_000}, {20_100_000, 20_140_000, 20_120_000}}, -20_000_000, 20_000_000},
 		{"crossed bounds restart from the newest sample",
-			[]sample{{100, 102, 101}, {300, 302, 250}}, ms(50), ms(52)},
+			[]sample{{100_000, 102_000, 101_000}, {300_000, 302_000, 250_000}}, 50_000_000, 52_000_000},
+		// The offset was 1 ms at the first sample and is 1.5 ms 5 s later
+		// (100 ppm): without widening the upper bound would stay at 1 ms and
+		// place slots 0.5 ms early.
+		{"an old sample widens by its age, so drift within the allowance is never early",
+			[]sample{{0, 2_000, 1_000}, {5_000_000, 5_001_000, 4_999_200}}, 800_000, 1_800_000},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -47,16 +53,52 @@ func TestClockMapBounds(t *testing.T) {
 			base := -time.Duration(remote0.UnixNano())
 			var lower, upper time.Duration
 			for _, s := range tc.samples {
-				lower, upper = c.observe(epoch.Add(ms(s.sent)), epoch.Add(ms(s.got)), remote0.Add(ms(s.at)))
+				lower, upper, _, _ = c.observe(epoch.Add(us(s.sent)), epoch.Add(us(s.got)), remote0.Add(us(s.at)))
 			}
 			if lower-base != tc.lower || upper-base != tc.upper {
 				t.Fatalf("bounds [%s, %s], want [%s, %s]", lower-base, upper-base, tc.lower, tc.upper)
 			}
 			// A remote moment maps to local with the given offset.
-			if got := c.toLocal(remote0.Add(ms(7)), upper); got.Sub(epoch) != ms(7)+tc.upper {
-				t.Fatalf("toLocal: %s after epoch, want %s", got.Sub(epoch), ms(7)+tc.upper)
+			if got := c.toLocal(remote0.Add(us(7)), upper); got.Sub(epoch) != us(7)+tc.upper {
+				t.Fatalf("toLocal: %s after epoch, want %s", got.Sub(epoch), us(7)+tc.upper)
 			}
 		})
+	}
+}
+
+func TestClockMapGenerationMovesOnlyOnARestart(t *testing.T) {
+	epoch := time.Now()
+	remote0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
+	c := newClockMap(epoch, 10*time.Second)
+	_, _, g0, _ := c.observe(epoch.Add(ms(100)), epoch.Add(ms(102)), remote0.Add(ms(101)))
+	_, _, g1, r1 := c.observe(epoch.Add(ms(200)), epoch.Add(ms(230)), remote0.Add(ms(215))) // agrees, looser
+	if g1 != g0 || r1 || !c.current(g0) {
+		t.Fatalf("an agreeing sample moved the generation: %d -> %d (restarted %v)", g0, g1, r1)
+	}
+	_, _, g2, r2 := c.observe(epoch.Add(ms(300)), epoch.Add(ms(302)), remote0.Add(ms(5_301))) // 5 s step
+	if g2 == g0 || !r2 || c.current(g0) || !c.current(g2) {
+		t.Fatalf("a 5 s step: generation %d -> %d (restarted %v); the old one must be void", g0, g2, r2)
+	}
+}
+
+func TestClockMapUncertainty(t *testing.T) {
+	epoch := time.Now()
+	remote0 := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
+	c := newClockMap(epoch, 10*time.Second)
+	if u := c.uncertainty(epoch); u != unknown {
+		t.Fatalf("no sample: uncertainty %s, want unknown", u)
+	}
+	c.observe(epoch.Add(ms(100)), epoch.Add(ms(102)), remote0.Add(ms(101)))
+	if u := c.uncertainty(epoch.Add(ms(102))); u != ms(2) {
+		t.Fatalf("one fresh sample: uncertainty %s, want its round trip 2ms", u)
+	}
+	if u := c.uncertainty(epoch.Add(ms(5_102))); u != ms(4) {
+		t.Fatalf("5 s later: uncertainty %s, want 2ms + 2 x 1ms of drift", u)
+	}
+	if u := c.uncertainty(epoch.Add(ms(10_200))); u != unknown {
+		t.Fatalf("past the window: uncertainty %s, want unknown", u)
 	}
 }
 
@@ -85,6 +127,9 @@ func (l *delayedLimiter) Take(ctx context.Context, ch core.Channel, n int) (core
 	l.k++
 	l.mu.Unlock()
 	sleep(ctx, d)
+	if err := ctx.Err(); err != nil {
+		return core.Grant{}, err // as the real limiter: a cut call has no reply
+	}
 	return g, nil
 }
 
@@ -239,27 +284,286 @@ func TestWorkerDeliveryMetrics(t *testing.T) {
 			t.Errorf("provider call durations recorded for sms = %d, want 1", n)
 		}
 	})
-	t.Run("an uncertain limiter clock gives slots up and sends nothing", func(t *testing.T) {
+	t.Run("a slot placed before a limiter clock step is given up", func(t *testing.T) {
 		reader := sdkmetric.NewManualReader()
 		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 		defer func() { _ = mp.Shutdown(context.Background()) }()
 		q := newMemQueue()
-		q.add(5, core.ChannelSMS, core.PriorityHigh)
-		// Every reply takes longer than an interval: the offset is never
-		// known to within one interval, so no slot can be placed safely.
-		lim := &delayedLimiter{grid: newGridLimiter(10*time.Millisecond, 50*time.Millisecond), delays: []time.Duration{25 * time.Millisecond}}
+		q.add(1, core.ChannelSMS, core.PriorityHigh)
+		jobs, _ := q.Claim(t.Context(), core.ChannelSMS, core.PriorityHigh, 1, time.Minute)
 		snd := &countingSender{fn: accept}
-		cfg := testConfig()
-		cfg.Channels = []core.Channel{core.ChannelSMS}
-		stop := run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: snd, Meter: mp}))
-		waitFor(t, "slots given up", func() bool {
-			return counted(collect(t, reader), "notifier.slots.given_up", sms, attribute.String("reason", "clock_uncertain")) >= 3
+		w := New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: snd, Meter: mp})
+		cr := w.newChannelRun(core.ChannelSMS, testPlaces(1, 0))
+		tk, _, _ := cr.br.Allow()
+		now, remote := time.Now(), time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+		_, _, gen, _ := w.clock.observe(now, now.Add(time.Millisecond), remote)
+		w.clock.observe(now.Add(time.Second), now.Add(time.Second+time.Millisecond), remote.Add(6*time.Second)) // a 5 s step
+		w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now(), tk, 5*time.Millisecond, gen)
+		if n := counted(collect(t, reader), "notifier.slots.given_up", sms, attribute.String("reason", "clock_stepped")); n != 1 || snd.calls.Load() != 0 {
+			t.Fatalf("given_up{reason=clock_stepped} = %d and %d calls, want 1 and 0", n, snd.calls.Load())
+		}
+	})
+	t.Run("a lease too short to send gives the slot up", func(t *testing.T) {
+		reader := sdkmetric.NewManualReader()
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+		defer func() { _ = mp.Shutdown(context.Background()) }()
+		q := newMemQueue()
+		q.add(1, core.ChannelSMS, core.PriorityHigh)
+		later := func() time.Time { return time.Now().Add(2 * time.Hour) } // every lease looks over
+		snd := &countingSender{fn: accept}
+		stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: snd, Now: later, Meter: mp}))
+		waitFor(t, "a slot given up", func() bool {
+			return counted(collect(t, reader), "notifier.slots.given_up", sms, attribute.String("reason", "lease_too_short")) >= 1
 		})
 		if err := stop(); err != nil {
 			t.Fatal(err)
 		}
 		if n := snd.calls.Load(); n != 0 {
-			t.Fatalf("%d provider calls with the limiter's clock unknown to within an interval, want 0", n)
+			t.Fatalf("%d provider calls, want 0", n)
 		}
 	})
+}
+
+// While the limiter's clock is not known to within one interval the worker
+// reads it with Takes of no slots: it sends nothing and reserves nothing, so
+// the shared rate stays with the workers that can use it.
+func TestWorkerWithAnUncertainClockReservesNoSlot(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+	q := newMemQueue()
+	q.add(5, core.ChannelSMS, core.PriorityHigh)
+	// Every reply takes longer than an interval.
+	grid := newGridLimiter(10*time.Millisecond, 50*time.Millisecond)
+	lim := &delayedLimiter{grid: grid, delays: []time.Duration{25 * time.Millisecond}}
+	snd := &countingSender{fn: accept}
+	cfg := testConfig()
+	cfg.Channels = []core.Channel{core.ChannelSMS}
+	cfg.IdleMin, cfg.IdleMax = time.Millisecond, 20*time.Millisecond
+	stop := run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: snd, Meter: mp}))
+	waitFor(t, "five clock readings", func() bool {
+		grid.mu.Lock()
+		defer grid.mu.Unlock()
+		return grid.takes >= 5
+	})
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	if n := snd.calls.Load(); n != 0 {
+		t.Errorf("%d provider calls with the limiter's clock unknown to within an interval, want 0", n)
+	}
+	if n := len(lim.handedOut()); n != 0 {
+		t.Errorf("%d slots reserved while the clock was uncertain, want 0", n)
+	}
+	if n := counted(collect(t, reader), "notifier.slots.given_up", attribute.String("channel", "sms")); n != 0 {
+		t.Errorf("%d slots counted as given up, want 0: none was reserved", n)
+	}
+}
+
+// A cold start reads the clock before it reserves: no group is spent on an
+// unknown offset.
+func TestWorkerReadsTheClockBeforeItsFirstReservation(t *testing.T) {
+	grid := newGridLimiter(5*time.Millisecond, 20*time.Millisecond)
+	rec := &recordingLimiter{inner: grid}
+	q := newMemQueue()
+	q.add(3, core.ChannelSMS, core.PriorityHigh)
+	cfg := testConfig()
+	cfg.Channels = []core.Channel{core.ChannelSMS}
+	stop := run(t, New(cfg, Deps{Queue: q, Limiter: rec, Sender: scriptSender{accept}}))
+	waitFor(t, "all 3 sent", func() bool { return q.count(core.StatusSent) == 3 })
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	if ns := rec.asked(); len(ns) < 2 || ns[0] != 0 {
+		t.Fatalf("Takes asked for %v, want a reading of 0 slots first", ns)
+	}
+}
+
+// recordingLimiter remembers how many slots each Take asked for.
+type recordingLimiter struct {
+	inner core.Limiter
+	mu    sync.Mutex
+	ns    []int
+}
+
+func (l *recordingLimiter) Take(ctx context.Context, ch core.Channel, n int) (core.Grant, error) {
+	l.mu.Lock()
+	l.ns = append(l.ns, n)
+	l.mu.Unlock()
+	return l.inner.Take(ctx, ch, n)
+}
+
+func (l *recordingLimiter) asked() []int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.ns)
+}
+
+// steppingLimiter is the Valkey limiter over a clock the test controls: GCRA
+// with burst 1 (consecutive slots one interval apart, at most horizon ahead;
+// a schedule found stale restarts at now). Its clock runs on the local
+// monotonic clock plus an offset that step moves, as Valkey's TIME does when
+// the VM it runs in catches its clock up after a stall.
+type steppingLimiter struct {
+	interval, horizon time.Duration
+	start             time.Time // local, monotonic
+
+	mu     sync.Mutex
+	offset time.Duration
+	tat    map[core.Channel]time.Time // remote
+}
+
+func newSteppingLimiter(interval, horizon time.Duration) *steppingLimiter {
+	return &steppingLimiter{interval: interval, horizon: horizon, start: time.Now(), tat: map[core.Channel]time.Time{}}
+}
+
+func (l *steppingLimiter) step(d time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.offset += d
+}
+
+func (l *steppingLimiter) Take(_ context.Context, ch core.Channel, n int) (core.Grant, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := remoteBase.Add(time.Since(l.start) + l.offset)
+	tat := l.tat[ch]
+	if tat.Before(now) {
+		tat = now // stale: the schedule restarts at now
+	}
+	first := tat.Sub(now)
+	k := 0
+	if first <= l.horizon {
+		k = min(int((l.horizon-first)/l.interval)+1, n)
+	}
+	tat = tat.Add(time.Duration(k) * l.interval)
+	l.tat[ch] = tat
+	var wait time.Duration
+	if k < n {
+		wait = max(tat.Sub(now)-l.horizon, 0)
+	}
+	return core.Grant{N: k, At: now, First: first, Interval: l.interval, Wait: wait}, nil
+}
+
+// busiestFrom is the most sends in any sliding second (sends sorted) and the
+// send that window starts at.
+func busiestFrom(sends []time.Time) (int, time.Time) {
+	most, j := 0, 0
+	var at time.Time
+	for i := range sends {
+		for j < len(sends) && sends[j].Sub(sends[i]) < time.Second {
+			j++
+		}
+		if j-i > most {
+			most, at = j-i, sends[i]
+		}
+	}
+	return most, at
+}
+
+// R8 across a step of the limiter's clock: the limiter restarts a channel's
+// schedule at its new "now" while slots of the old one are still pending in
+// the workers. The first Take after the step, on any channel of a worker,
+// restarts that worker's clock mapping and so voids every slot it placed
+// before, on all its channels; without that, a channel whose own next sample
+// agrees with the restarted mapping would send its old slots beside the new
+// schedule's.
+func TestWorkersHoldTheRateAcrossALimiterClockStep(t *testing.T) {
+	const interval, perChannel = 10 * time.Millisecond, 300
+	paced := int(time.Second / interval)
+	chans := []core.Channel{core.ChannelSMS, core.ChannelEmail, core.ChannelPush}
+	q := newMemQueue()
+	for _, ch := range chans {
+		q.add(perChannel, ch, core.PriorityNormal)
+	}
+	lim := newSteppingLimiter(interval, 100*time.Millisecond)
+	snd := &channelSender{at: map[core.Channel][]time.Time{}}
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+	cfg := testConfig()
+	cfg.Channels = chans
+	cfg.Horizon = 100 * time.Millisecond
+	cfg.SendAlign = 100 * time.Millisecond
+	var stops []func() error
+	for range 2 {
+		stops = append(stops, run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: snd, Meter: mp})))
+	}
+	waitFor(t, "a steady stream before the step", func() bool { return snd.count() >= 300 })
+	stepAt := time.Now()
+	lim.step(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
+	for q.count(core.StatusSent) < perChannel*len(chans) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, stop := range stops {
+		if err := stop(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stepped := counted(collect(t, reader), "notifier.slots.given_up", attribute.String("reason", "clock_stepped"))
+	t.Logf("%d slots given up as clock_stepped", stepped)
+	for _, ch := range chans {
+		sends := snd.times(ch)
+		slices.SortFunc(sends, func(a, b time.Time) int { return a.Compare(b) })
+		after := 0
+		for _, s := range sends {
+			if s.After(stepAt.Add(time.Second)) {
+				after++
+			}
+		}
+		most, at := busiestFrom(sends)
+		t.Logf("%s: %d sends (%d more than 1 s after the step), busiest sliding second %d (paced %d) from %s after the step; per 100 ms from 0.5 s before: %v",
+			ch, len(sends), after, most, paced, at.Sub(stepAt).Round(time.Millisecond), per100(sends, stepAt.Add(-500*time.Millisecond), 15))
+		// A send may leave up to one interval after its slot, so a sliding
+		// second can hold one more than the paced rate.
+		if most > paced+1 {
+			t.Errorf("%s: busiest sliding second %d sends, want at most %d: the old and new schedules overlapped", ch, most, paced+1)
+		}
+		if len(sends) != perChannel || after == 0 {
+			t.Errorf("%s: %d of %d sent, %d after the step: sends must resume", ch, len(sends), perChannel, after)
+		}
+	}
+	if stepped == 0 {
+		t.Errorf("no slot counted as given up for the clock step")
+	}
+}
+
+// channelSender records when each request left, by channel.
+type channelSender struct {
+	mu sync.Mutex
+	at map[core.Channel][]time.Time
+}
+
+func (s *channelSender) Send(_ context.Context, m provider.Message) (provider.Response, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.at[m.Channel] = append(s.at[m.Channel], time.Now())
+	return provider.Response{Status: 202, MessageID: "m"}, nil
+}
+
+func (s *channelSender) times(ch core.Channel) []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.at[ch])
+}
+
+func (s *channelSender) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, ts := range s.at {
+		n += len(ts)
+	}
+	return n
+}
+
+func per100(sends []time.Time, from time.Time, n int) []int {
+	out := make([]int, n)
+	for _, s := range sends {
+		if k := int(s.Sub(from) / (100 * time.Millisecond)); s.After(from) && k < n {
+			out[k]++
+		}
+	}
+	return out
 }
