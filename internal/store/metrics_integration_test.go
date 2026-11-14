@@ -60,9 +60,13 @@ func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 	if _, err := db.ExecContext(t.Context(), `ANALYZE TABLE notifications, delivery_attempts`); err != nil {
 		t.Fatal(err)
 	}
-	window := int64(60_000_000)
+	var now time.Time
+	if err := db.QueryRowContext(t.Context(), `SELECT NOW(3)`).Scan(&now); err != nil {
+		t.Fatal(err)
+	}
+	since := now.Add(-time.Minute)
 	qs := metricsQueries(t)
-	latency, latencyArgs := store.LatencyQuery(time.Minute)
+	latency, latencyArgs := store.LatencyQuery(since)
 	cases := []struct {
 		name     string
 		query    string
@@ -70,11 +74,11 @@ func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 		index    string
 		windowed bool
 	}{
-		{"queue", qs["MetricsQueue"], nil, "claim_idx", false},
+		{"queue", qs["MetricsQueue"], []any{now, now, now, now}, "claim_idx", false},
 		{"status counts", qs["MetricsStatusCounts"], nil, "list_status_idx", false},
-		{"scheduled", qs["MetricsScheduled"], nil, "claim_idx", false},
-		{"finished in window", qs["MetricsFinished"], []any{window}, "finished_idx", true},
-		{"attempts in window", qs["MetricsAttempts"], []any{window}, "attempts_window_idx", true},
+		{"scheduled", qs["MetricsScheduled"], []any{now}, "claim_idx", false},
+		{"finished in window", qs["MetricsFinished"], []any{since}, "finished_idx", true},
+		{"attempts in window", qs["MetricsAttempts"], []any{since}, "attempts_window_idx", true},
 		{"latency in window", latency, latencyArgs, "finished_idx", true},
 	}
 	for _, tc := range cases {
@@ -122,8 +126,18 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 	exec(`UPDATE notifications SET due_at = NOW(3) + INTERVAL 1 HOUR, attempts = 1 WHERE id = ?`, retry[0])
 	insertListed(t, db, 1, core.ChannelEmail, core.StatusProcessing)
 	sent := insertListed(t, db, 4, core.ChannelPush, core.StatusSent)
+	// Latency runs from the first due time: the creation, or the schedule when
+	// later. due_at, moved by retries and releases, does not count.
+	firstDue := []struct{ createdAgoUs, scheduledAgoUs any }{
+		{100_000, nil},        // created 100 ms ago, never scheduled: 100
+		{200_000, 5_000_000},  // scheduled before its creation: from creation, 200
+		{10_000_000, 300_000}, // scheduled 300 ms ago, created long before: 300
+		{400_000, nil},        // 400
+	}
 	for i, id := range sent {
-		exec(`UPDATE notifications SET due_at = NOW(3) - INTERVAL ? MICROSECOND, finished_at = NOW(3) WHERE id = ?`, (i+1)*100_000, id)
+		exec(`UPDATE notifications SET created_at = NOW(3) - INTERVAL ? MICROSECOND,
+			scheduled_at = NOW(3) - INTERVAL ? MICROSECOND, due_at = NOW(3) - INTERVAL 5000 MICROSECOND,
+			finished_at = NOW(3) WHERE id = ?`, firstDue[i].createdAgoUs, firstDue[i].scheduledAgoUs, id)
 		exec(`INSERT INTO delivery_attempts (notification_id, attempt_no, channel, started_at, duration_ms, outcome)
 			VALUES (?, 1, 'push', NOW(3), 5, 'accepted')`, id)
 	}

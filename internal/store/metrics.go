@@ -80,17 +80,20 @@ func NewMetricsReader(db *sql.DB) *MetricsReader {
 	return &MetricsReader{db: db, q: sqlc.New(db)}
 }
 
-// LatencyQuery returns the percentile statement and its arguments for a
-// window. Percentiles are computed in MySQL with window functions (nearest
-// rank: the value at row ceil(p*n) in latency order), so only the rows at
-// the ranks travel, whatever the rate times the window is. The scan is a
-// finished_idx range over the window's finished rows (status = 'sent' is
-// checked in the index; due_at is read from the row).
-func LatencyQuery(window time.Duration) (string, []any) {
+// LatencyQuery returns the percentile statement and its arguments for the
+// window that starts at since. Latency runs from the first due time (the
+// creation, or the schedule when later; a retry or release moves due_at but
+// not this) to provider acceptance. Percentiles are computed in MySQL with
+// window functions (nearest rank: the value at row ceil(p*n) in latency
+// order), so only the rows at the ranks travel, whatever the rate times the
+// window is. The scan is a finished_idx range over the window's finished rows
+// (status = 'sent' is checked in the index; the times are read from the row).
+func LatencyQuery(since time.Time) (string, []any) {
 	return `WITH sent AS (
-  SELECT channel, GREATEST(CEIL(TIMESTAMPDIFF(MICROSECOND, due_at, finished_at) / 1000), 0) AS ms
+  SELECT channel, GREATEST(CEIL(TIMESTAMPDIFF(MICROSECOND,
+    GREATEST(COALESCE(scheduled_at, created_at), created_at), finished_at) / 1000), 0) AS ms
   FROM notifications FORCE INDEX (finished_idx)
-  WHERE finished_at >= NOW(3) - INTERVAL ? MICROSECOND AND status = 'sent'
+  WHERE finished_at >= ? AND status = 'sent'
 ), ranked AS (
   SELECT channel, ms,
     ROW_NUMBER() OVER (PARTITION BY channel ORDER BY ms) AS rn,
@@ -101,49 +104,63 @@ func LatencyQuery(window time.Duration) (string, []any) {
 )
 SELECT CAST(channel AS CHAR), CAST(ms AS SIGNED), rn, n, rn_all, n_all FROM ranked
 WHERE rn IN (CEIL(0.5 * n), CEIL(0.95 * n), CEIL(0.99 * n))
-   OR rn_all IN (CEIL(0.5 * n_all), CEIL(0.95 * n_all), CEIL(0.99 * n_all))`, []any{window.Microseconds()}
+   OR rn_all IN (CEIL(0.5 * n_all), CEIL(0.95 * n_all), CEIL(0.99 * n_all))`, []any{since}
 }
 
-// Read computes the metrics, with delivery over the last window.
+// Read computes the metrics, with delivery over the last window. Every query
+// runs in one read-only REPEATABLE READ transaction against one reading of
+// the database clock, so the numbers describe one moment and agree.
 func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics, error) {
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return Metrics{}, fmt.Errorf("metrics: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // read only: nothing to commit
+	q := r.q.WithTx(tx)
+	now, err := q.MetricsNow(ctx)
+	if err != nil {
+		return Metrics{}, fmt.Errorf("metrics clock: %w", err)
+	}
+	since := now.Add(-window)
+
 	m := Metrics{Totals: map[string]int{}}
 	queue := map[core.Channel]QueueDepth{}
-	rows, err := r.q.MetricsQueue(ctx)
+	rows, err := q.MetricsQueue(ctx, sqlc.MetricsQueueParams{Now: now})
 	if err != nil {
 		return Metrics{}, fmt.Errorf("metrics queue: %w", err)
 	}
-	for _, q := range rows {
-		ch := core.Channel(q.Channel)
-		queue[ch] = QueueDepth{Channel: ch, Pending: int(q.PendingDue), Scheduled: int(q.PendingLater),
-			Processing: int(q.Processing), OldestPendingAgeMs: max(int(q.OldestDueAgeMs), 0)}
+	for _, row := range rows {
+		ch := core.Channel(row.Channel)
+		queue[ch] = QueueDepth{Channel: ch, Pending: int(row.PendingDue), Scheduled: int(row.PendingLater),
+			Processing: int(row.Processing), OldestPendingAgeMs: max(int(row.OldestDueAgeMs), 0)}
 	}
 	for _, ch := range core.Channels {
-		q := queue[ch]
-		q.Channel = ch
-		m.Queue = append(m.Queue, q)
+		qd := queue[ch]
+		qd.Channel = ch
+		m.Queue = append(m.Queue, qd)
 	}
 
-	counts, err := r.q.MetricsStatusCounts(ctx)
+	counts, err := q.MetricsStatusCounts(ctx)
 	if err != nil {
 		return Metrics{}, fmt.Errorf("metrics status counts: %w", err)
 	}
 	for _, c := range counts {
 		m.Totals[string(c.Status)] = int(c.N)
 	}
-	scheduled, err := r.q.MetricsScheduled(ctx)
+	scheduled, err := q.MetricsScheduled(ctx, now)
 	if err != nil {
 		return Metrics{}, fmt.Errorf("metrics scheduled: %w", err)
 	}
-	// The API view splits scheduled out of pending (core.Status docs).
+	// The API view splits scheduled out of pending (core.Status docs). On one
+	// snapshot scheduled rows are a subset of pending ones; the clamp is a guard.
 	m.Totals["scheduled"] = int(scheduled)
-	m.Totals[string(core.StatusPending)] -= int(scheduled)
+	m.Totals[string(core.StatusPending)] = max(m.Totals[string(core.StatusPending)]-int(scheduled), 0)
 
-	us := window.Microseconds()
 	by := map[core.Channel]*Delivery{}
 	for _, ch := range core.Channels {
 		by[ch] = &Delivery{}
 	}
-	finished, err := r.q.MetricsFinished(ctx, us)
+	finished, err := q.MetricsFinished(ctx, sql.NullTime{Time: since, Valid: true})
 	if err != nil {
 		return Metrics{}, fmt.Errorf("metrics finished: %w", err)
 	}
@@ -152,7 +169,7 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 			d.Sent, d.Failed = int(f.Sent), int(f.Failed)
 		}
 	}
-	attempts, err := r.q.MetricsAttempts(ctx, us)
+	attempts, err := q.MetricsAttempts(ctx, since)
 	if err != nil {
 		return Metrics{}, fmt.Errorf("metrics attempts: %w", err)
 	}
@@ -161,7 +178,7 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 			d.Attempts, d.FailedAttempts = int(a.Attempts), int(a.FailedAttempts)
 		}
 	}
-	if err := r.latency(ctx, window, by, &m.Delivery.Latency); err != nil {
+	if err := latency(ctx, tx, since, by, &m.Delivery.Latency); err != nil {
 		return Metrics{}, err
 	}
 	for _, ch := range core.Channels {
@@ -175,9 +192,9 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 	return m, nil
 }
 
-func (r *MetricsReader) latency(ctx context.Context, window time.Duration, by map[core.Channel]*Delivery, all *Latency) error {
-	query, args := LatencyQuery(window)
-	rows, err := r.db.QueryContext(ctx, query, args...)
+func latency(ctx context.Context, tx *sql.Tx, since time.Time, by map[core.Channel]*Delivery, all *Latency) error {
+	query, args := LatencyQuery(since)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("metrics latency: %w", err)
 	}
