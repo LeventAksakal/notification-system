@@ -134,7 +134,7 @@ One binary, three roles: `app migrate`, `app serve`, `app worker` (plus two help
 - **Accepting.** A request is validated (spec, then service rules), templates are rendered, and the notification is stored in one transaction; a batch and its items are one transaction. The API answers `201` before anything is sent. An `Idempotency-Key` is stored in the same transaction, so the primary key decides the race between two identical requests.
 - **The queue is the table.** A notification is `pending` with a due time. Workers claim due rows with `SELECT … FOR UPDATE SKIP LOCKED` under READ COMMITTED through an index that matches the query's order, so claimers never wait for each other. A scheduled notification is simply a row whose due time is in the future; a retry is the same row with a later due time. Nothing sleeps holding a message.
 - **One state machine.** `pending → processing → sent | failed`, `pending → cancelled`, `processing → pending` (retry or expired lease), `failed → pending` (replay). Every change is a conditional `UPDATE … WHERE status = <from>`, so a cancel racing a worker has exactly one winner. Each provider call is one row in `delivery_attempts`.
-- **Rate limit.** A GCRA limiter in Valkey, on Valkey's clock, hands out send slots spaced one interval apart across all workers. A worker reserves the next slots, claims that many rows in one query, and sends each at its slot, placed on its own clock through an offset it learns from every call to Valkey, so a slow reply cannot shift a group of sends. Slots are reserved before rows are claimed, and a job that misses its slot is released, never sent late. The limiter paces 3% under the limit so arrival jitter cannot show the provider 101 in a second. If Valkey is unreachable the workers send nothing and readiness says so. The limit is the hard rule and throughput is what gives: a slot is given up when its claim takes longer than 200 ms or its timer wakes more than one interval (10 ms) late, so a starved machine or a slow database sends fewer than 97 per second rather than more than 100. Every run on the compose stack stayed at or under 100; one test run showed 106 in a second after the machine stalled for several seconds, a case the worker now guards against but which has not been re-measured on a real stack (measured numbers: [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md), row R8).
+- **Rate limit.** A GCRA limiter in Valkey, on Valkey's clock, hands out send slots spaced one interval apart across all workers. A worker reserves the next slots, claims that many rows in one query, and sends each at its slot, placed on its own clock through an offset it learns from every call to Valkey, so a slow reply cannot shift a group of sends. Slots are reserved before rows are claimed, and a job that misses its slot is released, never sent late. The limiter paces 5% under the limit (95 per second) so requests that arrive in a clump do not show the provider 101 in a second; at 3% a two-core machine reached 100, and 101 once. If Valkey is unreachable the workers send nothing and readiness says so. The limit is the hard rule and throughput is what gives: a slot is given up when its claim takes longer than 200 ms or its timer wakes more than one interval (10 ms) late, so a starved machine or a slow database sends fewer than 95 per second rather than more than 100. Every run on the compose stack stayed at or under 100; one test run showed 106 in a second after the machine stalled for several seconds, a case the worker now guards against but which has not been re-measured on a real stack (measured numbers: [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md), row R8).
 - **Priority.** Each channel's slots are split between high, normal and low by weights (70 / 20 / 10). A priority that has nothing due lends its slots to the next one, so high traffic gets everything when alone and low traffic always moves.
 - **Retries.** One classifier decides: network errors, timeouts, 408, 425, 429 and 5xx are retried with full-jitter exponential backoff, never sooner than `Retry-After`; any other 4xx fails at once. After five calls a notification is `failed` (`exhausted`): the dead letter, listed with `status=failed` and replayable.
 - **Circuit breaker.** Per channel, in each worker. While it is open the worker does not claim that channel's rows, so an outage burns no attempts and other channels keep their rate.
@@ -161,6 +161,14 @@ One MySQL node carries this design to the low thousands of messages per second. 
 
 Every application setting is an `APP_*` environment variable declared once in [`internal/config`](internal/config/config.go) with a default, bounds and a doc line. `go run ./cmd/app env` prints all of them as an env file, bounds included; a test fails if this table misses one.
 
+That declaration is the one shape every environment fits: local, test, stage, production. Values may differ between them; names, types and bounds may not. The binary refuses to start on a value that does not fit, and `app env check` runs the same validation without starting anything (it also reports an `APP_*` variable the service does not know, which is how a typo in a deploy manifest is caught, and never prints a secret):
+
+```bash
+docker compose run --rm app env check
+```
+
+Secrets (today only `APP_DATABASE_DSN`) have no default and are never committed. Where the service is deployed, the platform's secrets manager supplies them, either as the environment variable or as a mounted file named by `APP_DATABASE_DSN_FILE`. Locally nothing needs setting up: compose builds the DSN from the development-only database passwords below ([decision 0020](docs/decisions/0020-one-settings-schema-secrets-from-the-platform.md)).
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `APP_DATABASE_DSN` | required | MySQL DSN |
@@ -175,7 +183,7 @@ Every application setting is an `APP_*` environment variable declared once in [`
 | `APP_MAX_ATTEMPTS` | `5` | Provider calls before a notification is `exhausted` |
 | `APP_RETRY_BASE`, `APP_RETRY_CAP` | `1s`, `5m` | Backoff base and cap |
 | `APP_RATE_LIMIT_PER_SECOND` | `100` | The provider's limit per channel |
-| `APP_RATE_LIMIT_HEADROOM_PERCENT` | `3` | How far under the limit the limiter paces |
+| `APP_RATE_LIMIT_HEADROOM_PERCENT` | `5` | How far under the limit the limiter paces |
 | `APP_RATE_LIMIT_HORIZON` | `200ms` | How far ahead send slots are reserved |
 | `APP_PRIORITY_WEIGHTS` | `70,20,10` | Shares of high, normal, low |
 | `APP_LEASE_DURATION`, `APP_REAP_INTERVAL` | `30s`, `5s` | Claim lease; how often expired leases are returned |
@@ -208,7 +216,7 @@ Unit tests, then the integration tests: the packages' own tests against real MyS
 
 `go tool -modfile=tools.mod task check` is the full local gate (build, vet, lint, unit tests, vulnerabilities). CI runs a superset on every pull request and on `main`: race tests, the integration tests, the migration drift check, the image scan and a compose bring-up.
 
-The rate tests assert the cap (at most 100 in any second) everywhere, and the throughput floors (90 per second over a drain, 93 in steady state) on a machine that can keep time. CI's two-core runner cannot, so the workflow sets `ACCEPTANCE_RATE_FLOOR=40` there; the floors run in full with the command above. A loaded laptop can miss them for the same reason while the cap still holds; set `ACCEPTANCE_RATE_FLOOR=40` in the environment to run everything with the lower floors.
+The rate tests assert the cap (at most 100 in any second) everywhere, and the throughput floors (88 per second over a drain, 91 in steady state) on a machine that can keep time. CI's two-core runner cannot, so the workflow sets `ACCEPTANCE_RATE_FLOOR=40` there; the floors run in full with the command above. A loaded laptop can miss them for the same reason while the cap still holds; set `ACCEPTANCE_RATE_FLOOR=40` in the environment to run everything with the lower floors.
 
 ## Where things are
 
@@ -228,8 +236,19 @@ The rate tests assert the cap (at most 100 in any second) everywhere, and the th
 
 ## Develop
 
-Only Go and Docker are needed. Go tools are pinned in `tools.mod`; Atlas and Trivy run from Docker images pinned by digest. The commit hook is optional: install [lefthook](https://github.com/evilmartians/lefthook) and run `lefthook install`.
+Only Go and Docker are needed. Go tools are pinned in `tools.mod`; Atlas and Trivy run from Docker images pinned by digest. The commit hooks are optional: install [lefthook](https://github.com/evilmartians/lefthook) and run `lefthook install`. They format, vet and scan staged files and hold the commit subject to [Conventional Commits](https://www.conventionalcommits.org) (`type(scope): description`); CI checks the subjects of every pull request too.
 
 ```bash
 go tool -modfile=tools.mod task --list
 ```
+
+## Release
+
+`main` moves by fast-forward, so it holds exactly the commits CI tested ([decision 0021](docs/decisions/0021-fast-forward-main-releases-cut-by-hand.md)). Releases are cut by hand from a commit on `main` whose CI run is green:
+
+```bash
+gh workflow run release -f version=v1.0.0-rc.1   # a release candidate
+gh workflow run release -f version=v1.0.0        # a release; also tags the image `latest`
+```
+
+The workflow builds the service image, scans it, pushes it to the repository's package registry and creates the tag and the release notes from the commit subjects. Nothing is deployed by a push.

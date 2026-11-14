@@ -1,5 +1,5 @@
 ---
-status: open
+status: answered
 created: 2026-11-14
 tags: [rate-limit, headroom]
 ---
@@ -37,3 +37,4 @@ Still open after that fix, by reasoning, not seen:
 Option 1: the dial exists, no run exceeded the limit, and the choice trades the brief's hard number against throughput, which is the owner's call.
 
 ## Answer
+Owner, 14 Nov 2026: option 2, pace at 95. What decided it: pinned to two cores without the race detector the provider double saw 99 to 100 requests in one second, and CI (two cores, race detector) saw 101 once. `APP_RATE_LIMIT_HEADROOM_PERCENT` now defaults to 5; the throughput floors moved down by two with it. Recorded in decision 0009's "As built" section.
