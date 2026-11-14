@@ -100,7 +100,7 @@ var Dials = []Dial{
 		func(c *Config) *time.Duration { return &c.RetryCap }),
 	integer("APP_RATE_LIMIT_PER_SECOND", "100", "provider's send limit per channel, per second", 1, 100_000,
 		func(c *Config) *int { return &c.RateLimitPerSecond }),
-	integer("APP_RATE_LIMIT_HEADROOM_PERCENT", "3",
+	integer("APP_RATE_LIMIT_HEADROOM_PERCENT", "5",
 		"the limiter paces this many percent under the limit; send slots are exactly one interval apart, "+
 			"so 0 is exact at the limiter but leaves no room for arrival jitter at the provider", 0, 50,
 		func(c *Config) *int { return &c.RateLimitHeadroomPct }),

@@ -34,7 +34,8 @@ func TestLimiterHoldsTheRateAcrossTakers(t *testing.T) {
 	}
 	defer client.Close()
 
-	const rate, headroom, takers, run = 100, 3, 3, 4 * time.Second
+	// The deployed default: 100 per second paced 5% under, 95 per second.
+	const rate, headroom, takers, run = 100, 5, 3, 4 * time.Second
 	const horizon = 200 * time.Millisecond
 	var mu sync.Mutex
 	var grants []grant
@@ -116,8 +117,10 @@ func TestLimiterHoldsTheRateAcrossTakers(t *testing.T) {
 	if busiest > paced {
 		t.Errorf("busiest one-second window: %d slots, paced rate %d", busiest, paced)
 	}
-	if avg < 96.5 {
-		t.Errorf("average %.2f/s, want at least 96.5 (the paced rate must be used)", avg)
+	// The paced rate must be used: the average may fall short of the exact
+	// slot rate (1 s / interval, 94.99 for 95 per second) by half a slot.
+	if floor := float64(time.Second)/float64(interval) - 0.5; avg < floor {
+		t.Errorf("average %.2f/s, want at least %.2f (the paced rate must be used)", avg, floor)
 	}
 }
 

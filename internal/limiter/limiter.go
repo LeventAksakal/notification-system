@@ -74,8 +74,8 @@ var _ core.Limiter = (*Limiter)(nil)
 // reserves slots at most horizon ahead; the keys are "<prefix><channel>".
 //
 // The interval is rounded up to the microsecond, so the slots in any sliding
-// second never exceed the paced rate: 97 per second gives 10 310 us, and
-// ceil(1s / 10 310 us) = 97.
+// second never exceed the paced rate: 95 per second (100 with the default 5%
+// headroom) gives 10 527 us, and ceil(1s / 10 527 us) = 95.
 func New(client valkey.Client, perSecond, headroomPct int, horizon time.Duration, prefix string) *Limiter {
 	pace := float64(perSecond) * float64(100-headroomPct) / 100
 	if pace <= 0 {
