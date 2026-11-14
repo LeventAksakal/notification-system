@@ -36,7 +36,7 @@ curl -s -X POST localhost:8080/v1/notifications \
 ```
 
 ```json
-{"id":"0193…","to":"+905551234567","channel":"sms","priority":"high","status":"pending","attempts":0,"correlationId":"demo-1","…":"…"}
+{"id":"<uuid>","to":"+905551234567","channel":"sms","priority":"high","status":"pending","attempts":0,"correlationId":"demo-1","…":"…"}
 ```
 
 ```bash
@@ -56,23 +56,29 @@ curl -s -X POST localhost:8080/v1/notifications/batch \
 curl -s localhost:8080/v1/batches/<batchId>
 ```
 
-A template, and a notification scheduled for later that uses it:
+A template, and a notification that uses it, scheduled for one hour from now (`scheduledAt` may be up to 30 days ahead; on macOS use `date -u -v+1H`):
 
 ```bash
 curl -s -X PUT localhost:8080/v1/templates/welcome \
   -H 'Content-Type: application/json' -d '{"body":"Hello {{name}}, welcome aboard."}'
 curl -s -X POST localhost:8080/v1/notifications \
   -H 'Content-Type: application/json' \
-  -d '{"to":"ada@example.com","channel":"email","template":{"name":"welcome","variables":{"name":"Ada"}},"scheduledAt":"2030-01-01T09:00:00Z"}'
+  -d '{"to":"ada@example.com","channel":"email","template":{"name":"welcome","variables":{"name":"Ada"}},"scheduledAt":"'"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"'"}'
 ```
 
-Cancel it while it waits, list with filters, replay a dead letter, read the numbers:
+Its status is `scheduled`. Cancel it while it waits, list with filters, read the numbers:
 
 ```bash
 curl -s -X POST localhost:8080/v1/notifications/<id>/cancel
-curl -s 'localhost:8080/v1/notifications?status=failed&channel=sms&limit=20'
-curl -s -X POST localhost:8080/v1/notifications/<id>/retry
+curl -s 'localhost:8080/v1/notifications?status=cancelled&channel=email&limit=20'
 curl -s 'localhost:8080/v1/metrics?windowSeconds=60'
+```
+
+A notification that used up its attempts is `failed`: the dead letter. List them and replay one (a cancelled or sent notification answers 409):
+
+```bash
+curl -s 'localhost:8080/v1/notifications?status=failed'
+curl -s -X POST localhost:8080/v1/notifications/<failed id>/retry
 ```
 
 Live status events over WebSocket (every change, or one notification, or one batch):
@@ -139,6 +145,12 @@ One binary, three roles: `app migrate`, `app serve`, `app worker`. No process as
 ### What "sent once" means here
 
 Delivery is at-least-once. Duplicates are prevented on our side: client retries by `Idempotency-Key`, concurrent workers by the row lock and the lease version. A send whose outcome is unknown (a timeout after the provider accepted) is retried with the same `Idempotency-Key`, so it is delivered once only if the provider honours that key. The provider stand-in implements key dedupe as a switch (`PUT /_control/dedupe`), and the tests measure both cases.
+
+### Operating notes
+
+- `GET /v1/metrics` is computed from MySQL on every call and is not cached, so it always agrees with what a client just did; put it behind the same authentication and rate limiting as the rest of the API before exposing it.
+- The API has no authentication of its own; it is meant to sit behind a gateway.
+- If Valkey is down the API keeps accepting and answering, workers stop sending (they cannot see the shared rate limit), `/readyz` is 503, and WebSocket streams are closed rather than left with holes. Delivery resumes by itself when Valkey is back.
 
 ### What comes next at larger scale
 
