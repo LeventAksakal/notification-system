@@ -3,7 +3,7 @@
 Facts every lane builds against. No verdicts here; reasons are in `docs/decisions/`. The decision records are still `proposed`; this run builds to their recommended options (owner item 0001).
 
 ## Sources of truth
-- HTTP: `api/openapi.yaml` (v1.1.0). Schema: `schema/notifications.sql`. Vocabulary, state machine, limits, ports: `internal/core/` (`status.go`, `limits.go`, `ports.go`).
+- HTTP: `api/openapi.yaml` (v1.2.0). Schema: `schema/notifications.sql`. Vocabulary, state machine, limits, ports: `internal/core/` (`status.go`, `limits.go`, `ports.go`).
 - Only the coordinator edits those. A lane that needs a change writes `.agents/owner-items/NNNN-<slug>.md`, takes the nearest assumption that needs no contract change, and continues.
 - Generated, never hand-edited: `internal/api/api.gen.go`, `internal/store/sqlc/`, `migrations/`. Regenerate with `go tool -modfile=tools.mod task gen`.
 
@@ -31,7 +31,7 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 - Breaker per channel per worker process: open on failure ratio over a window, half-open probe after a cool-down. While open the worker does not claim that channel; nothing is counted as an attempt.
 - Lease: claim sets `lease_until` and increments `claim_version`; every later write carries `WHERE claim_version = ?`; a reaper returns expired leases to `pending`.
 - Claim transaction: READ COMMITTED, `FOR UPDATE SKIP LOCKED`, `ORDER BY due_at` matching `claim_idx`; `due_at <= NOW(3)` on the database clock.
-- Events: every committed status change is published once through `core.Publisher` (Valkey pub/sub).
+- Events: every committed status change is published once through `core.Publisher` (Valkey pub/sub). Publishing never delays a response by more than one bounded wait per request, whatever the number of events (a batch is one pipelined publish with one deadline). When an API instance loses its event feed it closes its WebSocket streams and refuses new ones until the feed is back.
 
 ## Settings (all in `internal/config`, each with default, bounds, doc line)
 | Variable | Default | Meaning |
