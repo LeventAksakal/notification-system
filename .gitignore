@@ -4,3 +4,7 @@
 .env.*
 !.env.example
 CLAUDE.local.md
+# build and test output
+*.exe
+*.test
+coverage.out

@@ -3,7 +3,7 @@
 Facts every lane builds against. No verdicts here; reasons are in `docs/decisions/`. The decision records are still `proposed`; this run builds to their recommended options (owner item 0001).
 
 ## Sources of truth
-- HTTP: `api/openapi.yaml` (v1.2.0). Schema: `schema/notifications.sql`. Vocabulary, state machine, limits, ports: `internal/core/` (`status.go`, `limits.go`, `ports.go`).
+- HTTP: `api/openapi.yaml` (v1.3.0). Schema: `schema/notifications.sql`. Vocabulary, state machine, limits, ports: `internal/core/` (`status.go`, `limits.go`, `ports.go`).
 - Only the coordinator edits those. A lane that needs a change writes `.agents/owner-items/NNNN-<slug>.md`, takes the nearest assumption that needs no contract change, and continues.
 - Generated, never hand-edited: `internal/api/api.gen.go`, `internal/store/sqlc/`, `migrations/`. Regenerate with `go tool -modfile=tools.mod task gen`.
 
