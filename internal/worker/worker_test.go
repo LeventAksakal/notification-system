@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -448,46 +449,129 @@ func TestBackoff(t *testing.T) {
 	}
 }
 
-// slowPublisher takes delay per batch call, like a slow Valkey, and records
-// each event when its call is over. Single events (the results) go out at
-// once, so a result not held back for its processing event would overtake it.
-type slowPublisher struct {
+// gatedPublisher holds every batch call (the processing events) until open is
+// called, like a Valkey that does not answer, and records the batch's events
+// when its call is over. Single events (the results) go out at once, so a
+// result not held back for its processing event would overtake it.
+type gatedPublisher struct {
 	recPublisher
-	delay time.Duration
+	gate chan struct{}
+	once sync.Once
 }
 
-func (p *slowPublisher) PublishAll(ctx context.Context, es []core.Event) error {
-	sleep(ctx, p.delay)
+func newGatedPublisher() *gatedPublisher { return &gatedPublisher{gate: make(chan struct{})} }
+
+func (p *gatedPublisher) open() { p.once.Do(func() { close(p.gate) }) }
+
+func (p *gatedPublisher) PublishAll(ctx context.Context, es []core.Event) error {
+	select {
+	case <-p.gate:
+	case <-ctx.Done():
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.events = append(p.events, es...)
 	return nil
 }
 
+// The processing publish does not return until every job has been sent: were
+// it on the claim path, nothing would be sent at all, whatever the timing. A
+// timer woken late on a busy machine may still give a slot up and release a
+// job (correct, and not what this test is about); the job is then claimed and
+// sent again, so the test does not count releases. Each result must wait for
+// its own processing event: nothing is published while that is held, and once
+// it is let through no job has more results than processing events at any
+// point of its event sequence. (A released job's pending event and its next
+// claim's events wait for different publishes, so their mutual order is not
+// asserted.)
 func TestWorkerSlowPublishCostsNoSlotAndKeepsEventOrder(t *testing.T) {
 	q := newMemQueue()
 	q.add(12, core.ChannelSMS, core.PriorityHigh)
-	pub := &slowPublisher{delay: 300 * time.Millisecond}
+	pub := newGatedPublisher()
+	defer pub.open()
 	stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{accept}, Publisher: pub}))
-	waitFor(t, "all 12 sent", func() bool { return q.count(core.StatusSent) == 12 })
+	waitFor(t, "all 12 sent while their processing publish does not return", func() bool {
+		return q.count(core.StatusSent) == 12
+	})
+	pub.mu.Lock()
+	early := fmt.Sprint(pub.events)
+	n := len(pub.events)
+	pub.mu.Unlock()
+	if n != 0 {
+		t.Errorf("published before the processing publish returned: %s, want nothing", early)
+	}
+	pub.open()
+	ids := make([]string, 12)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("sms-high-%d", i)
+	}
+	// balance is how many processing events of id have no result yet; -1 when
+	// a result came before its processing event.
+	balance := func(got []core.Status) int {
+		n := 0
+		for _, st := range got {
+			if st == core.StatusProcessing {
+				n++
+			} else if n--; n < 0 {
+				return -1
+			}
+		}
+		return n
+	}
 	waitFor(t, "every result published", func() bool {
-		pub.mu.Lock()
-		defer pub.mu.Unlock()
-		return len(pub.events) == 24
+		for _, id := range ids {
+			got := pub.statuses(id)
+			if !slices.Contains(got, core.StatusSent) || balance(got) > 0 {
+				return false
+			}
+		}
+		return true
 	})
 	if err := stop(); err != nil {
 		t.Fatal(err)
 	}
-	q.mu.Lock()
-	released := q.released
-	q.mu.Unlock()
-	if released != 0 {
-		t.Errorf("%d jobs released unsent while the publish was slow, want none", released)
-	}
-	for i := range 12 {
-		id := fmt.Sprintf("sms-high-%d", i)
-		if got := pub.statuses(id); fmt.Sprint(got) != "[processing sent]" {
-			t.Errorf("%s events: want [processing sent], got %v", id, got)
+	for _, id := range ids {
+		if got := pub.statuses(id); balance(got) != 0 || got[0] != core.StatusProcessing {
+			t.Errorf("%s events: %v, want each result after a processing event of its own", id, got)
 		}
+	}
+}
+
+// slowFirstClaim makes the first claim take delay, longer than the group's
+// slots last, so its rows come back with no slot left.
+type slowFirstClaim struct {
+	*memQueue
+	delay time.Duration
+	once  sync.Once
+}
+
+func (q *slowFirstClaim) Claim(ctx context.Context, ch core.Channel, p core.Priority, n int, lease time.Duration) ([]core.Job, error) {
+	q.once.Do(func() { sleep(ctx, q.delay) })
+	return q.memQueue.Claim(ctx, ch, p, n, lease)
+}
+
+// Rows a claim brought back too late for its slots are released off the claim
+// path: their release event waits for the processing publish, the channel's
+// next claim does not, so the rows are claimed again and sent while that
+// publish still has not returned.
+func TestWorkerReleaseOfAnOutlastedClaimDoesNotWaitForThePublish(t *testing.T) {
+	mq := newMemQueue()
+	mq.add(12, core.ChannelSMS, core.PriorityHigh)
+	q := &slowFirstClaim{memQueue: mq, delay: 100 * time.Millisecond} // slots span 20 ms
+	pub := newGatedPublisher()
+	defer pub.open()
+	stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{accept}, Publisher: pub}))
+	waitFor(t, "all 12 sent while the processing publish does not return", func() bool {
+		return mq.count(core.StatusSent) == 12
+	})
+	mq.mu.Lock()
+	released := mq.released
+	mq.mu.Unlock()
+	if released == 0 {
+		t.Error("no row released: the first claim did not outlast its slots, the test proves nothing")
+	}
+	pub.open()
+	if err := stop(); err != nil {
+		t.Fatal(err)
 	}
 }

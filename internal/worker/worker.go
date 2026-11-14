@@ -537,15 +537,31 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr gro
 	// slow Valkey costs no slot. Each job's result event waits for it, so a
 	// job's processing event still goes out before its result.
 	announced := w.announce(sendCtx, jobs, inflight)
+	// Jobs without a slot go back off the claim path too: their release event
+	// waits for the publish, which must not hold up the channel's next claim.
+	var back []core.Job
+	reason := "claim outlasted its slots"
+	if voided {
+		reason = "limiter clock stepped" // the slots are counted above
+	}
+	defer func() {
+		for _, job := range back {
+			inflight.Add(1)
+			go func() { // owned by Run through inflight
+				defer inflight.Done()
+				w.release(jobContext(sendCtx, job), job, announced, reason)
+			}()
+		}
+	}()
 	for _, job := range jobs {
 		jctx := jobContext(sendCtx, job)
 		if voided {
-			w.release(jctx, job, announced, "limiter clock stepped") // its slot is counted above
+			back = append(back, job)
 			continue
 		}
 		if i == len(slots) {
 			w.m.gaveUp(ctx, cr.ch, giveUpClaimOutlasted, 1)
-			w.release(jctx, job, announced, "claim outlasted its slots")
+			back = append(back, job)
 			continue
 		}
 		at, tk := slots[i], tickets[i]
