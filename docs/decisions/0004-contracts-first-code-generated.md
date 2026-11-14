@@ -22,3 +22,6 @@ Pending. Recommended: option 1. List pagination is keyset (`created_at, id` curs
 
 ## Confirmation
 CI runs `go generate ./...` and fails on any diff; `task migrate:check` fails when `schema/` and `migrations/` disagree; the guard hook denies edits to generated paths.
+
+## As built (14 Nov 2026)
+List pagination is keyset on `id` alone (`ORDER BY id DESC`, `internal/store/list.go`): ids are UUIDv7, so id order is creation order and one column replaces the `created_at, id` pair. The indexes are `(channel, id)` and `(status, id)`.

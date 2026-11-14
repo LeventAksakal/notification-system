@@ -8,7 +8,7 @@ Router, not a manual. Every line is something you could not work out from the co
 - Owner items you raise: `.agents/owner-items/NNNN-<slug>.md` (question, options, the assumption you took). Never stop to ask; take the assumption and continue.
 - Work log: `.agents/logs/YYYY-MM/DD.md`, one line per pivot or mistake caught.
 
-## Commands (all via Go, no other installs)
+## Commands (all via Go; lefthook and gitleaks are separate, optional installs)
 - `lefthook install` once per clone: pre-commit runs gofmt, gitleaks and go vet on staged files.
 - `go tool -modfile=tools.mod task --list` lists every command. Alias it: `T="go tool -modfile=tools.mod"`.
 - While iterating: `go test ./internal/<pkg> -run <Test>`; the narrowest check that can fail.

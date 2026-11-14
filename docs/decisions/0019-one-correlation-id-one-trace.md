@@ -22,3 +22,6 @@ Pending. Recommended: option 1. Health: `/healthz` says the process is up; `/rea
 
 ## Confirmation
 Acceptance test: send a request with a known correlation id; the provider double received that id, and the log lines of the API and the worker for that notification all carry it. A trace query shows the delivery span linked to the request span.
+
+## As built (14 Nov 2026)
+Built as option 2, not the recommended option 1: the worker's delivery span is a child of the stored `traceparent`, so one trace shows the request, the queue wait and the provider call (`TestB5TraceparentToProvider`). The cost named under option 2 stands: a scheduled or retried send makes a long trace and a batch a wide one. Owner items 0006 and 0007.

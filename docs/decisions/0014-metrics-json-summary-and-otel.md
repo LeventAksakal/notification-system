@@ -22,3 +22,6 @@ Pending. Recommended: option 1. It answers the brief's three numbers correctly f
 
 ## Confirmation
 Acceptance test: create N notifications against a provider double that fails a known share; the endpoint's depth, success count and failure count equal what the test produced, read through any API instance.
+
+## As built (14 Nov 2026)
+Not cached: every call reads MySQL in one read-only snapshot, so the numbers always agree with what a client just did. The window is a `windowSeconds` parameter (default 60, at most 3600), not fixed 1 and 5 minute windows. Queue depth is per channel (pending, scheduled, processing, oldest due age), not per priority. Through OpenTelemetry the workers export delivery attempts by channel and outcome, provider call duration, and slots given up by channel and reason, beside the HTTP server metrics; queue depth is not exported. Read cost at size: owner item 0012.

@@ -22,3 +22,6 @@ Pending. Recommended: option 1. Batch status returns counts per notification sta
 
 ## Confirmation
 Acceptance tests: 1000 valid items create 1000 rows and one batch; 1001 items are refused; 999 valid plus 1 invalid creates no rows and the error names index and field.
+
+## As built (14 Nov 2026)
+All valid answers `201` with the batch, not `202` (`api/openapi.yaml`): the rows exist when the response is written.

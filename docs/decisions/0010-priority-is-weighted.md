@@ -24,3 +24,6 @@ Pending. Recommended: option 2. The weights are dials; whether low should be abl
 ## Confirmation
 - 10,000 low notifications queued, then one high: the high one is sent within 2 seconds.
 - High traffic saturating a channel for 30 seconds: low still sends at no less than its share.
+
+## As built (14 Nov 2026)
+The confirmation run uses 5,000 low notifications, not 10,000 (`TestDeliveryR9Priority`): the high one was sent 213 to 251 ms after its POST.

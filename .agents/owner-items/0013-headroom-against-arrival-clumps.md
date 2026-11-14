@@ -1,0 +1,32 @@
+---
+status: open
+created: 2026-11-14
+tags: [rate-limit, headroom]
+---
+# How far under 100 the limiter paces (0013)
+
+## Question
+The limiter paces at 97 per second (`APP_RATE_LIMIT_HEADROOM_PERCENT=3`). Is three percent enough room for requests that leave on time but arrive at the provider in a clump?
+
+## Context
+The provider counts by arrival. The worker guarantees that a request leaves within one interval (10.3 ms) of its slot; what happens between that check and the provider's clock (a stalled process, the network, the provider's own accept loop) it cannot see. The arithmetic: a one-second window at the provider stays at or under 100 while lateness plus arrival jitter is under 20.7 ms; lateness may use 10.3 ms of that, leaving about 10 ms for the rest.
+
+Measured 14 Nov on the compose stack, busiest second per channel at the provider:
+
+| Run | Busiest second |
+|---|---|
+| 3 workers, 9,000 messages, quiet (after the clock fix) | 98, 98, 98 |
+| the same with MySQL killed, Valkey killed, Valkey paused 14 times | 98, 98, 98 each |
+| 6 workers, 30,000 messages | 100, 100, 99 |
+
+In the six-worker run exactly one window of the 10,000 email arrivals reached 100; it starts with four arrivals inside 5 ms, a clump after a stall. No run went over 100.
+
+## Options
+1. Keep 3%. Trade-off: one more clumped arrival in such a window would show the provider 101.
+2. Pace at 95 (5%): the room for clumps grows from about 10 ms to about 31 ms. Trade-off: 2% less throughput; the rate tests' floors (93 steady state, 95 for low priority alone) and every "97" in the documents move with it.
+3. Keep 97 and halve the lateness a send may have (5 ms). Trade-off: about 5 ms more room, paid for with more slots given up whenever a timer wakes late.
+
+## Assumption taken
+Option 1: the dial exists, no run exceeded the limit, and the choice trades the brief's hard number against throughput, which is the owner's call.
+
+## Answer

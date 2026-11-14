@@ -22,3 +22,6 @@ Pending. Recommended: option 1. Because rendering happens at intake, editing a t
 
 ## Confirmation
 Acceptance tests: template plus variables yields the expected content at the provider double; a missing variable is refused; a rendering that exceeds the channel limit is refused; editing the template after acceptance does not change the queued content.
+
+## As built (14 Nov 2026)
+Templates have a name and a body, no channel: the channel's limits are checked on the rendered content of each notification. A missing variable is a `400` naming the field, like every other validation error (`422` is kept for a reused `Idempotency-Key`); variables the template does not use are ignored.

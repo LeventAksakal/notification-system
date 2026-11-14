@@ -22,3 +22,6 @@ Pending. Recommended: option 1. The unique index, not a read-then-write check, d
 
 ## Confirmation
 Acceptance tests: the same request twice returns the same ids and creates one set of rows; twenty concurrent copies create one set of rows; the same key with a different body returns 422.
+
+## As built (14 Nov 2026)
+There is no `409` for a request still in flight: the second of two concurrent identical requests loses on the unique index, then reads and replays the first one's stored response (`internal/intake/service.go`). The key must be printable ASCII (contract 1.1.0).
