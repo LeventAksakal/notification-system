@@ -390,9 +390,11 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, slots 
 		cr.pause(time.Now().Add(w.cfg.IdleMax))
 	}
 	skipMissed(time.Now())
+	// The group's claims are announced in one publish: with Valkey slow or
+	// down, the sends wait for one bounded publish, not one per job.
+	w.publishAll(sendCtx, jobs, core.StatusProcessing)
 	for _, job := range jobs {
 		jctx := jobContext(sendCtx, job)
-		w.publish(jctx, job, core.StatusProcessing, job.Attempts, "")
 		if i == len(slots) {
 			w.release(jctx, job, "claim outlasted its slots")
 			continue
@@ -665,6 +667,36 @@ func (w *Worker) publish(ctx context.Context, job core.Job, st core.Status, atte
 	}
 }
 
+// batchPublisher is a Publisher that sends many events as one call with one
+// bounded wait (realtime.Publisher).
+type batchPublisher interface {
+	PublishAll(ctx context.Context, es []core.Event) error
+}
+
+// publishAll announces that jobs moved to st (their attempts unchanged), in
+// order: in one call when the publisher has a batch form, else one by one.
+func (w *Worker) publishAll(ctx context.Context, jobs []core.Job, st core.Status) {
+	if w.deps.Publisher == nil || len(jobs) == 0 {
+		return
+	}
+	bp, ok := w.deps.Publisher.(batchPublisher)
+	if !ok {
+		for _, job := range jobs {
+			w.publish(jobContext(ctx, job), job, st, job.Attempts, "")
+		}
+		return
+	}
+	now := time.Now().UTC()
+	es := make([]core.Event, len(jobs))
+	for i, job := range jobs {
+		es[i] = core.Event{NotificationID: job.ID, BatchID: job.BatchID, Status: st, Attempts: job.Attempts,
+			At: now, CorrelationID: job.CorrelationID}
+	}
+	if err := bp.PublishAll(ctx, es); err != nil {
+		slog.WarnContext(ctx, "publish status changes", "status", st, "count", len(es), "err", err)
+	}
+}
+
 // reaper returns expired leases to pending and publishes each change.
 func (w *Worker) reaper(ctx context.Context) {
 	t := time.NewTicker(w.cfg.ReapInterval)
@@ -683,9 +715,7 @@ func (w *Worker) reaper(ctx context.Context) {
 			slog.InfoContext(ctx, "returned expired leases to pending", "count", len(jobs))
 		}
 		// What was reaped is committed even when a later batch failed.
-		for _, job := range jobs {
-			w.publish(jobContext(ctx, job), job, core.StatusPending, job.Attempts, "")
-		}
+		w.publishAll(ctx, jobs, core.StatusPending)
 	}
 }
 
