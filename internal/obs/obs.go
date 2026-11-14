@@ -67,7 +67,7 @@ func Setup(ctx context.Context, service, endpoint string, level slog.Level) (fun
 	otel.SetLoggerProvider(lp)
 
 	bridge := otelslog.NewHandler(service, otelslog.WithLoggerProvider(lp))
-	slog.SetDefault(slog.New(slog.NewMultiHandler(stdout, levelFilter{contextHandler{bridge}, level})))
+	slog.SetDefault(slog.New(slog.NewMultiHandler(stdout, levelFilter{plainValues{contextHandler{bridge}}, level})))
 
 	return func(ctx context.Context) error {
 		return errors.Join(tp.Shutdown(ctx), mp.Shutdown(ctx), lp.Shutdown(ctx))
