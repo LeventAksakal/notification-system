@@ -390,13 +390,14 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, slots 
 		cr.pause(time.Now().Add(w.cfg.IdleMax))
 	}
 	skipMissed(time.Now())
-	// The group's claims are announced in one publish: with Valkey slow or
-	// down, the sends wait for one bounded publish, not one per job.
-	w.publishAll(sendCtx, jobs, core.StatusProcessing)
+	// The group's claims are announced in one publish, beside the sends: a
+	// slow Valkey costs no slot. Each job's result event waits for it, so a
+	// job's processing event still goes out before its result.
+	announced := w.announce(sendCtx, jobs, inflight)
 	for _, job := range jobs {
 		jctx := jobContext(sendCtx, job)
 		if i == len(slots) {
-			w.release(jctx, job, "claim outlasted its slots")
+			w.release(jctx, job, announced, "claim outlasted its slots")
 			continue
 		}
 		at, tk := slots[i], tickets[i]
@@ -404,7 +405,7 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, slots 
 		inflight.Add(1)
 		go func() { // owned by Run through inflight
 			defer inflight.Done()
-			w.sendAt(ctx, jctx, cr, job, at, tk, tolerance)
+			w.sendAt(ctx, jctx, cr, job, announced, at, tk, tolerance)
 		}()
 	}
 	for ; i < len(slots); i++ {
@@ -412,13 +413,31 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, slots 
 	}
 }
 
+// announce publishes that jobs are processing, in a goroutine owned by Run
+// through inflight. The returned channel is closed once that publish is over;
+// it is nil when there is nothing to publish.
+func (w *Worker) announce(ctx context.Context, jobs []core.Job, inflight *sync.WaitGroup) <-chan struct{} {
+	if w.deps.Publisher == nil || len(jobs) == 0 {
+		return nil
+	}
+	done := make(chan struct{})
+	inflight.Add(1)
+	go func() { // owned by Run through inflight; one bounded publish
+		defer inflight.Done()
+		defer close(done)
+		w.publishAll(ctx, jobs, core.StatusProcessing)
+	}()
+	return done
+}
+
 // sendAt sends job at its slot moment at, or releases it unsent when that
-// cannot happen within tolerance.
-func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job, at time.Time, tk breaker.Ticket, tolerance time.Duration) {
+// cannot happen within tolerance. Its result is published after announced
+// is closed (nil: at once).
+func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job, announced <-chan struct{}, at time.Time, tk breaker.Ticket, tolerance time.Duration) {
 	sleep(ctx, time.Until(at))
 	if ctx.Err() != nil {
 		cr.br.Cancel(tk)
-		w.release(jctx, job, "shutdown before the send")
+		w.release(jctx, job, announced, "shutdown before the send")
 		return
 	}
 	late := at.Add(tolerance)
@@ -429,7 +448,7 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job,
 		if ctx.Err() != nil {
 			reason = "shutdown before the send"
 		}
-		w.release(jctx, job, reason)
+		w.release(jctx, job, announced, reason)
 		return
 	}
 	// The place is held for the provider call only, not for the database
@@ -440,16 +459,16 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job,
 	if time.Now().After(late) {
 		callDone()
 		cr.br.Cancel(tk)
-		w.release(jctx, job, "slot missed")
+		w.release(jctx, job, announced, "slot missed")
 		return
 	}
 	if !cr.br.Current(tk) {
 		// The breaker opened after the claim: nothing goes out (decision 0008).
 		callDone()
-		w.release(jctx, job, "breaker opened before the send")
+		w.release(jctx, job, announced, "breaker opened before the send")
 		return
 	}
-	w.deliver(jctx, job, cr.br, tk, callDone)
+	w.deliver(jctx, job, announced, cr.br, tk, callDone)
 }
 
 // pause makes the channel loop reserve nothing until until.
@@ -538,15 +557,16 @@ func jobContext(ctx context.Context, job core.Job) context.Context {
 // The call ends leaseMargin before the lease does (or at the provider
 // timeout, whichever is first); with less than minSendTime of lease left it is
 // not made and the job is released. callDone is called once the provider
-// call is over (or will not be made).
-func (w *Worker) deliver(ctx context.Context, job core.Job, br *breaker.Breaker, tk breaker.Ticket, callDone func()) {
+// call is over (or will not be made). The result is published after
+// announced is closed.
+func (w *Worker) deliver(ctx context.Context, job core.Job, announced <-chan struct{}, br *breaker.Breaker, tk breaker.Ticket, callDone func()) {
 	left := job.LeaseUntil.Sub(w.deps.Now()) - leaseMargin
 	if left < minSendTime {
 		callDone()
 		br.Cancel(tk)
 		slog.WarnContext(ctx, "lease too close to its end to send; released", "channel", job.Channel,
 			"lease_left_ms", (left + leaseMargin).Milliseconds())
-		w.release(ctx, job, "lease too short")
+		w.release(ctx, job, announced, "lease too short")
 		return
 	}
 	// The delivery span continues the accepting request's trace (B5): it is a
@@ -577,7 +597,7 @@ func (w *Worker) deliver(ctx context.Context, job core.Job, br *breaker.Breaker,
 		// Shutdown aborted the call: not an attempt; give the job back.
 		br.Cancel(tk)
 		span.SetStatus(codes.Error, "aborted by shutdown")
-		w.release(ctx, job, "shutdown aborted the call")
+		w.release(ctx, job, announced, "shutdown aborted the call")
 		return
 	}
 	if err != nil && cut {
@@ -639,11 +659,12 @@ func (w *Worker) deliver(ctx context.Context, job core.Job, br *breaker.Breaker,
 	if status != core.StatusSent {
 		errText = v.Error
 	}
-	w.publish(ctx, job, status, attempts, errText)
+	w.publish(ctx, job, announced, status, attempts, errText)
 }
 
-// release returns an unsent job to pending, due now, without an attempt.
-func (w *Worker) release(ctx context.Context, job core.Job, reason string) {
+// release returns an unsent job to pending, due now, without an attempt, and
+// publishes that after announced is closed.
+func (w *Worker) release(ctx context.Context, job core.Job, announced <-chan struct{}, reason string) {
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)
 	defer cancel()
 	if err := w.deps.Queue.Release(wctx, job, time.Now()); err != nil {
@@ -651,12 +672,17 @@ func (w *Worker) release(ctx context.Context, job core.Job, reason string) {
 		return
 	}
 	slog.DebugContext(ctx, "released unsent notification", "channel", job.Channel, "reason", reason)
-	w.publish(ctx, job, core.StatusPending, job.Attempts, "")
+	w.publish(ctx, job, announced, core.StatusPending, job.Attempts, "")
 }
 
-func (w *Worker) publish(ctx context.Context, job core.Job, st core.Status, attempts int, errText string) {
+// publish announces job's move to st once after is closed (nil: at once), so
+// it follows the event published before it.
+func (w *Worker) publish(ctx context.Context, job core.Job, after <-chan struct{}, st core.Status, attempts int, errText string) {
 	if w.deps.Publisher == nil {
 		return
+	}
+	if after != nil {
+		<-after // closed when one bounded publish is over
 	}
 	err := w.deps.Publisher.Publish(ctx, core.Event{
 		NotificationID: job.ID, BatchID: job.BatchID, Status: st, Attempts: attempts,
@@ -682,7 +708,7 @@ func (w *Worker) publishAll(ctx context.Context, jobs []core.Job, st core.Status
 	bp, ok := w.deps.Publisher.(batchPublisher)
 	if !ok {
 		for _, job := range jobs {
-			w.publish(jobContext(ctx, job), job, st, job.Attempts, "")
+			w.publish(jobContext(ctx, job), job, nil, st, job.Attempts, "")
 		}
 		return
 	}
