@@ -164,7 +164,7 @@ Every application setting is an `APP_*` environment variable declared once in [`
 That declaration is the one shape every environment fits: local, test, stage, production. Values may differ between them; names, types and bounds may not. The binary refuses to start on a value that does not fit, and `app env check` runs the same validation without starting anything (it also reports an `APP_*` variable the service does not know, which is how a typo in a deploy manifest is caught, and never prints a secret):
 
 ```bash
-docker compose run --rm app env check
+docker compose run --rm --no-deps app env check
 ```
 
 Secrets (today only `APP_DATABASE_DSN`) have no default and are never committed. Where the service is deployed, the platform's secrets manager supplies them, either as the environment variable or as a mounted file named by `APP_DATABASE_DSN_FILE`. Locally nothing needs setting up: compose builds the DSN from the development-only database passwords below ([decision 0020](docs/decisions/0020-one-settings-schema-secrets-from-the-platform.md)).
