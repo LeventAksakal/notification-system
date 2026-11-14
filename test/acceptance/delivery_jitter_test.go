@@ -25,7 +25,8 @@ import (
 // time from the reply's arrival) the busiest second per channel (sms, email,
 // push) measured 100/100/100 at 30 ms (passes, at the edge), 102/102/102 at
 // 60 ms and 107/106/108 at 120 ms; 60 ms is the smallest of the three that
-// breaks the cap, in line with roughly 97 + d/10.3 ms.
+// breaks the cap, in line with roughly 97 + d/10.3 ms (those runs paced at
+// 97/s, 3 % headroom; at today's 95/s the same reasoning gives 95 + d/10.5 ms).
 const dlJitterMax = 60 * time.Millisecond
 
 // jitterProxy forwards a local port to target. Data from the client to target
@@ -173,7 +174,8 @@ func (p *jitterProxy) close() {
 // the worker maps a group of send slots to local time from the moment the
 // limiter's reply arrives, so a reply delayed by d shifts the whole group up
 // to d late, on top of the next group; under compose two channels showed 100
-// in one second after a Valkey restart (a quiet run shows 98 to 99).
+// in one second after a Valkey restart (a quiet run at the then 3 % headroom
+// showed 98 to 99).
 // Dials: dlFastEnv; 700 per channel queued before 3 workers start; the
 // workers reach Valkey through jitterProxy (0..dlJitterMax per chunk from
 // Valkey to the worker). Only the cap is asserted: with jitter the correct

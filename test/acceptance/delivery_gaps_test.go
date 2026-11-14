@@ -247,7 +247,7 @@ func (s *stack) dgFirstArrival(t *testing.T, channel string) time.Time {
 // absolute rate floor here measured the runner, not isolation).
 // Dials: dgB1Env with APP_MAX_ATTEMPTS=5; sms requests are held 2 s against a
 // 500 ms timeout for 6 s while email and push drain a 900 backlog each
-// (9 s at 97/s, so both are still busy when the outage ends).
+// (about 9.5 s at 95/s, so both are still busy when the outage ends).
 func TestGapDeliveryB1HangingOutage(t *testing.T) {
 	const perFast, perSMS = 900, 300
 	const outage = 6 * time.Second
@@ -279,12 +279,12 @@ func TestGapDeliveryB1HangingOutage(t *testing.T) {
 
 	// Probe-level bound. Before the breaker can open, the first calls must
 	// time out (500 ms); add the 200 ms reservation horizon and 100 ms slack:
-	// at most 97/s * 0.8 s ~ 78 requests. Once open, each of the 3 worker
+	// at most 95/s * 0.8 s ~ 76 requests. Once open, each of the 3 worker
 	// processes sends one probe per 1 s cool-down at most: 3 * (6 + 1) = 21.
-	// Bound 100, against ~580 the limiter alone would allow in 6 s.
+	// Bound 100, against ~570 the limiter alone would allow in 6 s.
 	const smsBound = 100
 	smsDuring := dlReceivedIn(s.dlRequests(fakeprovider.Filter{Channel: "sms"}), start, cleared)
-	t.Logf("sms requests during the %s hang: %d (bound %d; limiter alone ~%.0f)", cleared.Sub(start).Round(time.Millisecond), smsDuring, smsBound, 97*cleared.Sub(start).Seconds())
+	t.Logf("sms requests during the %s hang: %d (bound %d; limiter alone ~%.0f)", cleared.Sub(start).Round(time.Millisecond), smsDuring, smsBound, dlPacedRate*cleared.Sub(start).Seconds())
 	if smsDuring > smsBound {
 		t.Errorf("sms requests during the hang: %d, want at most %d (probe level): the channel did not pause", smsDuring, smsBound)
 	}
@@ -363,8 +363,8 @@ func TestGapDeliveryB1HungChannelDoesNotStallOthers(t *testing.T) {
 // paused (decision 0008: while open the worker does not claim that channel and
 // nothing is counted as an attempt).
 // Dials: dgB1Env with APP_MAX_ATTEMPTS=3; an sms 503 outage of 8 s.
-// Why this fails without the breaker: at 97/s the limiter would cycle the 200
-// sms through 3 failed calls each within ~6.2 s (claims go by due_at, so each
+// Why this fails without the breaker: at 95/s the limiter would cycle the 200
+// sms through 3 failed calls each within ~6.3 s (claims go by due_at, so each
 // round takes the whole backlog before a retry comes up), and with backoff of
 // at most 1 s per retry every one would be failed/exhausted before the 8 s
 // outage ends. With the breaker only the calls before it opens and one probe

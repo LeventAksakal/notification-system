@@ -29,6 +29,17 @@ import (
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
 )
 
+// The limiter dials every stack starts with (harness_test.go) and the rate
+// they pace at. Every throughput floor is written as dlPacedRate minus its
+// margin, so a change of headroom is this one place. The cap (at most
+// dlRateLimit per channel in any second) does not depend on the headroom.
+const (
+	dlRateLimit       = 100 // APP_RATE_LIMIT_PER_SECOND
+	dlRateHeadroomPct = 5   // APP_RATE_LIMIT_HEADROOM_PERCENT (default since 14 Nov; 3 before)
+	// dlPacedRate is the limiter's rate per channel: one slot per 10.53 ms.
+	dlPacedRate = dlRateLimit * (100 - dlRateHeadroomPct) / 100.0 // 95/s
+)
+
 // dlRateFloorEnv names the test-run knob that relaxes throughput floors on a
 // constrained runner (CI's 2-core runner sets it to 40). It only ever lowers
 // "at least N requests per second" floors (each becomes min(strict, value));

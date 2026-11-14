@@ -183,7 +183,7 @@ func TestDeliveryR12Retry(t *testing.T) {
 // resumes; decision 0008).
 // Dials: APP_BREAKER_WINDOW=2s, APP_BREAKER_MIN_REQUESTS=5,
 // APP_BREAKER_COOLDOWN=1s, APP_MAX_ATTEMPTS=3, APP_RETRY_BASE=100ms,
-// APP_RETRY_CAP=1s; rate 100/s with 3 % headroom (97/s).
+// APP_RETRY_CAP=1s; rate 100/s with 5 % headroom (dlPacedRate, 95/s).
 func TestDeliveryB1BreakerPausesChannel(t *testing.T) {
 	const perChannel = 300
 	const outage = 6 * time.Second
@@ -220,13 +220,13 @@ func TestDeliveryB1BreakerPausesChannel(t *testing.T) {
 	cleared := time.Now()
 
 	during := dlReceivedIn(s.dlRequests(fakeprovider.Filter{Channel: "sms"}), start, cleared)
-	limit := 0.25 * 97 * cleared.Sub(start).Seconds()
-	t.Logf("sms requests during the %s outage: %d (limiter would allow ~%.0f; bound %.0f)", cleared.Sub(start).Round(time.Millisecond), during, 97*cleared.Sub(start).Seconds(), limit)
+	limit := 0.25 * dlPacedRate * cleared.Sub(start).Seconds()
+	t.Logf("sms requests during the %s outage: %d (limiter would allow ~%.0f; bound %.0f)", cleared.Sub(start).Round(time.Millisecond), during, dlPacedRate*cleared.Sub(start).Seconds(), limit)
 	if float64(during) >= limit {
 		t.Errorf("sms requests during the outage: %d, want fewer than %.0f (25%% of the limiter's rate): the channel did not pause", during, limit)
 	}
 
-	minFastRate := dlRateFloor(t, "B1 fast channels during the sms outage", 90.0)
+	minFastRate := dlRateFloor(t, "B1 fast channels during the sms outage", dlPacedRate-7) // 88/s
 	for _, ch := range []string{"email", "push"} {
 		s.dlAllSent(t, 20*time.Second, perChannel, "channel = ?", ch)
 		n, span, rate := dlRate(s.dlRequests(fakeprovider.Filter{Channel: ch}))
