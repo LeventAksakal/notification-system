@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math/rand/v2"
 	"time"
 	"unicode/utf8"
 
@@ -195,14 +196,18 @@ func (s *Queue) Release(ctx context.Context, job core.Job, dueAt time.Time) erro
 	if err := core.Transition(core.StatusProcessing, core.StatusPending); err != nil {
 		return err
 	}
-	affected, err := s.q.ReleaseLease(ctx, sqlc.ReleaseLeaseParams{DelayUs: delayUs(dueAt), ID: job.ID, ClaimVersion: job.ClaimVersion})
-	if err != nil {
-		return fmt.Errorf("release %s: %w", job.ID, err)
-	}
-	if affected == 0 {
-		return fmt.Errorf("release %s: %w", job.ID, core.ErrLeaseLost)
-	}
-	return nil
+	// One autocommit statement: a deadlock or lock wait timeout rolled it
+	// back, so trying it again cannot apply it twice.
+	return retryLockConflict(ctx, func() error {
+		affected, err := s.q.ReleaseLease(ctx, sqlc.ReleaseLeaseParams{DelayUs: delayUs(dueAt), ID: job.ID, ClaimVersion: job.ClaimVersion})
+		if err != nil {
+			return fmt.Errorf("release %s: %w", job.ID, err)
+		}
+		if affected == 0 {
+			return fmt.Errorf("release %s: %w", job.ID, core.ErrLeaseLost)
+		}
+		return nil
+	})
 }
 
 // ReapExpired returns notifications whose lease ran out to pending and
@@ -272,19 +277,35 @@ func (s *Queue) reapOnce(ctx context.Context) ([]core.Job, error) {
 	return jobs, nil
 }
 
-// lockRetries is how often a transaction InnoDB rolled back as a deadlock
-// victim or after a lock wait timeout is tried again.
+// lockRetries is how many times in all a transaction is run while InnoDB
+// rolls it back as a deadlock victim or after a lock wait timeout.
 const lockRetries = 4
 
+// lockBackoff is the mean wait before the first retry; the n-th retry waits
+// n times as long, jittered by ±50% so two victims of one deadlock do not
+// collide again in step.
+const lockBackoff = 2 * time.Millisecond
+
+// lockJitter returns a uniform value in [0, n); a variable so a test can pin it.
+var lockJitter = func(n int64) int64 { return rand.Int64N(n) } //nolint:gosec // jitter, not security
+
 // retryLockConflict runs fn again when InnoDB rolled it back for a lock
-// conflict; the whole transaction is retried, never a single statement.
+// conflict; fn must be a whole transaction (or one autocommit statement),
+// never a single statement inside one. A failed fn must leave nothing
+// committed: a lock conflict error guarantees it, since the statement that
+// got it was rolled back and the transaction is rolled back before fn returns.
+// It gives up when ctx is done and returns the last error.
 func retryLockConflict(ctx context.Context, fn func() error) error {
 	var err error
 	for i := range lockRetries {
 		if err = fn(); err == nil || !IsLockConflict(err) {
 			return err
 		}
-		t := time.NewTimer(time.Duration(i+1) * 2 * time.Millisecond)
+		if i == lockRetries-1 {
+			break
+		}
+		base := int64(i+1) * int64(lockBackoff)
+		t := time.NewTimer(time.Duration(base/2 + lockJitter(base)))
 		select {
 		case <-ctx.Done():
 			t.Stop()
