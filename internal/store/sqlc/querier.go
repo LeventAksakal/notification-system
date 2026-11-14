@@ -7,6 +7,7 @@ package sqlc
 import (
 	"context"
 	"database/sql"
+	"time"
 )
 
 type Querier interface {
@@ -56,20 +57,24 @@ type Querier interface {
 	// Oldest first (attempts_notification_idx).
 	ListDeliveryAttempts(ctx context.Context, notificationID string) ([]DeliveryAttempt, error)
 	ListTemplates(ctx context.Context) ([]Template, error)
-	// Provider calls started in the window, per channel, from attempts_window_idx
-	// (started_at, channel, outcome) alone.
-	MetricsAttempts(ctx context.Context, windowUs interface{}) ([]MetricsAttemptsRow, error)
-	// Notifications that reached sent or failed in the window, per channel, from
-	// finished_idx (finished_at, status, channel) alone.
-	MetricsFinished(ctx context.Context, windowUs interface{}) ([]MetricsFinishedRow, error)
-	// Unfinished notifications per channel, on the database clock, read from
-	// claim_idx (status, channel, priority, due_at) alone: an index range over the
-	// pending and processing rows, no table reads. pending_due is what a worker
-	// may claim now; oldest_due_age_ms is how long the oldest of those has waited.
-	MetricsQueue(ctx context.Context) ([]MetricsQueueRow, error)
-	// Pending notifications shown as scheduled (never tried, due later): a
+	// Provider calls started in the window (since its start), per channel, from
+	// attempts_window_idx (started_at, channel, outcome) alone.
+	MetricsAttempts(ctx context.Context, since time.Time) ([]MetricsAttemptsRow, error)
+	// Notifications that reached sent or failed in the window (since its
+	// start), per channel, from finished_idx (finished_at, status, channel) alone.
+	MetricsFinished(ctx context.Context, since sql.NullTime) ([]MetricsFinishedRow, error)
+	// Every metrics statement runs in one read-only REPEATABLE READ transaction
+	// and takes the database clock, read once with SELECT NOW(3), as an
+	// argument, so the numbers of one summary agree with each other.
+	MetricsNow(ctx context.Context) (time.Time, error)
+	// Unfinished notifications per channel, read from claim_idx (status, channel,
+	// priority, due_at) alone: an index range over the pending and processing
+	// rows, no table reads. pending_due is what a worker may claim at now;
+	// oldest_due_age_ms is how long the oldest of those has waited.
+	MetricsQueue(ctx context.Context, arg MetricsQueueParams) ([]MetricsQueueRow, error)
+	// Pending notifications shown as scheduled (never tried, due after now): a
 	// claim_idx range over the not-yet-due pending rows, reading attempts.
-	MetricsScheduled(ctx context.Context) (int64, error)
+	MetricsScheduled(ctx context.Context, now time.Time) (int64, error)
 	// Stored status counts over the whole table, from list_status_idx alone (an
 	// index scan, no table reads).
 	MetricsStatusCounts(ctx context.Context) ([]MetricsStatusCountsRow, error)
