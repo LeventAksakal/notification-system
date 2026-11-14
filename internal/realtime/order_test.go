@@ -2,6 +2,7 @@ package realtime
 
 import (
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -120,4 +121,62 @@ func TestCoveredDropsOnlyWhatTheSnapshotAlreadyShows(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSequencerStaysWithinItsCap(t *testing.T) {
+	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	ev := func(id string, st core.Status, origin Origin) Message {
+		return Message{Origin: origin, Event: core.Event{NotificationID: id, Status: st, At: t0}}
+	}
+	id := func(i int) string { return "n" + strconv.Itoa(i) }
+
+	t.Run("the oldest remembered notification is forgotten past the cap", func(t *testing.T) {
+		s := newCappedSequencer(holdFor, rememberFor, 3)
+		for i := range 5 {
+			s.push(ev(id(i), core.StatusPending, OriginAPI), t0.Add(time.Duration(i)*time.Millisecond))
+		}
+		if len(s.last) != 3 {
+			t.Fatalf("remembered: want 3, got %d", len(s.last))
+		}
+		// The newest is still known: its claim goes straight out.
+		if out := s.push(ev(id(4), core.StatusProcessing, OriginWorker), t0); len(out) != 1 {
+			t.Fatalf("claim of a remembered pending: want it delivered at once, got %v", labels(out))
+		}
+		// The oldest was forgotten: its claim is held, then released.
+		if out := s.push(ev(id(0), core.StatusProcessing, OriginWorker), t0); len(out) != 0 {
+			t.Fatalf("claim of a forgotten notification: want it held, got %v", labels(out))
+		}
+		if out := s.expire(t0.Add(holdFor)); !slices.Equal(labels(out), []string{"processing"}) {
+			t.Fatalf("held claim after the hold: got %v", labels(out))
+		}
+	})
+
+	t.Run("at the cap of holds a claim is forwarded without hold-back", func(t *testing.T) {
+		s := newCappedSequencer(holdFor, rememberFor, 2)
+		for i := range 2 {
+			if out := s.push(ev(id(i), core.StatusProcessing, OriginWorker), t0); len(out) != 0 {
+				t.Fatalf("claim %d: want held, got %v", i, labels(out))
+			}
+		}
+		if out := s.push(ev(id(2), core.StatusProcessing, OriginWorker), t0); !slices.Equal(labels(out), []string{"processing"}) {
+			t.Fatalf("claim past the cap: want delivered at once, got %v", labels(out))
+		}
+		if len(s.held) != 2 || len(s.last) > 2 {
+			t.Fatalf("past the cap: held %d, remembered %d", len(s.held), len(s.last))
+		}
+	})
+
+	t.Run("expiry of many notifications leaves nothing behind", func(t *testing.T) {
+		s := newCappedSequencer(holdFor, time.Minute, 1000)
+		for i := range 5000 {
+			s.push(Message{Origin: OriginAPI, Event: core.Event{NotificationID: "x" + strconv.Itoa(i), Status: core.StatusPending}}, t0)
+		}
+		if len(s.last) != 1000 || s.lru.Len() != 1000 {
+			t.Fatalf("remembered: map %d, list %d, want 1000 each", len(s.last), s.lru.Len())
+		}
+		s.expire(t0.Add(2 * time.Minute))
+		if len(s.last) != 0 || s.lru.Len() != 0 {
+			t.Fatalf("after ttl: map %d, list %d", len(s.last), s.lru.Len())
+		}
+	})
 }

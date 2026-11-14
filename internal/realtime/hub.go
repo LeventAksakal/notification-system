@@ -20,6 +20,10 @@ var (
 	ErrSlow = errors.New("subscriber too slow; events were dropped")
 	// ErrClosed ends a subscription because the hub stopped.
 	ErrClosed = errors.New("event hub stopped")
+	// ErrFeedLost ends every subscription when the hub's Valkey subscription
+	// drops (changes in the gap would be missed), and refuses new ones until
+	// it is back.
+	ErrFeedLost = errors.New("status event feed lost; resubscribe and read the snapshot")
 )
 
 const (
@@ -56,7 +60,7 @@ type Subscription struct {
 	err    error // set under hub.mu before ch is closed
 }
 
-// Err is why C was closed: ErrSlow, ErrClosed, or nil after Close.
+// Err is why C was closed: ErrSlow, ErrFeedLost, ErrClosed, or nil after Close.
 func (s *Subscription) Err() error {
 	s.hub.mu.Lock()
 	defer s.hub.mu.Unlock()
@@ -96,13 +100,17 @@ func NewHub(client valkey.Client) *Hub {
 // now reach this hub's subscribers.
 func (h *Hub) Live() bool { return h.live.Load() }
 
-// Subscribe registers a subscriber with a buffer of buf events. Events
-// published after it returns, while the hub is live, are delivered.
+// Subscribe registers a subscriber with a buffer of buf events. Every event
+// published after it returns is delivered, or the subscription ends: it is
+// refused with ErrFeedLost while the hub is not live.
 func (h *Hub) Subscribe(f Filter, buf int) (*Subscription, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
 		return nil, ErrClosed
+	}
+	if !h.live.Load() {
+		return nil, ErrFeedLost
 	}
 	ch := make(chan core.Event, max(buf, 1))
 	s := &Subscription{C: ch, ch: ch, filter: f, hub: h}
@@ -126,6 +134,7 @@ func (h *Hub) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			break
 		}
+		h.feedLost(ctx)
 		if h.now().Sub(started) > retryMax {
 			wait = 100 * time.Millisecond
 		}
@@ -151,12 +160,34 @@ func (h *Hub) Run(ctx context.Context) error {
 	return nil
 }
 
+// feedLost ends every subscription with ErrFeedLost: events published while
+// the subscription was down are gone, and a stream with holes is worse than a
+// closed one (the client reconnects and reads the snapshot). What was held
+// for ordering is dropped with them.
+func (h *Hub) feedLost(ctx context.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.live.Store(false)
+	h.seq = newSequencer(holdFor, rememberFor)
+	n := len(h.subs)
+	for s := range h.subs {
+		h.drop(s, ErrFeedLost)
+	}
+	if n > 0 {
+		slog.WarnContext(ctx, "status event feed lost; closed every stream", "streams", n)
+	}
+}
+
 // listen holds one subscription until it fails or ctx ends.
 func (h *Hub) listen(ctx context.Context) error {
 	dc, release := h.client.Dedicate()
 	defer release()
 	defer dc.Close() // the connection carries the subscription; never reuse it
-	defer h.live.Store(false)
+	defer func() {
+		h.mu.Lock() // Subscribe reads live under h.mu: none slips in unended
+		h.live.Store(false)
+		h.mu.Unlock()
+	}()
 	gone := dc.SetPubSubHooks(valkey.PubSubHooks{
 		OnMessage: func(m valkey.PubSubMessage) { h.receive(ctx, m.Message) },
 		OnSubscription: func(s valkey.PubSubSubscription) {

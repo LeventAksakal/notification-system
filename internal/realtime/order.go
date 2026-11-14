@@ -1,6 +1,7 @@
 package realtime
 
 import (
+	"container/list"
 	"time"
 
 	"github.com/LeventAksakal/notification-system/internal/core"
@@ -28,26 +29,49 @@ import (
 // a claim never follows it with the same attempts). A release or reap
 // (worker, no error) can be either; it counts as the predecessor when its
 // time is not after the held claim's.
+//
+// Memory is capped (maxTracked): past the cap the oldest remembered
+// notification is forgotten (its next claim is merely held), and a claim
+// that would need a hold while the cap is reached goes out unheld.
 type sequencer struct {
 	hold time.Duration
 	ttl  time.Duration
-	last map[string]seen
-	held map[string]*heldQueue
+	max  int // cap on remembered and on held notifications
+	// last is each remembered notification's last delivered state; lru
+	// orders the same entries by receive time, oldest first, so expiry and
+	// eviction look only at the front.
+	last map[string]*list.Element // of *seen
+	lru  *list.List
+	// held are the claims waiting for their predecessor; holds lists them by
+	// creation, which is deadline order (every hold is equally long).
+	held  map[string]*heldQueue
+	holds *list.List // of *heldQueue
 }
 
 type seen struct {
+	id       string
 	status   core.Status
 	attempts int
 	at       time.Time // local receive time, for expiry
 }
 
 type heldQueue struct {
+	id    string
 	msgs  []Message
 	until time.Time
 }
 
+// maxTracked is the sequencer's default cap: notifications in flight at
+// once on this hub is far below it at 100 sends per second per channel.
+const maxTracked = 50_000
+
 func newSequencer(hold, ttl time.Duration) *sequencer {
-	return &sequencer{hold: hold, ttl: ttl, last: map[string]seen{}, held: map[string]*heldQueue{}}
+	return newCappedSequencer(hold, ttl, maxTracked)
+}
+
+func newCappedSequencer(hold, ttl time.Duration, maxEntries int) *sequencer {
+	return &sequencer{hold: hold, ttl: ttl, max: max(maxEntries, 1),
+		last: map[string]*list.Element{}, lru: list.New(), held: map[string]*heldQueue{}, holds: list.New()}
 }
 
 // push takes one message and returns what may be delivered now, in order.
@@ -65,9 +89,13 @@ func (s *sequencer) push(m Message, now time.Time) []Message {
 		}
 		return out
 	}
-	if m.Status == core.StatusProcessing {
-		if l, ok := s.last[id]; !ok || l.status != core.StatusPending || l.attempts != m.Attempts {
-			s.held[id] = &heldQueue{msgs: []Message{m}, until: now.Add(s.hold)}
+	// With as many holds as the cap allows, a claim goes out unheld: order is
+	// best effort, memory is not.
+	if m.Status == core.StatusProcessing && len(s.held) < s.max {
+		if e, ok := s.last[id]; !ok || e.Value.(*seen).status != core.StatusPending || e.Value.(*seen).attempts != m.Attempts {
+			q := &heldQueue{id: id, msgs: []Message{m}, until: now.Add(s.hold)}
+			s.held[id] = q
+			s.holds.PushBack(q)
 			return nil
 		}
 	}
@@ -75,33 +103,46 @@ func (s *sequencer) push(m Message, now time.Time) []Message {
 }
 
 // expire releases holds that ran out and forgets notifications not heard of
-// for ttl.
+// for ttl. It looks only at the oldest entries: cost is what it removes.
 func (s *sequencer) expire(now time.Time) []Message {
 	var out []Message
-	for id, q := range s.held {
-		if now.Before(q.until) {
-			continue
+	for f := s.holds.Front(); f != nil; f = s.holds.Front() {
+		q := f.Value.(*heldQueue)
+		if s.held[q.id] == q && now.Before(q.until) {
+			break
 		}
-		delete(s.held, id)
+		s.holds.Remove(f)
+		if s.held[q.id] != q {
+			continue // released by its predecessor already
+		}
+		delete(s.held, q.id)
 		for _, h := range q.msgs {
 			out = s.emit(out, h, now)
 		}
 	}
-	for id, l := range s.last {
-		if now.Sub(l.at) > s.ttl {
-			delete(s.last, id)
-		}
+	for f := s.lru.Front(); f != nil && now.Sub(f.Value.(*seen).at) > s.ttl; f = s.lru.Front() {
+		s.forget(f)
 	}
 	return out
 }
 
 func (s *sequencer) emit(out []Message, m Message, now time.Time) []Message {
-	if m.Status.Terminal() {
-		delete(s.last, m.NotificationID)
-	} else {
-		s.last[m.NotificationID] = seen{status: m.Status, attempts: m.Attempts, at: now}
+	id := m.NotificationID
+	if e, ok := s.last[id]; ok {
+		s.forget(e)
+	}
+	if !m.Status.Terminal() {
+		s.last[id] = s.lru.PushBack(&seen{id: id, status: m.Status, attempts: m.Attempts, at: now})
+		for len(s.last) > s.max {
+			s.forget(s.lru.Front()) // evict the oldest; its next claim is merely held
+		}
 	}
 	return append(out, m)
+}
+
+func (s *sequencer) forget(e *list.Element) {
+	delete(s.last, e.Value.(*seen).id)
+	s.lru.Remove(e)
 }
 
 // predecessor reports whether p is the pending that the held claim c follows.

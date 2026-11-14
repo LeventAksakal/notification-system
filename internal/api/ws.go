@@ -120,7 +120,11 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	sub, err := s.hub.Subscribe(f, s.wsBuffer)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, Error{Code: "unavailable", Message: "status stream unavailable"})
+		msg := "status stream unavailable"
+		if errors.Is(err, realtime.ErrFeedLost) {
+			msg = "status stream unavailable: event feed lost; retry shortly"
+		}
+		writeError(w, http.StatusServiceUnavailable, Error{Code: "unavailable", Message: msg})
 		return
 	}
 	defer sub.Close()
@@ -191,9 +195,14 @@ func (s *Server) pump(ctx context.Context, conn *websocket.Conn, sub *realtime.S
 			return
 		case e, ok := <-sub.C:
 			if !ok {
-				if errors.Is(sub.Err(), realtime.ErrSlow) {
+				switch err := sub.Err(); {
+				case errors.Is(err, realtime.ErrSlow):
 					_ = conn.Close(websocket.StatusPolicyViolation, "too slow: events were dropped; resubscribe")
-				} else {
+				case errors.Is(err, realtime.ErrFeedLost):
+					// 1012: the server lost its event feed; changes may be
+					// missing, so the stream ends instead of going on with a hole.
+					_ = conn.Close(websocket.StatusServiceRestart, "event feed lost; reconnect and read the snapshot")
+				default:
 					_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
 				}
 				return
