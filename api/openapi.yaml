@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Notification system
-  version: 1.1.0
+  version: 1.2.0
   description: |
     Accepts notification requests (sms, email, push), queues them, and delivers them to an
     external provider with rate limiting, priorities, retries and status tracking.
@@ -314,7 +314,9 @@ paths:
         `notificationId`, the first message is a snapshot of that notification's current status
         (`snapshot: true`), then its changes follow in order. With `batchId`, changes of that
         batch's notifications follow. With neither, every change follows. The REST API stays the
-        source of truth; a slow subscriber is disconnected.
+        source of truth. The server closes the stream rather than deliver a stream with holes: a slow
+        subscriber is disconnected, and so is every subscriber when the server loses its event feed
+        (reconnect and read the snapshot).
       parameters:
         - name: notificationId
           in: query
@@ -558,7 +560,7 @@ components:
         updatedAt: { type: string, format: date-time }
     LatencyMs:
       type: object
-      description: From due time to provider acceptance, over notifications sent in the window; zeros when none
+      description: From the first due time (creation, or the schedule if later) to provider acceptance, retries included, over notifications sent in the window; zeros when none
       required: [p50, p95, p99]
       properties:
         p50: { type: integer }
@@ -592,9 +594,11 @@ components:
           description: Notifications that reached `failed` in the window
         successRate:
           type: number
+          format: double
           description: sent / (sent + failed); 0 when both are 0
         failureRate:
           type: number
+          format: double
           description: failed / (sent + failed); 0 when both are 0
         attempts:
           type: integer
@@ -628,8 +632,8 @@ components:
       properties:
         sent: { type: integer }
         failed: { type: integer }
-        successRate: { type: number }
-        failureRate: { type: number }
+        successRate: { type: number, format: double }
+        failureRate: { type: number, format: double }
         attempts: { type: integer }
         failedAttempts: { type: integer }
         latencyMs: { $ref: "#/components/schemas/LatencyMs" }
