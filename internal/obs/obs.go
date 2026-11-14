@@ -42,7 +42,12 @@ func Setup(ctx context.Context, service, endpoint string, level slog.Level) (fun
 		return tp.Shutdown, nil
 	}
 
-	res, err := resource.Merge(resource.Default(), resource.NewSchemaless(semconv.ServiceName(service)))
+	// Every process is its own instance: without the id, the metric series of
+	// several workers (same service name) overwrite each other in the backend.
+	host, _ := os.Hostname() // a container's id under compose; "" is still told apart by the pid
+	instance := fmt.Sprintf("%s-%d", host, os.Getpid())
+	res, err := resource.Merge(resource.Default(),
+		resource.NewSchemaless(semconv.ServiceName(service), semconv.ServiceInstanceID(instance)))
 	if err != nil {
 		return nil, fmt.Errorf("otel resource: %w", err)
 	}
