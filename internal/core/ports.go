@@ -68,8 +68,15 @@ type Queue interface {
 type Grant struct {
 	// N is how many slots were reserved; 0 when none is available yet.
 	N int
-	// First is how long from now until the first slot; slot i is due at
-	// First + i*Interval. A slot is the moment its request may leave.
+	// At is the limiter's clock (Valkey's) at the moment of the reservation:
+	// the "now" that First is measured from. The reply reaches the caller
+	// some unknown time later, so the caller must place slots on its own
+	// clock from At and what it has learned about the two clocks' offset,
+	// never from the moment the reply arrived: a late reply would otherwise
+	// send its whole group late, on top of the next group.
+	At time.Time
+	// First is how long after At the first slot is; slot i is due at
+	// At + First + i*Interval. A slot is the moment its request may leave.
 	First time.Duration
 	// Interval is the spacing between slots: one second divided by the paced rate.
 	Interval time.Duration
@@ -85,7 +92,8 @@ type Grant struct {
 type Limiter interface {
 	// Take reserves up to n consecutive send slots on a channel, none further
 	// ahead than the limiter's horizon. A slot that is not used is lost; a
-	// request must never leave before its slot. An error means the limiter is
+	// request must never leave before its slot, nor more than one interval
+	// after it, whatever the reply's delay was. An error means the limiter is
 	// unreachable: the caller sends nothing (fail closed).
 	Take(ctx context.Context, channel Channel, n int) (Grant, error)
 }

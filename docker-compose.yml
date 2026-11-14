@@ -78,6 +78,7 @@ services:
       valkey: { condition: service_healthy }
       otel: { condition: service_started }
     stop_grace_period: 15s # above APP_SHUTDOWN_TIMEOUT so drains finish
+    restart: unless-stopped # a crashed API comes back; `docker compose stop` still stops it
     healthcheck:
       test: ["CMD", "/app", "healthcheck"]
       interval: 2s
@@ -109,6 +110,7 @@ services:
     deploy:
       replicas: 3
     stop_grace_period: 15s # above APP_SHUTDOWN_TIMEOUT so in-flight sends finish
+    restart: unless-stopped # a crashed worker comes back; its claimed rows return when their lease ends
 
 volumes:
   mysql:
