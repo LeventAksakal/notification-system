@@ -5,6 +5,7 @@ package acceptance
 import (
 	"context"
 	"math"
+	"mime"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -81,6 +82,37 @@ func TestR10RequiredAndMalformedFields(t *testing.T) {
 			if tc.field == "" {
 				wantError(t, r, http.StatusBadRequest, "invalid_request")
 				return
+			}
+			wantError(t, r, http.StatusBadRequest, "invalid_request", tc.field)
+		})
+	}
+}
+
+// R10: Content validation (character limits, required fields) - a malformed
+// parameter is refused like a malformed field. CONTRACT (api/openapi.yaml,
+// Conventions): "Every refused request has the `Error` body. `details` names
+// each offending field." Finding 2 of the 14 Nov fault run: a malformed id and
+// a repeated single-value query parameter were refused with a plain-text body.
+// The reason's wording is not asserted.
+func TestR10MalformedParametersRefusedWithErrorBody(t *testing.T) {
+	s := startStack(t, stackOptions{})
+	requireIntake(t, s)
+
+	cases := []struct {
+		name, method, path, field string
+	}{
+		{"malformed id on get", http.MethodGet, "/v1/notifications/not-a-uuid", "id"},
+		{"malformed id on cancel", http.MethodPost, "/v1/notifications/not-a-uuid/cancel", "id"},
+		{"malformed id on retry", http.MethodPost, "/v1/notifications/not-a-uuid/retry", "id"},
+		{"malformed id on batch read", http.MethodGet, "/v1/batches/not-a-uuid", "id"},
+		{"status repeated on list", http.MethodGet, "/v1/notifications?status=sent&status=failed", "status"},
+		{"channel repeated on list", http.MethodGet, "/v1/notifications?channel=sms&channel=push", "channel"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := s.do(t, tc.method, tc.path, nil)
+			if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+				t.Errorf("%s %s: Content-Type want application/json, got %q (%s)", tc.method, tc.path, r.Header.Get("Content-Type"), r)
 			}
 			wantError(t, r, http.StatusBadRequest, "invalid_request", tc.field)
 		})
