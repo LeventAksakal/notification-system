@@ -27,7 +27,8 @@ import (
 //
 // KEYS[1] channel key; ARGV[1] interval us; ARGV[2] horizon us; ARGV[3] n.
 // Returns {reserved, us from now to the first slot, us until asking again
-// can reserve something (0 when all n were reserved)}.
+// can reserve something (0 when all n were reserved), now in us since the
+// Unix epoch on Valkey's clock}.
 const gcra = `
 local interval = tonumber(ARGV[1])
 local horizon = tonumber(ARGV[2])
@@ -54,7 +55,7 @@ local wait = 0
 if n < want then
   wait = math.max(tat - now - horizon, 0)
 end
-return {n, first, wait}
+return {n, first, wait, now}
 `
 
 var script = valkey.NewLuaScript(gcra)
@@ -88,7 +89,7 @@ func New(client valkey.Client, perSecond, headroomPct int, horizon time.Duration
 func (l *Limiter) Interval() time.Duration { return l.interval }
 
 // Take reserves up to n consecutive slots on channel, none further ahead
-// than the horizon.
+// than the horizon. Grant.At is Valkey's clock when the script ran.
 func (l *Limiter) Take(ctx context.Context, channel core.Channel, n int) (core.Grant, error) {
 	if n <= 0 {
 		return core.Grant{Interval: l.interval}, nil
@@ -98,11 +99,12 @@ func (l *Limiter) Take(ctx context.Context, channel core.Channel, n int) (core.G
 	if err != nil {
 		return core.Grant{}, fmt.Errorf("rate limiter: %w", err)
 	}
-	if len(vals) != 3 {
+	if len(vals) != 4 {
 		return core.Grant{}, fmt.Errorf("rate limiter: unexpected reply %v", vals)
 	}
 	return core.Grant{
 		N:        int(vals[0]),
+		At:       time.UnixMicro(vals[3]),
 		First:    time.Duration(vals[1]) * time.Microsecond,
 		Interval: l.interval,
 		Wait:     time.Duration(vals[2]) * time.Microsecond,

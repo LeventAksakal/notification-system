@@ -6,8 +6,11 @@
 //
 // Timing of one job: the slot comes from the limiter (Valkey's clock, exactly
 // one interval apart across all workers); the request leaves at slot +
-// SendAlign, never earlier. A job that cannot leave within one interval of
-// that moment (slow claim, no free provider call, a timer late under load) is
+// SendAlign, never earlier. The slot is mapped to the local clock through the
+// offset learnt from every Take's round trip (clockMap), never from the moment
+// the reply arrived, so a late reply does not shift its group late. A job that
+// cannot leave within one interval of that moment (slow claim, no free
+// provider call, a timer late under load, the mapping's own uncertainty) is
 // released unsent and claimed again for a later slot: it is never sent late on
 // top of the full rate. Before the call the lease is checked: the call ends
 // before the lease does, or it is not made.
@@ -25,6 +28,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -90,12 +94,16 @@ type Deps struct {
 	Rand func(n int64) int64
 	// Now is the clock a job's lease is checked against; default time.Now.
 	Now func() time.Time
+	// Meter provides the delivery metrics; default the global provider.
+	Meter metric.MeterProvider
 }
 
 // Worker runs the delivery loop; Run once.
 type Worker struct {
-	cfg  Config
-	deps Deps
+	cfg   Config
+	deps  Deps
+	clock *clockMap // Valkey's clock to the local one, for every channel
+	m     metrics
 }
 
 // New returns a worker; zero dials get their defaults.
@@ -142,7 +150,7 @@ func New(cfg Config, deps Deps) *Worker {
 		breakers[ch] = br
 	}
 	deps.Breakers = breakers
-	return &Worker{cfg: cfg, deps: deps}
+	return &Worker{cfg: cfg, deps: deps, clock: newClockMap(time.Now(), clockWindow), m: newMetrics(deps.Meter)}
 }
 
 // storeTimeout bounds one result write; it is not cut short by shutdown, so a
@@ -284,6 +292,7 @@ func (w *Worker) refill() time.Duration { return max(w.cfg.Horizon/2, time.Milli
 // the channel's provider calls are all in flight.
 func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, inflight *sync.WaitGroup) {
 	limiterDown := false
+	clockUncertain := false
 	interval := time.Millisecond // until the first grant says
 	for ctx.Err() == nil {
 		now := time.Now()
@@ -310,11 +319,14 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			return
 		}
 		want := int(w.cfg.Horizon/interval) + 1
-		if first.Probe() {
-			want = 1 // the probe is one call
+		if first.Probe() || clockUncertain {
+			// The probe is one call; while the clock mapping is too loose to
+			// use, one slot is enough to learn from and little to lose.
+			want = 1
 		}
+		sent := time.Now()
 		g, err := w.deps.Limiter.Take(ctx, cr.ch, want)
-		takenAt := time.Now()
+		got := time.Now()
 		if err != nil {
 			<-cr.claiming
 			cr.br.Cancel(first)
@@ -339,6 +351,36 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		if first.Probe() {
 			pause = g.Wait
 		}
+		// Valkey's clock maps to the local one with an offset in [lower,
+		// upper] (clockMap). Slots are placed with upper, so none is early
+		// whatever the reply's delay; a request may so be up to uncertainty
+		// late from the mapping alone, and the group's tolerance gives that
+		// up: mapping error plus timer lateness stay within one interval.
+		uncertainty := time.Duration(math.MaxInt64) // a grant without At cannot be placed
+		var upper time.Duration
+		if !g.At.IsZero() {
+			var lower time.Duration
+			lower, upper = w.clock.observe(sent, got, g.At)
+			uncertainty = upper - lower
+		}
+		if g.N > 0 && uncertainty >= g.Interval {
+			// The cap cannot be guaranteed: none of these slots is used.
+			<-cr.claiming
+			cr.br.Cancel(first)
+			w.m.gaveUp(ctx, cr.ch, giveUpClockUncertain, g.N)
+			if !clockUncertain {
+				slog.WarnContext(ctx, "limiter clock offset too uncertain to hold the rate; channel sends nothing",
+					"channel", cr.ch, "uncertainty_us", uncertainty.Microseconds(), "interval_us", g.Interval.Microseconds())
+				clockUncertain = true
+			}
+			sleep(ctx, w.cfg.IdleMin)
+			continue
+		}
+		if g.N > 0 && clockUncertain {
+			slog.InfoContext(ctx, "limiter clock offset known again", "channel", cr.ch,
+				"uncertainty_us", uncertainty.Microseconds())
+			clockUncertain = false
+		}
 		if g.N == 0 {
 			<-cr.claiming
 			cr.br.Cancel(first)
@@ -354,21 +396,20 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			}
 			tickets = append(tickets, t)
 		}
-		// Server-now maps to a local moment within the Take's round trip;
-		// takenAt is its latest bound, so no request leaves before its slot.
-		base := takenAt.Add(g.First + w.cfg.SendAlign)
+		w.m.gaveUp(ctx, cr.ch, giveUpBreakerOpened, g.N-len(tickets))
+		base := w.clock.toLocal(g.At.Add(g.First), upper).Add(w.cfg.SendAlign)
 		slots := make([]time.Time, len(tickets))
 		for i := range slots {
 			slots[i] = base.Add(time.Duration(i) * g.Interval)
 		}
-		tolerance := max(g.Interval, time.Millisecond)
+		tolerance := g.Interval - uncertainty // > 0: checked above
 		inflight.Add(1)
 		go func() { // owned by Run through inflight
 			defer inflight.Done()
 			defer func() { <-cr.claiming }()
 			w.claimGroup(ctx, sendCtx, cr, slots, tickets, tolerance, inflight)
 		}()
-		sleep(ctx, time.Until(takenAt.Add(pause)))
+		sleep(ctx, time.Until(got.Add(pause)))
 	}
 }
 
@@ -378,10 +419,12 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, slots []time.Time, tickets []breaker.Ticket, tolerance time.Duration, inflight *sync.WaitGroup) {
 	i := 0
 	skipMissed := func(now time.Time) {
+		from := i
 		for i < len(slots) && now.After(slots[i].Add(tolerance)) {
 			cr.br.Cancel(tickets[i])
 			i++
 		}
+		w.m.gaveUp(ctx, cr.ch, giveUpSlotMissed, i-from)
 	}
 	skipMissed(time.Now())
 	jobs, err := w.claim(ctx, cr, len(slots)-i)
@@ -397,6 +440,7 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, slots 
 	for _, job := range jobs {
 		jctx := jobContext(sendCtx, job)
 		if i == len(slots) {
+			w.m.gaveUp(ctx, cr.ch, giveUpClaimOutlasted, 1)
 			w.release(jctx, job, announced, "claim outlasted its slots")
 			continue
 		}
@@ -447,6 +491,8 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job,
 		reason := "no free provider call at its slot"
 		if ctx.Err() != nil {
 			reason = "shutdown before the send"
+		} else {
+			w.m.gaveUp(ctx, cr.ch, giveUpNoFreeCall, 1)
 		}
 		w.release(jctx, job, announced, reason)
 		return
@@ -459,12 +505,14 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job core.Job,
 	if time.Now().After(late) {
 		callDone()
 		cr.br.Cancel(tk)
+		w.m.gaveUp(ctx, cr.ch, giveUpSlotMissed, 1)
 		w.release(jctx, job, announced, "slot missed")
 		return
 	}
 	if !cr.br.Current(tk) {
 		// The breaker opened after the claim: nothing goes out (decision 0008).
 		callDone()
+		w.m.gaveUp(ctx, cr.ch, giveUpBreakerOpened, 1)
 		w.release(jctx, job, announced, "breaker opened before the send")
 		return
 	}
@@ -566,6 +614,7 @@ func (w *Worker) deliver(ctx context.Context, job core.Job, announced <-chan str
 		br.Cancel(tk)
 		slog.WarnContext(ctx, "lease too close to its end to send; released", "channel", job.Channel,
 			"lease_left_ms", (left + leaseMargin).Milliseconds())
+		w.m.gaveUp(ctx, job.Channel, giveUpLeaseTooShort, 1)
 		w.release(ctx, job, announced, "lease too short")
 		return
 	}
@@ -607,6 +656,7 @@ func (w *Worker) deliver(ctx context.Context, job core.Job, announced <-chan str
 	}
 	v := provider.Classify(res.Status, err, res.Header)
 	br.Done(tk, !v.ProviderFault)
+	w.m.attempt(ctx, job.Channel, v.Outcome, elapsed.Seconds())
 	a := core.Attempt{
 		StartedAt: start, Duration: elapsed, Outcome: v.Outcome, HTTPStatus: res.Status,
 		Error: v.Error, ProviderMessageID: res.MessageID,

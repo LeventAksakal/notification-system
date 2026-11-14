@@ -141,7 +141,9 @@ func (q *memQueue) row(id string) memRow {
 }
 
 // gridLimiter is an in-memory GCRA with burst 1 per channel, like the Valkey
-// limiter: slots exactly interval apart, at most horizon ahead.
+// limiter: slots exactly interval apart, at most horizon ahead. Its clock is
+// a "remote" one, hours away from the local wall clock and running on the
+// local monotonic clock: Grant.At is on it, as Valkey's TIME is.
 type gridLimiter struct {
 	mu       sync.Mutex
 	err      error
@@ -149,11 +151,21 @@ type gridLimiter struct {
 	interval time.Duration
 	horizon  time.Duration
 	next     map[core.Channel]time.Time
+	start    time.Time // local, monotonic
 }
 
+// remoteBase is the gridLimiter's clock at its start.
+var remoteBase = time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+
 func newGridLimiter(interval, horizon time.Duration) *gridLimiter {
-	return &gridLimiter{interval: interval, horizon: horizon, next: map[core.Channel]time.Time{}}
+	return &gridLimiter{interval: interval, horizon: horizon, next: map[core.Channel]time.Time{}, start: time.Now()}
 }
+
+// remote is local moment t on the limiter's clock.
+func (l *gridLimiter) remote(t time.Time) time.Time { return remoteBase.Add(t.Sub(l.start)) }
+
+// local is limiter moment at on the local monotonic clock.
+func (l *gridLimiter) local(at time.Time) time.Time { return l.start.Add(at.Sub(remoteBase)) }
 
 func (l *gridLimiter) Take(_ context.Context, ch core.Channel, n int) (core.Grant, error) {
 	l.mu.Lock()
@@ -178,7 +190,7 @@ func (l *gridLimiter) Take(_ context.Context, ch core.Channel, n int) (core.Gran
 	if k < n {
 		wait = max(tat.Sub(now)-l.horizon, 0)
 	}
-	return core.Grant{N: k, First: first, Interval: l.interval, Wait: wait}, nil
+	return core.Grant{N: k, At: l.remote(now), First: first, Interval: l.interval, Wait: wait}, nil
 }
 
 func testLimiter() *gridLimiter { return newGridLimiter(5*time.Millisecond, 20*time.Millisecond) }

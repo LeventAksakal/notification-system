@@ -151,6 +151,37 @@ func TestLimiterReservesWithinTheHorizon(t *testing.T) {
 	}
 }
 
+// TestLimiterGrantCarriesValkeysClock: At is the "now" First is measured
+// from, so two grants on one key name the same grid on Valkey's timeline.
+func TestLimiterGrantCarriesValkeysClock(t *testing.T) {
+	addr := support.Valkey(t)
+	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}, DisableCache: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	l := limiter.New(client, 100, 0, 500*time.Millisecond, "test:clock:")
+	g1, err := l.Take(t.Context(), core.ChannelPush, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g2, err := l.Take(t.Context(), core.ChannelPush, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g1.At.IsZero() || g2.At.Before(g1.At) {
+		t.Fatalf("At: want Valkey's clock, non-decreasing; got %s then %s", g1.At, g2.At)
+	}
+	// Containers share the host's clock up to a VM's skew: a minute is generous.
+	if d := time.Since(g1.At); d < -time.Minute || d > time.Minute {
+		t.Errorf("At %s is %s away from the local clock", g1.At, d)
+	}
+	want := g1.At.Add(g1.First + time.Duration(g1.N)*g1.Interval)
+	if got := g2.At.Add(g2.First); g1.N != 3 || g2.N != 3 || !got.Equal(want) {
+		t.Fatalf("second grant's first slot at %s, want %s right after the first grant (%+v, %+v)", got, want, g1, g2)
+	}
+}
+
 func TestLimiterFailsClosed(t *testing.T) {
 	addr := support.Valkey(t)
 	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}, DisableCache: true})
