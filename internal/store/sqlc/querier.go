@@ -28,9 +28,11 @@ type Querier interface {
 	// Forget one key older than the retention, so it can be used again.
 	DeleteExpiredIdempotencyKey(ctx context.Context, arg DeleteExpiredIdempotencyKeyParams) (int64, error)
 	DeleteTemplate(ctx context.Context, name string) (int64, error)
-	// processing -> failed (permanent refusal or an exhausted budget).
+	// processing -> failed (permanent refusal or an exhausted budget); both count.
 	FinishFailed(ctx context.Context, arg FinishFailedParams) (int64, error)
 	// processing -> pending, due again after delay_us (a retry is a stored due time, decision 0007).
+	// counted is 1 when the failure counts against the budget, 0 when it belongs
+	// to a declared provider outage (decision 0026).
 	FinishRetry(ctx context.Context, arg FinishRetryParams) (int64, error)
 	// processing -> sent.
 	FinishSent(ctx context.Context, arg FinishSentParams) (int64, error)
@@ -93,7 +95,7 @@ type Querier interface {
 	ReapCandidates(ctx context.Context) ([]ReapCandidatesRow, error)
 	// processing -> pending for rows locked by ReapCandidates in the same transaction.
 	ReapLeases(ctx context.Context, ids []string) (int64, error)
-	// processing -> pending without an attempt (breaker open, shutdown; decision 0008).
+	// processing -> pending without an attempt (provider outage declared, shutdown; decision 0026).
 	ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error)
 	// A dead letter goes back to pending with a fresh attempt budget; history is kept.
 	ReplayNotification(ctx context.Context, id string) (int64, error)

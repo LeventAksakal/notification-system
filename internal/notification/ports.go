@@ -21,6 +21,7 @@ type Job struct {
 	To            string
 	Content       string
 	Attempts      int    // provider calls already made in this attempt budget
+	BudgetSpent   int    // of those, the failures counted against the budget (decision 0026)
 	ClaimVersion  uint64 // carried on every write for this claim
 	LeaseUntil    time.Time
 	DueAt         time.Time
@@ -36,6 +37,11 @@ type Attempt struct {
 	HTTPStatus        int // 0 when no response arrived
 	Error             string
 	ProviderMessageID string
+	// Counted is true when a failed call counts against the notification's
+	// attempt budget: its provider was believed healthy after the failure
+	// was recorded. A failure that belongs to a declared outage is recorded
+	// with Counted false (decision 0026). Ignored for an accepted call.
+	Counted bool
 }
 
 // Queue is the work queue. MySQL implements it (decision 0003); a broker could
@@ -51,12 +57,14 @@ type Queue interface {
 	MarkSent(ctx context.Context, job Job, attempt Attempt) error
 	// Reschedule records the failed attempt and returns the notification to
 	// pending, due again at dueAt (a retry is a stored due time, decision 0007).
+	// It adds 1 to the budget spent only when attempt.Counted (decision 0026).
 	Reschedule(ctx context.Context, job Job, attempt Attempt, dueAt time.Time) error
-	// MarkFailed records the failed attempt and ends the notification as failed.
+	// MarkFailed records the failed attempt and ends the notification as
+	// failed; the failure always counts against the budget.
 	MarkFailed(ctx context.Context, job Job, attempt Attempt, kind FailureKind) error
 	// Release returns a claimed notification to pending without recording an
-	// attempt, due again at dueAt: the worker could not send it (breaker open,
-	// shutdown), so no attempt is burned (decision 0008).
+	// attempt, due again at dueAt: the worker could not send it (provider
+	// outage declared, shutdown), so no attempt is burned (decision 0026).
 	Release(ctx context.Context, job Job, dueAt time.Time) error
 	// ReapExpired returns notifications whose lease ran out to pending and
 	// reports them, so the caller can publish the change (decision 0018). Of

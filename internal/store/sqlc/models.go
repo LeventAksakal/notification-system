@@ -362,6 +362,7 @@ type Notification struct {
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	FinishedAt        sql.NullTime
+	BudgetSpent       uint32
 }
 
 type Template struct {

@@ -10,7 +10,6 @@ Record 0004 in this folder is still `proposed` (the owner rejected it on 15 Nov 
 - [A notification moves through one explicit state machine and every attempt is recorded (0005)](0005-one-state-machine-attempts-recorded.md)
 - [Delivery is at-least-once, with an idempotency key sent to the provider (0006)](0006-at-least-once-with-provider-key.md)
 - [Retries are classified, backed off with full jitter, and stored as a due time (0007)](0007-retries-classified-jittered-stored.md)
-- [A per-channel circuit breaker pauses claiming, so an outage burns no attempts (0008)](0008-breaker-pauses-claiming.md)
 - [The per-channel limit is global, enforced in Valkey before rows are claimed (0009)](0009-global-rate-limit-in-valkey.md)
 - [Priority is weighted, not strict: high goes first, low never starves (0010)](0010-priority-is-weighted.md)
 - [A batch is accepted or rejected as a whole (0011)](0011-batch-is-atomic.md)
@@ -27,3 +26,4 @@ Record 0004 in this folder is still `proposed` (the owner rejected it on 15 Nov 
 - [Packages are named for their role; contracts and settings sit at the root (0022)](0022-packages-by-role-contracts-at-the-root.md)
 - [schema/ is the desired state, diffed into goose migrations by sqldef (0023)](0023-schema-as-code-with-sqldef.md)
 - [The server's endpoint code owns the HTTP contract; the spec and clients are generated from it (0024)](0024-server-code-owns-the-http-contract.md)
+- [Provider health is shared in Valkey per channel; a failure counts against a message only while its provider is believed healthy (0026)](0026-provider-health-shared-outages-spend-no-budget.md)

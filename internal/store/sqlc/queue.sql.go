@@ -14,7 +14,7 @@ import (
 
 const claimCandidates = `-- name: ClaimCandidates :many
 
-SELECT id, batch_id, recipient, content, attempts, claim_version, due_at, correlation_id, traceparent
+SELECT id, batch_id, recipient, content, attempts, budget_spent, claim_version, due_at, correlation_id, traceparent
 FROM notifications
 WHERE status = 'pending' AND channel = ? AND priority = ? AND due_at <= NOW(3)
 ORDER BY due_at
@@ -34,6 +34,7 @@ type ClaimCandidatesRow struct {
 	Recipient     string
 	Content       string
 	Attempts      uint32
+	BudgetSpent   uint32
 	ClaimVersion  uint64
 	DueAt         time.Time
 	CorrelationID string
@@ -62,6 +63,7 @@ func (q *Queries) ClaimCandidates(ctx context.Context, arg ClaimCandidatesParams
 			&i.Recipient,
 			&i.Content,
 			&i.Attempts,
+			&i.BudgetSpent,
 			&i.ClaimVersion,
 			&i.DueAt,
 			&i.CorrelationID,
@@ -82,7 +84,7 @@ func (q *Queries) ClaimCandidates(ctx context.Context, arg ClaimCandidatesParams
 
 const finishFailed = `-- name: FinishFailed :execrows
 UPDATE notifications
-SET status = 'failed', attempts = attempts + 1, last_error = ?,
+SET status = 'failed', attempts = attempts + 1, budget_spent = budget_spent + 1, last_error = ?,
     failure_kind = ?, lease_until = NULL, finished_at = NOW(3)
 WHERE id = ? AND status = 'processing' AND claim_version = ?
 `
@@ -94,7 +96,7 @@ type FinishFailedParams struct {
 	ClaimVersion uint64
 }
 
-// processing -> failed (permanent refusal or an exhausted budget).
+// processing -> failed (permanent refusal or an exhausted budget); both count.
 func (q *Queries) FinishFailed(ctx context.Context, arg FinishFailedParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, finishFailed,
 		arg.LastError,
@@ -110,12 +112,13 @@ func (q *Queries) FinishFailed(ctx context.Context, arg FinishFailedParams) (int
 
 const finishRetry = `-- name: FinishRetry :execrows
 UPDATE notifications
-SET status = 'pending', attempts = attempts + 1, last_error = ?,
+SET status = 'pending', attempts = attempts + 1, budget_spent = budget_spent + ?, last_error = ?,
     due_at = NOW(3) + INTERVAL ? MICROSECOND, lease_until = NULL
 WHERE id = ? AND status = 'processing' AND claim_version = ?
 `
 
 type FinishRetryParams struct {
+	Counted      uint32
 	LastError    sql.NullString
 	DelayUs      interface{}
 	ID           string
@@ -123,8 +126,11 @@ type FinishRetryParams struct {
 }
 
 // processing -> pending, due again after delay_us (a retry is a stored due time, decision 0007).
+// counted is 1 when the failure counts against the budget, 0 when it belongs
+// to a declared provider outage (decision 0026).
 func (q *Queries) FinishRetry(ctx context.Context, arg FinishRetryParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, finishRetry,
+		arg.Counted,
 		arg.LastError,
 		arg.DelayUs,
 		arg.ID,
@@ -361,7 +367,7 @@ type ReleaseLeaseParams struct {
 	ClaimVersion uint64
 }
 
-// processing -> pending without an attempt (breaker open, shutdown; decision 0008).
+// processing -> pending without an attempt (provider outage declared, shutdown; decision 0026).
 func (q *Queries) ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, releaseLease, arg.DelayUs, arg.ID, arg.ClaimVersion)
 	if err != nil {

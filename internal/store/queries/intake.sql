@@ -38,7 +38,7 @@ WHERE id = ? AND status = 'pending';
 -- name: ReplayNotification :execrows
 -- A dead letter goes back to pending with a fresh attempt budget; history is kept.
 UPDATE notifications
-SET status = 'pending', attempts = 0, failure_kind = NULL, finished_at = NULL, due_at = NOW(3)
+SET status = 'pending', attempts = 0, budget_spent = 0, failure_kind = NULL, finished_at = NULL, due_at = NOW(3)
 WHERE id = ? AND status = 'failed';
 
 -- name: GetBatch :one

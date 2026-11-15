@@ -61,19 +61,24 @@ func (q *memQueue) Claim(_ context.Context, ch notification.Channel, p notificat
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.claimCalls++
-	var out []notification.Job
+	// Due rows of this lane, oldest due first, as the store's claim (ORDER BY
+	// due_at); ties in insertion order.
+	now := time.Now()
+	var due []*memRow
 	for _, id := range q.order {
 		r := q.rows[id]
-		if len(out) == n {
-			break
+		if r.status == notification.StatusPending && r.job.Channel == ch && r.job.Priority == p && !now.Before(r.due) {
+			due = append(due, r)
 		}
-		if r.status == notification.StatusPending && r.job.Channel == ch && r.job.Priority == p && !time.Now().Before(r.due) {
-			r.status = notification.StatusProcessing
-			r.job.ClaimVersion++
-			r.job.LeaseUntil = time.Now().Add(lease)
-			out = append(out, r.job)
-			q.claims[p]++
-		}
+	}
+	slices.SortStableFunc(due, func(a, b *memRow) int { return a.due.Compare(b.due) })
+	out := make([]notification.Job, 0, min(n, len(due)))
+	for _, r := range due[:min(n, len(due))] {
+		r.status = notification.StatusProcessing
+		r.job.ClaimVersion++
+		r.job.LeaseUntil = now.Add(lease)
+		out = append(out, r.job)
+		q.claims[p]++
 	}
 	return out, nil
 }
@@ -93,6 +98,9 @@ func (q *memQueue) finish(job notification.Job, a *notification.Attempt, to noti
 	r.status, r.kind, r.due = to, kind, due
 	if a != nil {
 		r.job.Attempts++
+		if to == notification.StatusFailed || a.Counted && to == notification.StatusPending {
+			r.job.BudgetSpent++ // as the store: a failure counts when Counted, a final failure always
+		}
 		q.results[job.ID] = append(q.results[job.ID], a.Outcome)
 	} else {
 		q.released++

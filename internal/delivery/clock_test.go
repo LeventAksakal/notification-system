@@ -450,7 +450,7 @@ func TestWorkerDeliveryMetrics(t *testing.T) {
 		snd := &countingSender{fn: accept}
 		w := New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: snd, Meter: mp})
 		cr := w.newChannelRun(notification.ChannelSMS, testPlaces(1, 0))
-		tk, _, _ := cr.br.Allow()
+		tk, _, _, _ := cr.gate.Allow(t.Context(), time.Second)
 		now, remote := time.Now(), time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 		_, _, gen, _ := w.clock.observe(now, now.Add(time.Millisecond), remote, 5*time.Millisecond)
 		w.clock.observe(now.Add(time.Second), now.Add(time.Second+time.Millisecond), remote.Add(6*time.Second), 5*time.Millisecond) // a 5 s step

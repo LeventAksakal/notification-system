@@ -592,3 +592,22 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// A rule with To fails one recipient while the others on the same channel
+// succeed: the message-specific failure of the provider health tests.
+func TestFaultForOneRecipient(t *testing.T) {
+	s, url, _ := start(t)
+	if err := s.SetFaults([]fakeprovider.Fault{{Mode: fakeprovider.ModeStatus, Status: 503, To: "+15550000001"}}); err != nil {
+		t.Fatal(err)
+	}
+	bad := `{"to":"+15550000001","channel":"sms","content":"x"}`
+	good := `{"to":"+15550000002","channel":"sms","content":"x"}`
+	for range 2 {
+		if got := send(t, nil, http.MethodPost, url, bad).status; got != http.StatusServiceUnavailable {
+			t.Errorf("matching recipient: status %d, want 503", got)
+		}
+		if got := send(t, nil, http.MethodPost, url, good).status; got != http.StatusAccepted {
+			t.Errorf("other recipient: status %d, want 202", got)
+		}
+	}
+}

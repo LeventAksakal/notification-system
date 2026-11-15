@@ -24,11 +24,11 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 
 ## Delivery rules
 - Classify (only in `provider.Classify`): retry on network error, timeout, 408, 425, 429, 5xx; permanent on any other 4xx; a 2xx without `messageId` counts as sent.
-- Backoff: `random(0, min(cap, base * 2^attempt))`, never shorter than `Retry-After`; stored as `due_at`. After `APP_MAX_ATTEMPTS` provider calls: `failed`, `failure_kind = exhausted`. Permanent: `failed`, `permanent`, after one call.
+- Backoff: `random(0, min(cap, base * 2^attempt))`, never shorter than `Retry-After`; stored as `due_at`. After `APP_MAX_ATTEMPTS` counted failures (`budget_spent`; a failure during a declared outage is recorded but not counted, decision 0026): `failed`, `failure_kind = exhausted`. Permanent: `failed`, `permanent`, after one call.
 - Rate limit: GCRA in Valkey with burst 1, Valkey's clock, one key per channel. `Limiter.Take` reserves consecutive send slots one interval apart, at most `APP_RATE_LIMIT_HORIZON` ahead; slots are reserved before claiming, one claim query serves a group of slots, and each request leaves at its slot, never earlier. A job that misses its slot by more than one interval is released, not sent late. Valkey unreachable: workers send nothing and `/readyz` says so.
 - A request is sent only if its lease outlives the call: the call's timeout is capped at the time left on the lease minus a margin, and a job with too little lease left is released.
 - Priority: per-channel permits are split by weights with borrowing (unused share goes to the next priority down, then up). One claim query per priority through `claim_idx`.
-- Breaker per channel per worker process: open on failure ratio over a window, half-open probe after a cool-down. While open the worker does not claim that channel; nothing is counted as an attempt.
+- Provider health per channel, shared by all workers in Valkey (decision 0026): `APP_BREAKER_FAILURES` consecutive provider faults declare an outage; one probe per cool-down fleet-wide; while open no worker claims that channel and no failure counts against a message's budget.
 - Lease: claim sets `lease_until` and increments `claim_version`; every later write carries `WHERE claim_version = ?`; a reaper returns expired leases to `pending`.
 - Claim transaction: READ COMMITTED, `FOR UPDATE SKIP LOCKED`, `ORDER BY due_at` matching `claim_idx`; `due_at <= NOW(3)` on the database clock.
 - Events: every committed status change is published once through `core.Publisher` (Valkey pub/sub). Publishing never delays a response by more than one bounded wait per request, whatever the number of events (a batch is one pipelined publish with one deadline). When an API instance loses its event feed it closes its WebSocket streams and refuses new ones until the feed is back.
@@ -41,7 +41,7 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 | `APP_VALKEY_ADDR` | `localhost:6379` | exists |
 | `APP_PROVIDER_URL_SMS`, `_EMAIL`, `_PUSH` | `http://localhost:8090/send` | provider URL per channel |
 | `APP_PROVIDER_TIMEOUT` | `5s` | one provider call |
-| `APP_MAX_ATTEMPTS` | `12` | provider calls before `exhausted`; with base 1 s and cap 5 min a message retries for about 12 min on average, 23.5 at most (owner, 15 Nov 2026) |
+| `APP_MAX_ATTEMPTS` | `10` | counted failures before `exhausted`: the smallest budget whose waits reach the cap; a message-specific failure retries for about 6.75 min on average, 13.5 at most (decision 0026; an outage no longer spends budget) |
 | `APP_RETRY_BASE` | `1s` | backoff base |
 | `APP_RETRY_CAP` | `5m` | backoff cap |
 | `APP_RATE_LIMIT_PER_SECOND` | `100` | provider's limit per channel |
@@ -51,10 +51,8 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 | `APP_LEASE_DURATION` | `30s` | claim lease |
 | `APP_REAP_INTERVAL` | `5s` | how often expired leases are returned |
 | `APP_WORKER_CONCURRENCY` | `32` | provider calls in flight per worker process |
-| `APP_BREAKER_WINDOW` | `10s` | failure-ratio window |
-| `APP_BREAKER_MIN_REQUESTS` | `10` | calls in the window before the ratio counts |
-| `APP_BREAKER_FAILURE_RATIO` | `0.5` | opens at or above |
-| `APP_BREAKER_COOLDOWN` | `5s` | open time before one probe |
+| `APP_BREAKER_FAILURES` | `5` | consecutive provider faults, fleet-wide, that declare an outage |
+| `APP_BREAKER_COOLDOWN` | `5s` | least time before the next probe, fleet-wide |
 | `APP_IDEMPOTENCY_RETENTION` | `24h` | how long a key is remembered |
 | `APP_IDEMPOTENCY_SWEEP_INTERVAL` | `1m` | how often expired keys are deleted |
 | `APP_WS_SEND_BUFFER` | `256` | events buffered per subscriber before it is dropped |

@@ -44,9 +44,11 @@ var ErrInvalidFault = errors.New("invalid fault rule")
 // Fault is one scripted failure. Count > 0 applies it to the next Count
 // matching requests; Ratio in (0,1] applies it to that share of them; neither
 // applies it until cleared. A ratio rule that does not fire falls through to
-// the next rule.
+// the next rule. Channel and To narrow a rule to one channel or one recipient
+// (a message-specific failure while the others succeed); empty matches any.
 type Fault struct {
 	Channel           string  `json:"channel,omitempty"`
+	To                string  `json:"to,omitempty"`
 	Mode              Mode    `json:"mode"`
 	Status            int     `json:"status,omitempty"`
 	RetryAfterSeconds int     `json:"retryAfterSeconds,omitempty"`
@@ -313,7 +315,7 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", msg)
 		return
 	}
-	fault, hit := s.pickFaultLocked(in.Channel)
+	fault, hit := s.pickFaultLocked(in.Channel, in.To)
 	switch {
 	case !hit:
 		body := s.acceptLocked(epoch, &rec)
@@ -386,10 +388,10 @@ func (s *Server) wait(ctx context.Context, ms int) bool {
 
 // pickFaultLocked returns the first rule that fires for channel, spending one
 // of its Count if it has one. Caller holds s.mu.
-func (s *Server) pickFaultLocked(channel string) (Fault, bool) {
+func (s *Server) pickFaultLocked(channel, to string) (Fault, bool) {
 	for i := range s.faults {
 		f := &s.faults[i] // pointer into the slice so the Count decrement sticks
-		if f.Channel != "" && f.Channel != channel {
+		if f.Channel != "" && f.Channel != channel || f.To != "" && f.To != to {
 			continue
 		}
 		switch {

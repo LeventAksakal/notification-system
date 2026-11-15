@@ -15,7 +15,7 @@ import (
 	"github.com/valkey-io/valkey-go"
 
 	"github.com/LeventAksakal/notification-system/internal/delivery"
-	"github.com/LeventAksakal/notification-system/internal/delivery/breaker"
+	"github.com/LeventAksakal/notification-system/internal/delivery/health"
 	"github.com/LeventAksakal/notification-system/internal/delivery/limiter"
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
 	"github.com/LeventAksakal/notification-system/internal/notification"
@@ -77,19 +77,16 @@ func TestWorkersHoldTheRateAtTheProvider(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer vk.Close()
-		brs := map[notification.Channel]*breaker.Breaker{}
-		for _, ch := range notification.Channels {
-			brs[ch] = breaker.New(breaker.Config{Window: 10 * time.Second, MinRequests: 10, FailureRatio: 0.5, Cooldown: 5 * time.Second}, time.Now)
-		}
+		hs := health.NewValkey(vk, health.Config{Failures: 5, Cooldown: 5 * time.Second}, "health:")
 		w := delivery.New(delivery.Config{
 			Concurrency: 32, MaxAttempts: 5, RetryBase: 100 * time.Millisecond, RetryCap: time.Second,
 			Lease: 2 * time.Second, ReapInterval: 500 * time.Millisecond, ShutdownTimeout: 5 * time.Second,
 			Weights: [3]int{70, 20, 10}, Horizon: 200 * time.Millisecond,
 		}, delivery.Deps{
-			Queue:    &timedQueue{Queue: store.NewQueue(db), start: start},
-			Limiter:  limiter.New(vk, limit, headroom, 200*time.Millisecond, "rate:"),
-			Sender:   provider.New(urls, 500*time.Millisecond, 32),
-			Breakers: brs,
+			Queue:   &timedQueue{Queue: store.NewQueue(db), start: start},
+			Limiter: limiter.New(vk, limit, headroom, 200*time.Millisecond, "rate:"),
+			Sender:  provider.New(urls, 500*time.Millisecond, 32),
+			Health:  hs,
 		})
 		go func() { errc <- w.Run(ctx) }()
 		// As processes started one after another: the first drains alone for a while.

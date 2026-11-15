@@ -1,9 +1,12 @@
 ---
-status: accepted
+status: superseded
+superseded-by: ../0026-provider-health-shared-outages-spend-no-budget.md
 date: 2026-11-13
 decision-makers: owner (in chat, 15 Nov 2026); proposed by the coordinator
 revisit: when more than a handful of worker replicas run
 ---
+> **Superseded by [0026](../0026-provider-health-shared-outages-spend-no-budget.md)** (15 Nov 2026): health is shared in Valkey per channel, and a failure counts against a message only while its provider is believed healthy. Kept for its history.
+
 # A per-channel circuit breaker pauses claiming, so an outage burns no attempts (0008)
 
 ## Question
@@ -37,14 +40,14 @@ Answer, from the code (`internal/delivery/delivery.go:366`, `internal/delivery/b
 - **Where the breaker does not help:** low traffic. Fewer than 10 calls in 10 s never trips it, so a lone message meets the outage with only its retry budget. That is why 0007's budget is now a stated span (about 12 minutes on average) rather than a count that ran out in 30 s.
 - **Cost of per-process breakers:** each worker learns of the outage on its own (about 10 failed sends each) and probes on its own (three probes per cool-down instead of one). A breaker shared in Valkey (option 3) removes both, at the price of more Lua and one more thing that fails when Valkey does; it is worth it once many replicas run (this record's revisit trigger).
 
-## Numbers (15 Nov 2026)
-| Number | Value | Where it comes from |
+## Numbers (15 Nov 2026, as replaced by 0026)
+| Number | Value here | What replaced it (0026) |
 |---|---|---|
-| `APP_BREAKER_WINDOW` | 10 s | Unexplained |
-| `APP_BREAKER_MIN_REQUESTS` | 10 | Unexplained. Consequence: under one call a second the breaker never trips, and a lone message meets an outage with only its retry budget |
-| `APP_BREAKER_FAILURE_RATIO` | 0.5 | Industry default (Resilience4j's failure-rate threshold defaults to 50%) |
-| `APP_BREAKER_COOLDOWN` | 5 s | Sets how fast sending resumes after recovery (at most 5 s) against probe cost (one call per 5 s per worker). Not derived from a target: unexplained |
-| `probeWait` | 20 ms | Code constant in `internal/delivery/breaker/breaker.go`: how long a caller waits while the probe is out |
+| `APP_BREAKER_WINDOW` | 10 s | Removed: a consecutive-fault count needs no window |
+| `APP_BREAKER_MIN_REQUESTS` | 10 | Removed: it made the breaker blind under one call per second |
+| `APP_BREAKER_FAILURE_RATIO` | 0.5 | Removed; `APP_BREAKER_FAILURES` = 5 consecutive faults fleet-wide (Envoy's `consecutive_5xx` default) |
+| `APP_BREAKER_COOLDOWN` | 5 s | Kept, now derived: sending resumes within 5 s plus a round trip of recovery (Hystrix's default), one probe per 5 s fleet-wide |
+| `probeWait` | 20 ms | Removed: waiters ask again at `min(time left, IdleMax)`; the probe is held for a computed lease of about 5.66 s |
 
 ## Follow-up proposed (15 Nov 2026)
-Owner: "I feel like we should be caching the health and readiness of upstream services we depend on in valkey or somewhere else no? isn't that done in the industry?" Proposed: keep each channel's provider health in Valkey, shared by every worker (option 3 above), gate claims on it, and count an attempt against a message only while its provider is believed healthy, so an outage of any length dead-letters nothing and the retry budget measures only failures particular to that message. The numbers above are then re-derived from targets (how fast an outage is detected, how fast sending resumes). Not built; it edits `internal/delivery`, so it starts after the wake-hint branch lands.
+Owner: "I feel like we should be caching the health and readiness of upstream services we depend on in valkey or somewhere else no? isn't that done in the industry?" Proposed: keep each channel's provider health in Valkey, shared by every worker (option 3 above), gate claims on it, and count an attempt against a message only while its provider is believed healthy, so an outage of any length dead-letters nothing and the retry budget measures only failures particular to that message. The numbers above are then re-derived from targets (how fast an outage is detected, how fast sending resumes). Built as decision 0026.

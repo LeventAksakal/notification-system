@@ -90,6 +90,8 @@ func (s *Queue) claimOnce(ctx context.Context, channel notification.Channel, pri
 			To:       r.Recipient,
 			Content:  r.Content,
 			Attempts: int(r.Attempts),
+			// Failures counted against the budget so far (decision 0026).
+			BudgetSpent: int(r.BudgetSpent),
 			// Exact: the row lock is held from the SELECT to the commit.
 			ClaimVersion: r.ClaimVersion + 1,
 			// A lower bound on the local clock: the worker sends only while
@@ -118,10 +120,16 @@ func (s *Queue) MarkSent(ctx context.Context, job notification.Job, a notificati
 }
 
 // Reschedule records the failed attempt and returns the notification to
-// pending, due at dueAt. The delay is applied on the database clock.
+// pending, due at dueAt. The delay is applied on the database clock. The
+// failure counts against the budget only when a.Counted (decision 0026).
 func (s *Queue) Reschedule(ctx context.Context, job notification.Job, a notification.Attempt, dueAt time.Time) error {
 	return s.finish(ctx, job, a, notification.StatusPending, func(q *sqlc.Queries) (int64, error) {
+		counted := uint32(0)
+		if a.Counted {
+			counted = 1
+		}
 		return q.FinishRetry(ctx, sqlc.FinishRetryParams{
+			Counted:      counted,
 			LastError:    nullString(cut(a.Error, notification.MaxErrorLen)),
 			DelayUs:      delayUs(dueAt),
 			ID:           job.ID,

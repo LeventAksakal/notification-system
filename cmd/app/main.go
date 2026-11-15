@@ -30,11 +30,10 @@ import (
 
 	"github.com/LeventAksakal/notification-system/config"
 	delivery "github.com/LeventAksakal/notification-system/internal/delivery"
-	"github.com/LeventAksakal/notification-system/internal/delivery/breaker"
+	"github.com/LeventAksakal/notification-system/internal/delivery/health"
 	"github.com/LeventAksakal/notification-system/internal/delivery/limiter"
 	"github.com/LeventAksakal/notification-system/internal/httpapi"
 	"github.com/LeventAksakal/notification-system/internal/intake"
-	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/provider"
 	"github.com/LeventAksakal/notification-system/internal/realtime"
 	"github.com/LeventAksakal/notification-system/internal/store"
@@ -151,15 +150,6 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		return err
 	}
 
-	breakers := make(map[notification.Channel]*breaker.Breaker, len(notification.Channels))
-	for _, ch := range notification.Channels {
-		breakers[ch] = breaker.New(breaker.Config{
-			Window:       cfg.BreakerWindow,
-			MinRequests:  cfg.BreakerMinRequests,
-			FailureRatio: cfg.BreakerFailureRatio,
-			Cooldown:     cfg.BreakerCooldown,
-		}, time.Now)
-	}
 	w := delivery.New(delivery.Config{
 		Concurrency:     cfg.WorkerConcurrency,
 		MaxAttempts:     cfg.MaxAttempts,
@@ -171,12 +161,14 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		Weights:         cfg.PriorityWeights,
 		Horizon:         cfg.RateLimitHorizon,
 		SendAlign:       delivery.DefaultSendAlign,
+		ProviderTimeout: cfg.ProviderTimeout,
+		HealthCooldown:  cfg.BreakerCooldown,
 	}, delivery.Deps{
 		Queue:     store.NewQueue(db),
 		Limiter:   limiter.New(vk, cfg.RateLimitPerSecond, cfg.RateLimitHeadroomPct, cfg.RateLimitHorizon, "ratelimit:"),
 		Sender:    provider.New(cfg.ProviderURLs, cfg.ProviderTimeout, cfg.WorkerConcurrency),
 		Publisher: realtime.NewPublisher(vk, realtime.OriginWorker),
-		Breakers:  breakers,
+		Health:    health.NewValkey(vk, health.Config{Failures: cfg.BreakerFailures, Cooldown: cfg.BreakerCooldown}, "health:"),
 		Tracer:    otel.Tracer("notifier/worker"),
 		Waker:     wake.NewPublisher(vk),
 		Wakes:     wake.NewListener(vk),
@@ -186,6 +178,12 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		"max_attempts", cfg.MaxAttempts, "retry_span_mean", retryMean.String(), "retry_span_worst", retryWorst.String(),
 		"rate_per_second", cfg.RateLimitPerSecond, "headroom_percent", cfg.RateLimitHeadroomPct,
 		"horizon", cfg.RateLimitHorizon.String())
+	if cfg.MaxAttempts < cfg.BreakerFailures {
+		// Allowed (a deliberate fail-fast choice), but a lone message then
+		// spends its whole budget before its outage can be declared (0026).
+		slog.WarnContext(ctx, "retry budget below the outage threshold: a lone message is dead-lettered before an outage is detected",
+			"max_attempts", cfg.MaxAttempts, "breaker_failures", cfg.BreakerFailures)
+	}
 	err = w.Run(ctx)
 	slog.InfoContext(context.WithoutCancel(ctx), "worker stopped")
 	return err

@@ -19,7 +19,7 @@ type Verdict struct {
 	// Error describes a failed call for last_error; "" when accepted.
 	Error string
 	// ProviderFault is true when the call says the provider is unhealthy
-	// (it counts as a failure for the circuit breaker).
+	// (it counts as a fault for the shared provider health, decision 0026).
 	ProviderFault bool
 }
 

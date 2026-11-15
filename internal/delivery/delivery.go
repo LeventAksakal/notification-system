@@ -1,5 +1,6 @@
 // Package delivery is the delivery loop of `app worker` (rows R7, R8, R9, R11,
-// R12, B1, B2). Per channel it asks the breaker, reserves the send slots of
+// R12, B1, B2). Per channel it asks the channel's shared provider health
+// (decision 0026), reserves the send slots of
 // the next horizon in one limiter call, splits them between the priorities by
 // weight, claims the rows with one query per priority, and sends each job at
 // its slot. It classifies the answer and writes the result.
@@ -21,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -34,7 +34,7 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/LeventAksakal/notification-system/internal/delivery/breaker"
+	"github.com/LeventAksakal/notification-system/internal/delivery/health"
 	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/provider"
 	"github.com/LeventAksakal/notification-system/internal/telemetry"
@@ -55,7 +55,7 @@ type Config struct {
 	// provider hangs can hold at most its own places and the shared ones,
 	// never another channel's.
 	Concurrency     int
-	MaxAttempts     int           // APP_MAX_ATTEMPTS
+	MaxAttempts     int           // APP_MAX_ATTEMPTS: counted failures before a notification is exhausted
 	RetryBase       time.Duration // APP_RETRY_BASE
 	RetryCap        time.Duration // APP_RETRY_CAP
 	Lease           time.Duration // APP_LEASE_DURATION
@@ -77,7 +77,7 @@ type Config struct {
 	// reserve now: IdleMin while all its provider calls are in flight (a call
 	// place frees within a call's time), and the clock probe's back-off from
 	// IdleMin doubling to IdleMax; IdleMax after the limiter or a claim failed
-	// and as the cap of a breaker's wait. Defaults 50ms and 250ms. A channel
+	// and as the cap of a refused health check's wait. Defaults 50ms and 250ms. A channel
 	// with nothing due does not poll: it sleeps until its next due time, a
 	// wake hint, or SafetyPoll.
 	IdleMin, IdleMax time.Duration
@@ -85,6 +85,14 @@ type Config struct {
 	// database (Queue.NextDue): it bounds the delay a lost wake hint can
 	// cause. Default wake.SafetyPoll; not an operator dial (tests shorten it).
 	SafetyPoll time.Duration
+	// ProviderTimeout is APP_PROVIDER_TIMEOUT, the Sender's own limit on one
+	// call; it bounds the probe lease (probeLease). 0: the lease bounds it.
+	ProviderTimeout time.Duration
+	// HealthCooldown is APP_BREAKER_COOLDOWN. Rows whose failure belongs to an
+	// outage are spread over one cool-down after the next probe may go, so
+	// they do not come due together and declare the outage again by
+	// themselves (decision 0026). 0: no spread.
+	HealthCooldown time.Duration
 }
 
 // DefaultSendAlign is SendAlign's default: above the claim's start-up p99.
@@ -96,10 +104,10 @@ type Deps struct {
 	Limiter   notification.Limiter
 	Sender    Sender
 	Publisher notification.Publisher
-	// Breakers holds one breaker per channel; a channel without one gets a
-	// breaker that never opens.
-	Breakers map[notification.Channel]*breaker.Breaker
-	Tracer   trace.Tracer
+	// Health is the channels' provider health shared by every worker
+	// (health.ValkeyState in production); nil: a state that never opens.
+	Health health.State
+	Tracer trace.Tracer
 	// Rand returns a uniform value in [0, n]; default math/rand/v2.
 	Rand func(n int64) int64
 	// Now is the clock a job's lease is checked against; default time.Now.
@@ -126,6 +134,7 @@ type Wakes interface {
 type Worker struct {
 	cfg   Config
 	deps  Deps
+	gates map[notification.Channel]*health.Gate
 	clock *clockMap // Valkey's clock to the local one, for every channel
 	m     metrics
 	// runs is set by Run before anything that reads it starts.
@@ -170,16 +179,14 @@ func New(cfg Config, deps Deps) *Worker {
 	if deps.Tracer == nil {
 		deps.Tracer = noop.NewTracerProvider().Tracer("worker")
 	}
-	breakers := make(map[notification.Channel]*breaker.Breaker, len(cfg.Channels))
-	for _, ch := range cfg.Channels {
-		br := deps.Breakers[ch]
-		if br == nil {
-			br = breaker.New(breaker.Config{Window: time.Second, MinRequests: math.MaxInt, FailureRatio: 1, Cooldown: time.Second}, time.Now)
-		}
-		breakers[ch] = br
+	if deps.Health == nil {
+		deps.Health = health.NeverOpens()
 	}
-	deps.Breakers = breakers
-	return &Worker{cfg: cfg, deps: deps, clock: newClockMap(time.Now(), clockWindow, time.Second+cfg.Horizon+cfg.SendAlign), m: newMetrics(deps.Meter)}
+	gates := make(map[notification.Channel]*health.Gate, len(cfg.Channels))
+	for _, ch := range cfg.Channels {
+		gates[ch] = health.NewGate(deps.Health, ch)
+	}
+	return &Worker{cfg: cfg, deps: deps, gates: gates, clock: newClockMap(time.Now(), clockWindow, time.Second+cfg.Horizon+cfg.SendAlign), m: newMetrics(deps.Meter)}
 }
 
 // storeTimeout bounds one result write; it is not cut short by shutdown, so a
@@ -251,8 +258,8 @@ func (w *Worker) Run(ctx context.Context) error {
 
 // channelRun is what a channel's loop, its claim groups and its sends share.
 type channelRun struct {
-	ch notification.Channel
-	br *breaker.Breaker
+	ch   notification.Channel
+	gate *health.Gate // the channel's shared provider health, as this worker sees it
 	// calling bounds the provider calls in flight on this channel. While no
 	// place is free the loop reserves no slots.
 	calling callPlaces
@@ -274,7 +281,7 @@ type channelRun struct {
 
 func (w *Worker) newChannelRun(ch notification.Channel, calling callPlaces) *channelRun {
 	return &channelRun{
-		ch: ch, br: w.deps.Breakers[ch],
+		ch: ch, gate: w.gates[ch],
 		calling: calling, claiming: make(chan struct{}, 1), wake: make(chan struct{}, 1),
 		sel: newSelector(w.cfg.Weights),
 	}
@@ -327,7 +334,8 @@ func (w *Worker) refill() time.Duration { return max(w.cfg.Horizon/2, time.Milli
 
 // channelLoop reserves slots and hands each group to a claim task. It
 // reserves nothing while every priority is known to be empty, while the
-// breaker refuses, while the channel's previous claim is running, or while
+// provider health refuses (an outage is declared and this worker does not
+// hold the probe), while the channel's previous claim is running, or while
 // the channel's provider calls are all in flight.
 func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, inflight *sync.WaitGroup) {
 	limiterDown := false
@@ -354,6 +362,9 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			limiterDown = false
 		}
 	}
+	// The health gate fails closed: without the shared state nothing is
+	// claimed (the limiter lives in the same Valkey and is down too).
+	healthDown := false
 	for ctx.Err() == nil {
 		now := time.Now()
 		cr.mu.Lock()
@@ -420,15 +431,33 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 				clockUncertain = false
 			}
 		}
-		first, ok, wait := cr.br.Allow()
+		first, ok, wait, err := cr.gate.Allow(ctx, w.probeLease(interval))
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if !healthDown {
+				slog.ErrorContext(ctx, "provider health unreachable; channel sends nothing", "channel", cr.ch, "err", err)
+				healthDown = true
+			}
+			sleep(ctx, w.cfg.IdleMax)
+			continue
+		}
+		if healthDown {
+			slog.InfoContext(ctx, "provider health reachable again", "channel", cr.ch)
+			healthDown = false
+		}
 		if !ok {
+			// An outage is declared: wait out the cool-down or the probe that
+			// is out, asking again at least every IdleMax so a recovery that
+			// another worker's probe saw (or a lost state) is noticed within it.
 			sleep(ctx, min(wait, w.cfg.IdleMax))
 			continue
 		}
 		select {
 		case cr.claiming <- struct{}{}:
 		case <-ctx.Done():
-			cr.br.Cancel(first)
+			w.cancel(ctx, cr, first)
 			return
 		}
 		want := int(w.cfg.Horizon/interval) + 1
@@ -440,7 +469,7 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		got := time.Now()
 		if err != nil {
 			<-cr.claiming
-			cr.br.Cancel(first)
+			w.cancel(ctx, cr, first)
 			if ctx.Err() != nil {
 				return
 			}
@@ -481,7 +510,7 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 				// at most one request to a second, or a backward one, which
 				// leaves a gap: the grant is used as placed.
 				<-cr.claiming
-				cr.br.Cancel(first)
+				w.cancel(ctx, cr, first)
 				w.m.gaveUp(ctx, cr.ch, giveUpClockStepped, g.N)
 				continue
 			}
@@ -493,7 +522,7 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			// without voiding may land here, its round trip being slow); the
 			// next turn reads the clock without reserving.
 			<-cr.claiming
-			cr.br.Cancel(first)
+			w.cancel(ctx, cr, first)
 			w.m.gaveUp(ctx, cr.ch, giveUpClockUncertain, g.N)
 			if !clockUncertain {
 				slog.WarnContext(ctx, "limiter clock offset too uncertain to hold the rate; channel sends nothing",
@@ -509,20 +538,24 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		}
 		if g.N == 0 {
 			<-cr.claiming
-			cr.br.Cancel(first)
+			w.cancel(ctx, cr, first)
 			sleep(ctx, pause)
 			continue
 		}
-		tickets := make([]breaker.Ticket, 1, g.N)
-		tickets[0] = first
-		for len(tickets) < g.N {
-			t, ok, _ := cr.br.Allow()
-			if !ok {
-				break // the breaker opened meanwhile: the other slots are lost
-			}
-			tickets = append(tickets, t)
+		if !cr.gate.Current(first) {
+			// An outage was declared meanwhile (one of this worker's results
+			// said so): the slots are lost.
+			<-cr.claiming
+			w.cancel(ctx, cr, first)
+			w.m.gaveUp(ctx, cr.ch, giveUpBreakerOpened, g.N)
+			continue
 		}
-		w.m.gaveUp(ctx, cr.ch, giveUpBreakerOpened, g.N-len(tickets))
+		// One admission covers the grant: every slot carries the same ticket
+		// (a probe's grant has one slot).
+		tickets := make([]health.Ticket, g.N)
+		for i := range tickets {
+			tickets[i] = first
+		}
 		base := w.clock.toLocal(g.At.Add(g.First), upper).Add(w.cfg.SendAlign)
 		slots := make([]time.Time, len(tickets))
 		for i := range slots {
@@ -562,11 +595,11 @@ func (w *Worker) logClockStep(ctx context.Context, ch notification.Channel, r cl
 }
 
 // group is one grant's slots as placed on the local clock: their moments,
-// breaker tickets, how late each may leave, and the clock mapping's
+// health tickets, how late each may leave, and the clock mapping's
 // generation they were placed under.
 type group struct {
 	slots     []time.Time
-	tickets   []breaker.Ticket
+	tickets   []health.Ticket
 	tolerance time.Duration
 	gen       uint64
 	// flex: the limiter's grid had been free for at least SendAlign plus one
@@ -633,7 +666,7 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr gro
 		}
 		w.m.gaveUp(ctx, cr.ch, giveUpClockStepped, len(slots)-i)
 		for ; i < len(slots); i++ {
-			cr.br.Cancel(tickets[i])
+			w.cancel(ctx, cr, tickets[i])
 		}
 		return true
 	}
@@ -646,7 +679,7 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr gro
 	skipMissed := func(now time.Time) {
 		from := i
 		for i < len(slots) && now.After(slots[i].Add(tolerance)) {
-			cr.br.Cancel(tickets[i])
+			w.cancel(ctx, cr, tickets[i])
 			i++
 		}
 		w.m.gaveUp(ctx, cr.ch, giveUpSlotMissed, i-from)
@@ -714,7 +747,7 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr gro
 		}()
 	}
 	for ; i < len(slots); i++ {
-		cr.br.Cancel(tickets[i])
+		w.cancel(ctx, cr, tickets[i])
 	}
 }
 
@@ -739,17 +772,17 @@ func (w *Worker) announce(ctx context.Context, jobs []notification.Job, inflight
 // cannot happen within tolerance or a clock step has voided the slot's
 // generation gen. Its result is published after announced is closed (nil:
 // at once).
-func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job notification.Job, announced <-chan struct{}, at time.Time, tk breaker.Ticket, tolerance time.Duration, gen uint64) {
+func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job notification.Job, announced <-chan struct{}, at time.Time, tk health.Ticket, tolerance time.Duration, gen uint64) {
 	sleep(ctx, time.Until(at))
 	if ctx.Err() != nil {
-		cr.br.Cancel(tk)
+		w.cancel(ctx, cr, tk)
 		w.release(jctx, job, announced, "shutdown before the send")
 		return
 	}
 	late := at.Add(tolerance)
 	give, ok := cr.calling.take(ctx, late)
 	if !ok {
-		cr.br.Cancel(tk)
+		w.cancel(ctx, cr, tk)
 		reason := "no free provider call at its slot"
 		if ctx.Err() != nil {
 			reason = "shutdown before the send"
@@ -766,7 +799,7 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job notificat
 	defer callDone()
 	if time.Now().After(late) {
 		callDone()
-		cr.br.Cancel(tk)
+		w.cancel(ctx, cr, tk)
 		w.m.gaveUp(ctx, cr.ch, giveUpSlotMissed, 1)
 		w.release(jctx, job, announced, "slot missed")
 		return
@@ -775,19 +808,20 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job notificat
 		// A forward clock step of an interval or more (clockMap.gen): this
 		// slot is on the old mapping and could leave beside the new one's.
 		callDone()
-		cr.br.Cancel(tk)
+		w.cancel(ctx, cr, tk)
 		w.m.gaveUp(ctx, cr.ch, giveUpClockStepped, 1)
 		w.release(jctx, job, announced, "limiter clock stepped")
 		return
 	}
-	if !cr.br.Current(tk) {
-		// The breaker opened after the claim: nothing goes out (decision 0008).
+	if !cr.gate.Current(tk) {
+		// An outage was declared after the claim, as this worker last saw the
+		// shared health: nothing goes out (decision 0026).
 		callDone()
 		w.m.gaveUp(ctx, cr.ch, giveUpBreakerOpened, 1)
-		w.release(jctx, job, announced, "breaker opened before the send")
+		w.release(jctx, job, announced, "provider outage declared before the send")
 		return
 	}
-	w.deliver(jctx, job, announced, cr.br, tk, callDone)
+	w.deliver(jctx, job, announced, cr.gate, tk, callDone)
 }
 
 // pause makes the channel loop reserve nothing until until.
@@ -996,11 +1030,11 @@ func jobContext(ctx context.Context, job notification.Job) context.Context {
 // not made and the job is released. callDone is called once the provider
 // call is over (or will not be made). The result is published after
 // announced is closed.
-func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-chan struct{}, br *breaker.Breaker, tk breaker.Ticket, callDone func()) {
+func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-chan struct{}, gate *health.Gate, tk health.Ticket, callDone func()) {
 	left := job.LeaseUntil.Sub(w.deps.Now()) - leaseMargin
 	if left < minSendTime {
 		callDone()
-		br.Cancel(tk)
+		w.cancelGate(ctx, gate, tk)
 		slog.WarnContext(ctx, "lease too close to its end to send; released", "channel", job.Channel,
 			"lease_left_ms", (left + leaseMargin).Milliseconds())
 		w.m.gaveUp(ctx, job.Channel, giveUpLeaseTooShort, 1)
@@ -1033,7 +1067,7 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 	callDone()
 	if err != nil && ctx.Err() != nil {
 		// Shutdown aborted the call: not an attempt; give the job back.
-		br.Cancel(tk)
+		w.cancelGate(ctx, gate, tk)
 		span.SetStatus(codes.Error, "aborted by shutdown")
 		w.release(ctx, job, announced, "shutdown aborted the call")
 		return
@@ -1044,11 +1078,12 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 		err = fmt.Errorf("%w: %w (%s before its end)", provider.ErrTimeout, errLeaseCut, leaseMargin)
 	}
 	v := provider.Classify(res.Status, err, res.Header)
-	br.Done(tk, !v.ProviderFault)
+	healthy, healthWait := w.reportHealth(ctx, job.Channel, gate, tk, v)
 	w.m.attempt(ctx, job.Channel, v.Outcome, elapsed.Seconds())
+	nx := decide(v, healthy, healthWait, job.BudgetSpent, w.cfg, w.deps.Rand)
 	a := notification.Attempt{
 		StartedAt: start, Duration: elapsed, Outcome: v.Outcome, HTTPStatus: res.Status,
-		Error: v.Error, ProviderMessageID: res.MessageID,
+		Error: v.Error, ProviderMessageID: res.MessageID, Counted: nx.counted,
 	}
 	span.SetAttributes(attribute.Int("http.response.status_code", res.Status), attribute.String("delivery.outcome", string(v.Outcome)))
 	if v.Outcome != notification.OutcomeAccepted {
@@ -1060,30 +1095,25 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 	attempts := job.Attempts + 1
 	log := []any{"channel", job.Channel, "priority", job.Priority, "attempt", attempts,
 		"http_status", res.Status, "outcome", v.Outcome, "duration_ms", elapsed.Milliseconds()}
+	if v.Outcome != notification.OutcomeAccepted {
+		log = append(log, "counted", nx.counted, "budget_spent", nx.budgetSpent)
+	}
 
-	var status notification.Status
+	status := nx.status
 	var retryAt time.Time // set when the job is rescheduled
 	var werr error
-	switch {
-	case v.Outcome == notification.OutcomeAccepted:
-		status = notification.StatusSent
+	switch status {
+	case notification.StatusSent:
 		if res.MessageID == "" {
 			slog.WarnContext(ctx, "provider accepted without messageId; counted as sent", log...)
 		}
 		werr = w.deps.Queue.MarkSent(wctx, job, a)
-	case v.Outcome == notification.OutcomePermanent:
-		status = notification.StatusFailed
-		log = append(log, "failure_kind", notification.FailurePermanent, "error", v.Error)
-		werr = w.deps.Queue.MarkFailed(wctx, job, a, notification.FailurePermanent)
-	case attempts >= w.cfg.MaxAttempts:
-		status = notification.StatusFailed
-		log = append(log, "failure_kind", notification.FailureExhausted, "error", v.Error)
-		werr = w.deps.Queue.MarkFailed(wctx, job, a, notification.FailureExhausted)
+	case notification.StatusFailed:
+		log = append(log, "failure_kind", nx.kind, "error", v.Error)
+		werr = w.deps.Queue.MarkFailed(wctx, job, a, nx.kind)
 	default:
-		status = notification.StatusPending
-		delay := Backoff(attempts, w.cfg.RetryBase, w.cfg.RetryCap, v.RetryAfter, w.deps.Rand)
-		log = append(log, "retry_in_ms", delay.Milliseconds(), "error", v.Error)
-		retryAt = time.Now().Add(delay)
+		log = append(log, "retry_in_ms", nx.retryIn.Milliseconds(), "error", v.Error)
+		retryAt = time.Now().Add(nx.retryIn)
 		werr = w.deps.Queue.Reschedule(wctx, job, a, retryAt)
 	}
 	switch {

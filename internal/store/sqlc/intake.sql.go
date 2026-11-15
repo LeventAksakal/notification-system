@@ -131,7 +131,7 @@ func (q *Queries) GetIdempotencyKey(ctx context.Context, idemKey string) (Idempo
 }
 
 const getNotification = `-- name: GetNotification :one
-SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.failure_kind, notifications.attempts, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
+SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.failure_kind, notifications.attempts, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at, notifications.budget_spent,
   CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
 FROM notifications
 WHERE id = ?
@@ -167,6 +167,7 @@ func (q *Queries) GetNotification(ctx context.Context, id string) (GetNotificati
 		&i.Notification.CreatedAt,
 		&i.Notification.UpdatedAt,
 		&i.Notification.FinishedAt,
+		&i.Notification.BudgetSpent,
 		&i.IsScheduled,
 	)
 	return i, err
@@ -275,7 +276,7 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 }
 
 const listBatchItems = `-- name: ListBatchItems :many
-SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.failure_kind, notifications.attempts, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
+SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.failure_kind, notifications.attempts, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at, notifications.budget_spent,
   CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
 FROM notifications
 WHERE batch_id = ? AND CAST(batch_index AS SIGNED) > ?
@@ -326,6 +327,7 @@ func (q *Queries) ListBatchItems(ctx context.Context, arg ListBatchItemsParams) 
 			&i.Notification.CreatedAt,
 			&i.Notification.UpdatedAt,
 			&i.Notification.FinishedAt,
+			&i.Notification.BudgetSpent,
 			&i.IsScheduled,
 		); err != nil {
 			return nil, err
@@ -442,7 +444,7 @@ func (q *Queries) ListTemplates(ctx context.Context) ([]Template, error) {
 
 const replayNotification = `-- name: ReplayNotification :execrows
 UPDATE notifications
-SET status = 'pending', attempts = 0, failure_kind = NULL, finished_at = NULL, due_at = NOW(3)
+SET status = 'pending', attempts = 0, budget_spent = 0, failure_kind = NULL, finished_at = NULL, due_at = NOW(3)
 WHERE id = ? AND status = 'failed'
 `
 

@@ -46,9 +46,7 @@ type Config struct {
 	LeaseDuration        time.Duration
 	ReapInterval         time.Duration
 	WorkerConcurrency    int
-	BreakerWindow        time.Duration
-	BreakerMinRequests   int
-	BreakerFailureRatio  float64
+	BreakerFailures      int
 	BreakerCooldown      time.Duration
 	IdempotencyRetention time.Duration
 	IdempotencySweep     time.Duration
@@ -92,11 +90,17 @@ var Dials = []Dial{
 	providerURL("APP_PROVIDER_URL_PUSH", notification.ChannelPush),
 	duration("APP_PROVIDER_TIMEOUT", "5s", "time limit of one provider call", 10*time.Millisecond, time.Minute,
 		func(c *Config) *time.Duration { return &c.ProviderTimeout }),
-	integer("APP_MAX_ATTEMPTS", "12", "provider calls before a notification fails as exhausted; with the default base and cap a message retries for about 12 min on average (23.5 at most)", 1, 50,
+	integer("APP_MAX_ATTEMPTS", "10", "failed calls counted against a notification (made while its provider was believed healthy) "+
+		"before it fails as exhausted. Default: the smallest budget whose waits reach APP_RETRY_CAP, ceil(log2(cap/base))+1 = 10 with "+
+		"the default base and cap (a message-specific failure is retried for 6.75 min on average, 13.5 at most); also at least "+
+		"APP_BREAKER_FAILURES, so a lone message survives the detection of its outage", 1, 50,
 		func(c *Config) *int { return &c.MaxAttempts }),
-	duration("APP_RETRY_BASE", "1s", "backoff base; attempt n waits random(0, min(cap, base*2^n))", time.Millisecond, time.Minute,
+	duration("APP_RETRY_BASE", "1s", "backoff base; after n counted failures the wait is random(0, min(cap, base*2^n)). "+
+		"Default: the AWS SDK standard retry mode's base (full jitter, 1 s), so the first retry comes within 2 s", time.Millisecond, time.Minute,
 		func(c *Config) *time.Duration { return &c.RetryBase }),
-	duration("APP_RETRY_CAP", "5m", "backoff cap, the longest wait between two attempts; at least APP_RETRY_BASE", time.Millisecond, 24*time.Hour,
+	duration("APP_RETRY_CAP", "5m", "backoff cap, the longest wait between two attempts; at least APP_RETRY_BASE. "+
+		"Default target: once a message-specific failure clears, the message goes out within 5 min (time-sensitive "+
+		"notifications such as one-time codes commonly expire in 5 to 10 min)", time.Millisecond, 24*time.Hour,
 		func(c *Config) *time.Duration { return &c.RetryCap }),
 	integer("APP_RATE_LIMIT_PER_SECOND", "100", "provider's send limit per channel, per second", 1, 100_000,
 		func(c *Config) *int { return &c.RateLimitPerSecond }),
@@ -118,13 +122,15 @@ var Dials = []Dial{
 		func(c *Config) *time.Duration { return &c.ReapInterval }),
 	integer("APP_WORKER_CONCURRENCY", "32", "provider calls in flight per worker process", 1, 1024,
 		func(c *Config) *int { return &c.WorkerConcurrency }),
-	duration("APP_BREAKER_WINDOW", "10s", "window the breaker's failure ratio is measured over", 100*time.Millisecond, 10*time.Minute,
-		func(c *Config) *time.Duration { return &c.BreakerWindow }),
-	integer("APP_BREAKER_MIN_REQUESTS", "10", "calls in the window before the failure ratio counts", 1, 10_000,
-		func(c *Config) *int { return &c.BreakerMinRequests }),
-	ratio("APP_BREAKER_FAILURE_RATIO", "0.5", "the breaker opens at or above this failure ratio", 0.01, 1,
-		func(c *Config) *float64 { return &c.BreakerFailureRatio }),
-	duration("APP_BREAKER_COOLDOWN", "5s", "open time before one half-open probe", 10*time.Millisecond, 10*time.Minute,
+	integer("APP_BREAKER_FAILURES", "5", "consecutive provider-fault results on a channel, across all workers, that declare its "+
+		"provider down (shared in Valkey, decision 0026); the declaring failure and every later one until recovery do not count "+
+		"against a message's budget. Default: Envoy outlier detection's consecutive_5xx (5): an outage is declared within 5 failed "+
+		"calls fleet-wide and costs at most 4 budget units; at 95/s a provider failing 10% of calls at random trips about once per "+
+		"20 min", 1, 10_000,
+		func(c *Config) *int { return &c.BreakerFailures }),
+	duration("APP_BREAKER_COOLDOWN", "5s", "least time between an outage being declared (or a probe failing) and the next probe; "+
+		"one probe per cool-down fleet-wide. Default target: sending resumes within 5 s plus one probe round trip of recovery "+
+		"(Hystrix's default sleep window), for one call per 5 s while down (0.2% of the paced rate)", 10*time.Millisecond, 10*time.Minute,
 		func(c *Config) *time.Duration { return &c.BreakerCooldown }),
 	duration("APP_IDEMPOTENCY_RETENTION", "24h", "how long an Idempotency-Key is remembered", time.Second, 30*24*time.Hour,
 		func(c *Config) *time.Duration { return &c.IdempotencyRetention }),
@@ -234,21 +240,6 @@ func providerURL(env string, ch notification.Channel) Dial {
 				return fmt.Errorf("not an http(s) URL: %q", raw)
 			}
 			c.ProviderURLs[ch] = raw
-			return nil
-		}}
-}
-
-func ratio(env, def, doc string, lo, hi float64, field func(*Config) *float64) Dial {
-	return Dial{Env: env, Default: def, Doc: fmt.Sprintf("%s [%g..%g]", doc, lo, hi),
-		apply: func(c *Config, raw string) error {
-			v, err := strconv.ParseFloat(raw, 64)
-			if err != nil {
-				return fmt.Errorf("not a number: %q", raw)
-			}
-			if v < lo || v > hi {
-				return fmt.Errorf("%g outside [%g..%g]", v, lo, hi)
-			}
-			*field(c) = v
 			return nil
 		}}
 }

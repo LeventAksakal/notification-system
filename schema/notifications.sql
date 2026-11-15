@@ -17,6 +17,11 @@ CREATE TABLE notifications (
   failure_kind ENUM('permanent', 'exhausted') NULL,
   -- Provider calls made in the current attempt budget; reset by a replay.
   attempts INT UNSIGNED NOT NULL DEFAULT 0,
+  -- Failed calls counted against the attempt budget (APP_MAX_ATTEMPTS): only
+  -- those made while the channel's provider was believed healthy; a failure
+  -- that belongs to a declared outage is recorded but not counted (decision
+  -- 0026). Reset by a replay.
+  budget_spent INT UNSIGNED NOT NULL DEFAULT 0,
   -- Earliest claim time: the schedule or the next retry (decisions 0007, 0016).
   due_at DATETIME(3) NOT NULL,
   scheduled_at DATETIME(3) NULL,
@@ -38,6 +43,7 @@ CREATE TABLE notifications (
   CONSTRAINT recipient_sms_e164 CHECK (((`channel` <> _utf8mb4'sms') or regexp_like(`recipient`,_utf8mb4'^\\+[0-9]{7,15}$'))),
   CONSTRAINT content_length CHECK ((((`channel` = _utf8mb4'sms') and (char_length(`content`) between 1 and 1600)) or ((`channel` = _utf8mb4'email') and (char_length(`content`) between 1 and 100000)) or ((`channel` = _utf8mb4'push') and (char_length(`content`) between 1 and 1024)))),
   CONSTRAINT failure_kind_only_when_failed CHECK ((status = 'failed') = (failure_kind IS NOT NULL)),
+  CONSTRAINT budget_within_attempts CHECK ((`budget_spent` <= `attempts`)),
   -- The claim: WHERE status='pending' AND channel=? AND priority=? AND due_at<=NOW(3) ORDER BY due_at.
   KEY claim_idx (status, channel, priority, due_at),
   -- The reaper: WHERE status='processing' AND lease_until < NOW(3).

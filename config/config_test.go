@@ -46,7 +46,7 @@ func TestDeliveryDialsDefaultToTheContractTable(t *testing.T) {
 			t.Errorf("provider URL for %s: %q", ch, c.ProviderURL(ch))
 		}
 	}
-	if c.PriorityWeights != [3]int{70, 20, 10} || c.BreakerFailureRatio != 0.5 || c.MaxAttempts != 12 ||
+	if c.PriorityWeights != [3]int{70, 20, 10} || c.BreakerFailures != 5 || c.MaxAttempts != 10 ||
 		c.RetryCap != 5*time.Minute || c.IdempotencyRetention != 24*time.Hour || c.WSSendBuffer != 256 ||
 		c.RateLimitHorizon != 200*time.Millisecond || c.RateLimitHeadroomPct != 5 {
 		t.Fatalf("defaults not applied: %+v", c)
@@ -58,8 +58,8 @@ func TestBrokenDeliveryDialsAreRefused(t *testing.T) {
 		"two weights":              {"APP_PRIORITY_WEIGHTS", "70,30"},
 		"weight over 100":          {"APP_PRIORITY_WEIGHTS", "101,0,0"},
 		"weights sum to zero":      {"APP_PRIORITY_WEIGHTS", "0,0,0"},
-		"ratio above one":          {"APP_BREAKER_FAILURE_RATIO", "1.5"},
-		"ratio not a number":       {"APP_BREAKER_FAILURE_RATIO", "half"},
+		"breaker failures zero":    {"APP_BREAKER_FAILURES", "0"},
+		"breaker failures a ratio": {"APP_BREAKER_FAILURES", "0.5"},
 		"provider URL no host":     {"APP_PROVIDER_URL_SMS", "send"},
 		"retry cap below base":     {"APP_RETRY_CAP", "10ms"},
 		"zero concurrency":         {"APP_WORKER_CONCURRENCY", "0"},
