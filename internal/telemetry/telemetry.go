@@ -27,6 +27,11 @@ import (
 
 // Setup installs the global logger and OTel providers. The returned func
 // flushes and stops them; call it on shutdown with a bounded context.
+//
+// The tracer provider is built without WithSampler on purpose: the SDK then
+// takes its sampler from OTEL_TRACES_SAMPLER and OTEL_TRACES_SAMPLER_ARG
+// (validated in config), and WithSampler would override them. Unset, it is
+// parentbased_always_on: 100%, the local default (decision 0019).
 func Setup(ctx context.Context, service, endpoint string, level slog.Level) (func(context.Context) error, error) {
 	stdout := contextHandler{slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})}
 	// The W3C propagator is installed even without an exporter: an incoming

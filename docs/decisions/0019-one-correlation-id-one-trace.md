@@ -34,3 +34,28 @@ Built as option 2, not the recommended option 1: the worker's delivery span is a
 - Lines about a notification carry its stored correlation id; a cancel line used to carry the cancel request's own id (owner item 0006 §4). The request's own id stays on its access line.
 - Sampling: 100% locally (every demo trace visible, small volume). Production uses the standard `OTEL_TRACES_SAMPLER=parentbased_traceidratio`, with a ratio derived from a trace-storage budget. It is parent-based, so the worker honours the API's decision.
 - Both fixes built in session trace-correlation (branch `feat-correlation-sampling`), merged with the rest.
+
+## As built (16 Nov 2026): whose correlation id a line carries, and how many traces are kept
+
+### Correlation id on lines about a notification (owner item 0006 §4, option a)
+- A line about a notification (`notification_id` set) carries in `correlation_id` the id stored on that notification, whichever request or worker writes it: `notification accepted`, `notification create replayed`, `notification cancelled`, `notification replayed` (retry of a failed one), and the worker's `delivery attempt`, release and status-change lines. `telemetry.WithNotification` and the worker's `jobContext` set it.
+- The current request's own id keeps the name `correlation_id` on that request's lines that are not about one notification: the access line `request`, error and timeout lines. On a line about a notification written by a later request (replay, cancel, retry), the request's id is added as `request_correlation_id`. Filtering by a notification's id therefore finds its whole story, and filtering by a request's id finds that request's access line and the lines it wrote about notifications.
+- A batch: `batch accepted` carries the batch's stored id, which is the creating request's id; each notification of a batch stores that same id, so its worker lines carry it too.
+- Any new line about a notification (reschedule included) goes through `telemetry.WithNotification` with the stored id.
+- Tests: `TestLinesAboutANotificationCarryItsStoredCorrelationIDWhicheverRequestWritesThem` (`internal/intake`, integration: create, replay, cancel, retry), `TestLinesAboutANotificationCarryItsStoredCorrelationID` (`internal/telemetry`), and the cancel case of `TestR14CorrelationIDOnLogsAndProvider`.
+
+### Trace sampling
+- The sampler is the OpenTelemetry standard pair `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG`, read by the Go SDK (v1.47.0) in `sdktrace.NewTracerProvider`; `internal/telemetry` passes no `WithSampler`, which would override them. They are declared in `config` like every setting (decision 0020: one schema in code), marked `PassThrough` because the SDK, not `Config`, reads them: documented in `app env`, and a value the SDK would silently replace with "sample everything" (an unknown sampler, a ratio outside [0, 1] or NaN) refuses to start, as does a ratio set beside a sampler that ignores it. A misspelt variable name is not caught (`app env check` knows only `APP_` names).
+- Local default: unset, which is `parentbased_always_on`, 100%. Every demo trace is visible and the volume is a few thousand traces a day.
+- Production: `OTEL_TRACES_SAMPLER=parentbased_traceidratio`, `OTEL_TRACES_SAMPLER_ARG=0.02`. Parent-based is required, not a preference: the API decides when the request arrives, the decision travels in the stored `traceparent`'s sampled flag, and the worker's delivery span is its child, so the worker keeps exactly the traces the API kept. A non-parent-based sampler in the worker would record delivery spans whose request span was dropped. `TestTheWorkerHonoursTheStoredSamplingDecision` (`internal/delivery`): an unsampled stored trace records no delivery span at ratio 1, a sampled one is recorded at ratio 0.
+- What ratio sampling loses: 98% of failed deliveries have no trace. Their log lines (every one, with the correlation id) remain. Keeping every error trace needs tail sampling in a collector; not built. Revisit when a collector sits between the services and Tempo.
+
+### Numbers
+| Number | Value | Derivation |
+|---|---|---|
+| Sends per day at the ceiling | 24 624 000 | 3 channels × 100/s (`APP_RATE_LIMIT_PER_SECOND`) × 0.95 (5% `APP_RATE_LIMIT_HEADROOM_PERCENT`) = 285/s; × 86 400 s |
+| Spans per sent notification | 2 | 1 API request span (otelhttp server; a batch request is one span for up to 1000 notifications, so at most 1 each) + 1 `deliver` span per provider attempt, 1 attempt when the provider is healthy. No database or provider-client spans are instrumented |
+| Trace-storage budget (assumption) | 1 000 000 spans/day | About 1 GB/day at about 1 KB per stored span, about 30 GB a month. An assumption to replace with the real backend's quota; the ratio follows by the row below |
+| Production `OTEL_TRACES_SAMPLER_ARG` | 0.02 | 1 000 000 spans/day ÷ (24 624 000 sends/day × 2 spans) = 0.0203, rounded down to 0.02: 492 480 traces, 984 960 spans a day at the ceiling, about 5.7 kept notifications a second |
+| Delivery spans, upper bound | 492 480/day | Every attempt, retries included, takes a limiter slot, so provider calls never exceed 24 624 000 a day however many attempts each notification needs: × 0.02. Retries do not grow the trace volume |
+| Room left for request spans | 25 376 000 traced requests/day | (1 000 000 − 492 480) spans ÷ 0.02, about 294 requests a second. Every HTTP request is a span (otelhttp wraps the whole mux): creates, reads, lists, `/docs`, health probes. Intake above the send rate and heavy read traffic are what exceed the budget; the ratio then follows by the same division |

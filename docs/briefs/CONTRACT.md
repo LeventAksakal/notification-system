@@ -56,6 +56,8 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 | `APP_IDEMPOTENCY_RETENTION` | `24h` | how long a key is remembered |
 | `APP_IDEMPOTENCY_SWEEP_INTERVAL` | `1m` | how often expired keys are deleted |
 | `APP_WS_SEND_BUFFER` | `256` | events buffered per subscriber before it is dropped |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | pass-through, read by the OpenTelemetry SDK and validated by `config`; production `parentbased_traceidratio` (decision 0019) |
+| `OTEL_TRACES_SAMPLER_ARG` | `1` | pass-through; share of new traces kept by the `*traceidratio` samplers; production `0.02`, derived in decision 0019 |
 
 ## Acceptance test harness (`test/acceptance/`, build tag `integration`)
 - Black box: the tests build `./cmd/app` once (`TestMain`), start real MySQL and Valkey with `test/support` (`support.MySQL(t)` returns a migrated database and its DSN, `support.Valkey(t)` an address, `support.Provider(t)` the double's URL and handle), then run `app serve` and N × `app worker` as child processes configured only through the variables above. They speak HTTP to the API, read the provider double's counters, and read the children's stdout for log assertions.

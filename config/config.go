@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -63,7 +64,13 @@ type Dial struct {
 	Default  string // "" with Required means the value must be injected
 	Required bool
 	Secret   bool
-	apply    func(c *Config, raw string) error
+	// PassThrough marks a variable a library reads itself (the OpenTelemetry
+	// SDK's OTEL_*): it is declared, documented and validated here, so a bad
+	// value refuses to start instead of falling back silently, and its Default
+	// is what the library does when it is unset. Config does not hold it.
+	// A misspelt name is not caught: env check knows only APP_ names.
+	PassThrough bool
+	apply       func(c *Config, raw string) error
 }
 
 // Dials lists every setting. Order is the order of the docs.
@@ -75,6 +82,28 @@ var Dials = []Dial{
 	text("APP_OTLP_ENDPOINT", "", "OTLP/HTTP base URL, e.g. http://otel:4318; empty disables export",
 		func(c *Config) *string { return &c.OTLPEndpoint }),
 	text("APP_SERVICE_NAME", "notifier", "service.name on every span, metric and log", func(c *Config) *string { return &c.ServiceName }),
+	{Env: "OTEL_TRACES_SAMPLER", Default: "parentbased_always_on", PassThrough: true,
+		Doc: "trace sampler, read by the OpenTelemetry SDK: " + strings.Join(traceSamplers, ", ") +
+			". Keep it parentbased_*: the worker continues the trace stored at the API, so the API's decision must hold there " +
+			"(production: parentbased_traceidratio, decision 0019)",
+		apply: func(_ *Config, raw string) error {
+			if !slices.Contains(traceSamplers, strings.ToLower(strings.TrimSpace(raw))) {
+				return fmt.Errorf("unknown sampler %q (want one of %s)", raw, strings.Join(traceSamplers, ", "))
+			}
+			return nil
+		}},
+	{Env: "OTEL_TRACES_SAMPLER_ARG", Default: "1", PassThrough: true,
+		Doc: "share of new traces the *traceidratio samplers keep, read by the OpenTelemetry SDK; ignored by the others [0..1]",
+		apply: func(_ *Config, raw string) error {
+			v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+			if err != nil {
+				return fmt.Errorf("not a number: %q", raw)
+			}
+			if !(v >= 0 && v <= 1) { // NaN too: the SDK would then sample all or nothing, by CPU
+				return fmt.Errorf("%g outside [0..1]", v)
+			}
+			return nil
+		}},
 	{Env: "APP_LOG_LEVEL", Doc: "debug, info, warn or error", Default: "info",
 		apply: func(c *Config, raw string) error { return c.LogLevel.UnmarshalText([]byte(raw)) }},
 	integer("APP_DB_MAX_OPEN_CONNS", "10", "MySQL pool size", 1, 200, func(c *Config) *int { return &c.DBMaxOpenConns }),
@@ -140,6 +169,32 @@ var Dials = []Dial{
 		func(c *Config) *int { return &c.WSSendBuffer }),
 }
 
+// traceSamplers are the OTEL_TRACES_SAMPLER values the OpenTelemetry Go SDK
+// (sdk/trace, sampler_env.go) accepts; it lower-cases and trims the value,
+// and falls back to parentbased_always_on on anything else.
+var traceSamplers = []string{
+	"always_on", "always_off", "traceidratio",
+	"parentbased_always_on", "parentbased_always_off", "parentbased_traceidratio",
+}
+
+// samplerArgIgnored refuses a ratio given to a sampler that ignores it: with
+// only OTEL_TRACES_SAMPLER_ARG=0.02 set, the default sampler keeps 100%.
+func samplerArgIgnored(settings []setting) error {
+	var sampler, arg setting
+	for i, d := range Dials {
+		switch d.Env {
+		case "OTEL_TRACES_SAMPLER":
+			sampler = settings[i]
+		case "OTEL_TRACES_SAMPLER_ARG":
+			arg = settings[i]
+		}
+	}
+	if arg.src == SourceEnv && !strings.HasSuffix(strings.ToLower(strings.TrimSpace(sampler.raw)), "traceidratio") {
+		return fmt.Errorf("OTEL_TRACES_SAMPLER_ARG %s is ignored by OTEL_TRACES_SAMPLER %s; use parentbased_traceidratio", arg.raw, sampler.raw)
+	}
+	return nil
+}
+
 // FileSuffix names the variable that holds the path of a secret's file: a
 // secret setting NAME may instead be given as NAME_FILE=/path, the way a
 // secrets manager mounts it (Kubernetes and Docker secrets, Vault agent).
@@ -194,6 +249,9 @@ func load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 			}
 			errs = append(errs, fmt.Errorf("%s: %w", d.Env, err))
 		}
+	}
+	if err := samplerArgIgnored(settings); err != nil {
+		errs = append(errs, err)
 	}
 	if len(errs) == 0 && c.RetryCap < c.RetryBase {
 		errs = append(errs, fmt.Errorf("APP_RETRY_CAP %s is below APP_RETRY_BASE %s", c.RetryCap, c.RetryBase))

@@ -14,8 +14,15 @@ func env(kv map[string]string) func(string) string { return func(k string) strin
 
 func TestEveryDialIsDocumentedAndHasADefaultOrIsInjected(t *testing.T) {
 	for _, d := range Dials {
-		if !strings.HasPrefix(d.Env, "APP_") || d.Doc == "" {
-			t.Errorf("%s: needs the APP_ prefix and a doc line", d.Env)
+		prefix := "APP_"
+		if d.PassThrough {
+			prefix = "OTEL_" // a library's own variable, declared here only to document and validate it
+		}
+		if !strings.HasPrefix(d.Env, prefix) || d.Doc == "" {
+			t.Errorf("%s: needs the %s prefix and a doc line", d.Env, prefix)
+		}
+		if d.PassThrough && (d.Secret || d.Default == "") {
+			t.Errorf("%s: a pass-through setting is not a secret and its default is the library's own", d.Env)
 		}
 		if d.Secret && d.Default != "" {
 			t.Errorf("%s: a secret must not have a committed default", d.Env)
@@ -153,6 +160,37 @@ func TestASecretIsReadFromTheFileItsFileVariableNames(t *testing.T) {
 			}
 			if c.HTTPAddr != ":8080" {
 				t.Errorf("HTTP addr %q, want the default", c.HTTPAddr)
+			}
+		})
+	}
+}
+
+// The trace sampler is the SDK's own variable; config only refuses what the
+// SDK would silently replace with "sample everything" (decision 0019).
+func TestTraceSamplerVariablesAreValidatedNotHeld(t *testing.T) {
+	const dsn = "u:p@tcp(db:3306)/app"
+	for name, tc := range map[string]struct {
+		sampler, arg string
+		refused      string // "" when the pair loads
+	}{
+		"unset: the SDK's own default":         {},
+		"production setting":                   {sampler: "parentbased_traceidratio", arg: "0.02"},
+		"the SDK lower-cases and trims":        {sampler: " ParentBased_TraceIDRatio ", arg: " 0.5 "},
+		"a typo would trace everything":        {sampler: "parentbased_traceratio", refused: "OTEL_TRACES_SAMPLER: unknown sampler"},
+		"a ratio above one is refused":         {sampler: "parentbased_traceidratio", arg: "1.5", refused: "OTEL_TRACES_SAMPLER_ARG: 1.5 outside [0..1]"},
+		"a percentage is not a ratio":          {sampler: "parentbased_traceidratio", arg: "5%", refused: "OTEL_TRACES_SAMPLER_ARG: not a number"},
+		"zero keeps only what the parent kept": {sampler: "parentbased_traceidratio", arg: "0"},
+		"NaN parses but is no ratio":           {sampler: "parentbased_traceidratio", arg: "NaN", refused: "OTEL_TRACES_SAMPLER_ARG: NaN outside [0..1]"},
+		"a ratio alone keeps 100%":             {arg: "0.02", refused: "OTEL_TRACES_SAMPLER_ARG 0.02 is ignored by OTEL_TRACES_SAMPLER parentbased_always_on"},
+		"a ratio with an always sampler":       {sampler: "always_on", arg: "0.02", refused: "is ignored"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(env(map[string]string{"APP_DATABASE_DSN": dsn, "OTEL_TRACES_SAMPLER": tc.sampler, "OTEL_TRACES_SAMPLER_ARG": tc.arg}))
+			switch {
+			case tc.refused == "" && err != nil:
+				t.Fatalf("refused: %v", err)
+			case tc.refused != "" && (err == nil || !strings.Contains(err.Error(), tc.refused)):
+				t.Fatalf("want an error containing %q, got %v", tc.refused, err)
 			}
 		})
 	}
