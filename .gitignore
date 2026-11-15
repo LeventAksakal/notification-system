@@ -7,3 +7,4 @@ CLAUDE.local.md
 *.exe
 *.test
 coverage.out
+.vscode/time-analytics.json

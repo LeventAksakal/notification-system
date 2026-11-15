@@ -1,0 +1,63 @@
+{
+  // The Taskfile commands most used while editing, on Ctrl+Shift+B / "Run Task".
+  // Errors land in the Problems panel through the $go matcher.
+  "version": "2.0.0",
+  "options": { "cwd": "${workspaceFolder}" },
+  "tasks": [
+    {
+      "label": "gen (oapi-codegen + sqlc)",
+      "type": "process",
+      "command": "go",
+      "args": ["tool", "-modfile=tools.mod", "task", "gen"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": "$go"
+    },
+    {
+      "label": "migrate:diff (Atlas)",
+      "type": "process",
+      "command": "go",
+      "args": ["tool", "-modfile=tools.mod", "task", "migrate:diff", "--", "${input:migrationName}"],
+      "problemMatcher": []
+    },
+    {
+      "label": "lint (golangci-lint)",
+      "type": "process",
+      "command": "go",
+      "args": ["tool", "-modfile=tools.mod", "task", "lint"],
+      "problemMatcher": "$go"
+    },
+    {
+      "label": "test (unit)",
+      "type": "process",
+      "command": "go",
+      "args": ["tool", "-modfile=tools.mod", "task", "test"],
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": "$go"
+    },
+    {
+      "label": "test:integration",
+      "type": "process",
+      "command": "go",
+      "args": ["tool", "-modfile=tools.mod", "task", "test:integration"],
+      "group": "test",
+      "problemMatcher": "$go"
+    },
+    {
+      "label": "check (full gate)",
+      "type": "process",
+      "command": "go",
+      "args": ["tool", "-modfile=tools.mod", "task", "check"],
+      "problemMatcher": "$go"
+    },
+    {
+      "label": "stack up",
+      "type": "process",
+      "command": "docker",
+      "args": ["compose", "up", "--wait", "--build"],
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    { "id": "migrationName", "type": "promptString", "description": "Migration name (snake_case)" }
+  ]
+}

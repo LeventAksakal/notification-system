@@ -1,0 +1,11 @@
+{
+  // What this repo needs: Go (gopls, Delve), MySQL client, YAML schemas
+  // (OpenAPI, compose, Taskfile), Dockerfile/compose, GitHub Actions.
+  "recommendations": [
+    "golang.go",
+    "cweijan.vscode-mysql-client2",
+    "redhat.vscode-yaml",
+    "docker.docker",
+    "github.vscode-github-actions"
+  ]
+}

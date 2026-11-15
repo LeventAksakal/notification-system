@@ -1,0 +1,25 @@
+// Repo-specific settings only. Editor preferences belong in your user or
+// profile settings (the owner uses a "go+mysql" profile), not here.
+{
+  // 70 test files carry `//go:build integration`; without the tag gopls treats
+  // them as excluded and shows no types, references or errors in them.
+  // .claude/worktrees holds agent checkouts: indexing it doubles every package.
+  "gopls": {
+    "build.buildFlags": ["-tags=integration"],
+    "build.directoryFilters": ["-**/node_modules", "-**/.claude"]
+  },
+  // Run integration tests from the test explorer too (they start containers).
+  "go.testTags": "integration",
+
+  // Generated or tool-written: edit the source, then `task gen` / `task migrate:diff`.
+  "files.readonlyInclude": {
+    "**/*.gen.go": true,
+    "internal/store/sqlc/**": true,
+    "migrations/*.sql": true,
+    "migrations/atlas.sum": true
+  },
+
+  "yaml.schemas": {
+    "https://spec.openapis.org/oas/3.0/schema/2021-09-28": "api/openapi.yaml"
+  }
+}
