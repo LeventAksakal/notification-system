@@ -3,9 +3,7 @@
 package acceptance
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -18,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // Valkey outage: the API keeps answering promptly, WebSocket streams end
@@ -194,7 +193,7 @@ func waitReadyz(t *testing.T, s *stack, timeout time.Duration, what string, ok f
 	t.Helper()
 	last := -1
 	if !poll(timeout, func() bool {
-		last, _, _ = probe(s.URL + "/readyz")
+		last, _, _ = s.readyz()
 		return ok(last)
 	}) {
 		t.Fatalf("not within %s: /readyz %s (last status %d, 0 = no answer)", timeout, what, last)
@@ -209,43 +208,32 @@ func valkeyDown(t *testing.T, s *stack, p *linkProxy, o outage) {
 	waitReadyz(t, s, 20*time.Second, "kept answering 200 after Valkey went "+string(o), func(st int) bool { return st != http.StatusOK })
 }
 
-// timedDo sends one JSON request with a hard client timeout and returns the
+// apiCall is one typed request (a method of the generated client without
+// "WithResponse"); the caller reads its raw answer.
+type apiCall func(ctx context.Context) (*http.Response, error)
+
+// timedDo sends one typed request with a hard client timeout and returns the
 // response and how long it took. A timeout fails the test with a message that
 // says the API did not answer in time while Valkey was down.
-func (s *stack) timedDo(t *testing.T, method, path string, body any, clientTimeout time.Duration) (*response, time.Duration) {
+func (s *stack) timedDo(t *testing.T, what string, call apiCall, clientTimeout time.Duration) (*response, time.Duration) {
 	t.Helper()
-	var rdr io.Reader
-	if body != nil {
-		buf, err := json.Marshal(body)
-		if err != nil {
-			t.Fatalf("encode body: %v", err)
-		}
-		rdr = bytes.NewReader(buf)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, s.URL+path, rdr)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	if rdr != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
 	start := time.Now()
-	res, err := http.DefaultClient.Do(req)
+	res, err := call(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
-			t.Fatalf("%s %s with Valkey down: no response within the client timeout of %s (publishing must not hold the response)", method, path, clientTimeout)
+			t.Fatalf("%s with Valkey down: no response within the client timeout of %s (publishing must not hold the response)", what, clientTimeout)
 		}
-		t.Fatalf("%s %s with Valkey down: %v", method, path, err)
+		t.Fatalf("%s with Valkey down: %v", what, err)
 	}
 	defer func() { _ = res.Body.Close() }()
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		if ctx.Err() != nil {
-			t.Fatalf("%s %s with Valkey down: body not complete within the client timeout of %s", method, path, clientTimeout)
+			t.Fatalf("%s with Valkey down: body not complete within the client timeout of %s", what, clientTimeout)
 		}
-		t.Fatalf("%s %s: read body: %v", method, path, err)
+		t.Fatalf("%s: read body: %v", what, err)
 	}
 	return &response{Status: res.StatusCode, Header: res.Header, Body: b}, time.Since(start)
 }
@@ -276,27 +264,31 @@ func TestGapOutageBatchAcceptedPromptlyWithValkeyDown(t *testing.T) {
 			valkeyDown(t, s, p, o)
 
 			channels := []string{"sms", "email", "push"}
-			items := make([]map[string]any, 1000)
+			items := make([]apiclient.NotificationCreate, 1000)
 			for i := range items {
 				items[i] = msg(channels[i%3], "outage batch "+strconv.Itoa(i))
 			}
-			r, took := s.timedDo(t, http.MethodPost, "/v1/notifications/batch", map[string]any{"notifications": items}, 30*time.Second)
+			r, took := s.timedDo(t, "POST /v1/notifications/batch", func(ctx context.Context) (*http.Response, error) {
+				return s.API.CreateBatch(ctx, nil, apiclient.BatchCreate{Notifications: items})
+			}, 30*time.Second)
 			within(t, "POST /v1/notifications/batch (1000 items)", r, took, http.StatusCreated, 10*time.Second)
-			var b batchCreated
+			var b apiclient.BatchCreated
 			r.decode(t, &b)
-			if b.Total != 1000 || len(b.NotificationIDs) != 1000 {
-				t.Fatalf("batch: want total 1000 and 1000 ids, got total %d and %d ids", b.Total, len(b.NotificationIDs))
+			if b.Total != 1000 || len(b.NotificationIds) != 1000 {
+				t.Fatalf("batch: want total 1000 and 1000 ids, got total %d and %d ids", b.Total, len(b.NotificationIds))
 			}
-			if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE batch_id = ?", b.ID); got != 1000 {
-				t.Fatalf("rows of batch %s: want 1000, got %d", b.ID, got)
+			if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE batch_id = ?", b.Id.String()); got != 1000 {
+				t.Fatalf("rows of batch %s: want 1000, got %d", b.Id, got)
 			}
 
-			r, took = s.timedDo(t, http.MethodPost, "/v1/notifications", msg("sms", "outage single"), 30*time.Second)
+			r, took = s.timedDo(t, "POST /v1/notifications", func(ctx context.Context) (*http.Response, error) {
+				return s.API.CreateNotification(ctx, nil, msg("sms", "outage single"))
+			}, 30*time.Second)
 			within(t, "POST /v1/notifications", r, took, http.StatusCreated, 5*time.Second)
-			var n apiNotification
+			var n apiclient.Notification
 			r.decode(t, &n)
-			if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE id = ?", n.ID); got != 1 {
-				t.Fatalf("row of %s: want 1, got %d", n.ID, got)
+			if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE id = ?", n.Id.String()); got != 1 {
+				t.Fatalf("row of %s: want 1, got %d", n.Id, got)
 			}
 		})
 	}
@@ -314,34 +306,42 @@ func TestGapOutageAPIServesWithValkeyDown(t *testing.T) {
 			s, p := stackBehindValkeyProxy(t, 0)
 			valkeyDown(t, s, p, o)
 
-			r, took := s.timedDo(t, http.MethodPost, "/v1/notifications", msg("email", "outage r1"), clientTimeout)
+			r, took := s.timedDo(t, "POST /v1/notifications", func(ctx context.Context) (*http.Response, error) {
+				return s.API.CreateNotification(ctx, nil, msg("email", "outage r1"))
+			}, clientTimeout)
 			within(t, "POST /v1/notifications", r, took, http.StatusCreated, limit)
-			var n apiNotification
+			var n apiclient.Notification
 			r.decode(t, &n)
 
-			r, took = s.timedDo(t, http.MethodGet, "/v1/notifications/"+n.ID, nil, clientTimeout)
+			r, took = s.timedDo(t, "GET /v1/notifications/{id}", func(ctx context.Context) (*http.Response, error) {
+				return s.API.GetNotification(ctx, n.Id)
+			}, clientTimeout)
 			within(t, "GET /v1/notifications/{id}", r, took, http.StatusOK, limit)
-			var got apiNotification
+			var got apiclient.Notification
 			r.decode(t, &got)
-			if got.ID != n.ID || got.Status != "pending" || got.Channel != "email" || got.To != emailTo {
-				t.Errorf("GET %s: want the pending email just created, got %+v", n.ID, got)
+			if got.Id != n.Id || got.Status != "pending" || got.Channel != "email" || got.To != emailTo {
+				t.Errorf("GET %s: want the pending email just created, got %s", n.Id, jsonOf(got))
 			}
 
-			r, took = s.timedDo(t, http.MethodGet, "/v1/notifications?channel=email", nil, clientTimeout)
+			r, took = s.timedDo(t, "GET /v1/notifications", func(ctx context.Context) (*http.Response, error) {
+				return s.API.ListNotifications(ctx, &apiclient.ListNotificationsParams{Channel: ptr(apiclient.Email)})
+			}, clientTimeout)
 			within(t, "GET /v1/notifications", r, took, http.StatusOK, limit)
-			var page notificationPage
+			var page apiclient.NotificationPage
 			r.decode(t, &page)
 			found := false
 			for _, it := range page.Items {
-				found = found || it.ID == n.ID
+				found = found || it.Id == n.Id
 			}
 			if !found {
-				t.Errorf("list: want %s among the items, got %v", n.ID, ids(page.Items))
+				t.Errorf("list: want %s among the items, got %v", n.Id, ids(page.Items))
 			}
 
-			r, took = s.timedDo(t, http.MethodPost, "/v1/notifications/"+n.ID+"/cancel", nil, clientTimeout)
+			r, took = s.timedDo(t, "POST /v1/notifications/{id}/cancel", func(ctx context.Context) (*http.Response, error) {
+				return s.API.CancelNotification(ctx, n.Id)
+			}, clientTimeout)
 			within(t, "POST /v1/notifications/{id}/cancel", r, took, http.StatusOK, limit)
-			if st := s.storedStatus(t, n.ID); st != "cancelled" {
+			if st := s.storedStatus(t, n.Id); st != "cancelled" {
 				t.Errorf("after cancel: stored status want cancelled, got %q", st)
 			}
 		})
@@ -366,6 +366,10 @@ func TestGapOutageWSClosedWhileFeedLost(t *testing.T) {
 		if errors.Is(err, errWSTimeout) {
 			t.Fatalf("Valkey down for 10s: the subscriber's stream is still open and silent (want the server to close it)")
 		}
+		if errors.Is(err, errEventIncomplete) {
+			t.Errorf("event before the stream ended: %v", err)
+			continue
+		}
 		if err != nil {
 			var ce websocket.CloseError
 			if errors.As(err, &ce) {
@@ -375,7 +379,7 @@ func TestGapOutageWSClosedWhileFeedLost(t *testing.T) {
 			}
 			break
 		}
-		t.Logf("event before the stream ended: %v", e)
+		t.Logf("event before the stream ended: %s", eventString(e))
 	}
 
 	// While the feed is lost a new handshake is refused with a 5xx.
@@ -399,10 +403,10 @@ func TestGapOutageWSClosedWhileFeedLost(t *testing.T) {
 	n := s.create(t, msg("push", "outage after recovery"))
 	var sub *websocket.Conn
 	if !poll(20*time.Second, func() bool {
-		sub, status, err = s.dialWS("notificationId", n.ID)
+		sub, status, err = s.dialWS("notificationId", n.Id.String())
 		return err == nil
 	}) {
-		t.Fatalf("GET /v1/ws?notificationId=%s still refused 20s after /readyz was 200 again (HTTP %d): %v", n.ID, status, err)
+		t.Fatalf("GET /v1/ws?notificationId=%s still refused 20s after /readyz was 200 again (HTTP %d): %v", n.Id, status, err)
 	}
 	t.Cleanup(func() { _ = sub.CloseNow() })
 
@@ -410,11 +414,11 @@ func TestGapOutageWSClosedWhileFeedLost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first message after recovery: %v", err)
 	}
-	if !first.Snapshot || first.NotificationID != n.ID || first.Status != "pending" {
-		t.Fatalf("first message after recovery: want snapshot of %s pending, got %v", n.ID, first)
+	if !isSnapshot(first) || first.NotificationId != n.Id || first.Status != "pending" {
+		t.Fatalf("first message after recovery: want snapshot of %s pending, got %s", n.Id, eventString(first))
 	}
-	s.cancel(t, n.ID)
-	collectUntil(t, sub, 10*time.Second, reached(n.ID, "cancelled"), "live cancelled event of "+n.ID+" after recovery")
+	s.cancel(t, n.Id)
+	collectUntil(t, sub, 10*time.Second, reached(n.Id, "cancelled"), "live cancelled event of "+n.Id.String()+" after recovery")
 }
 
 // R7: Process notifications asynchronously via queue workers, and R8:
@@ -426,8 +430,8 @@ func TestGapOutageWorkerSendsNothingWithValkeyDown(t *testing.T) {
 
 	// Baseline: through this proxy the worker does deliver.
 	base := s.create(t, msg("sms", "outage baseline"))
-	s.providerRequests(t, base.ID, 20*time.Second)
-	s.waitStatus(t, base.ID, "sent", 20*time.Second)
+	s.providerRequests(t, base.Id, 20*time.Second)
+	s.waitStatus(t, base.Id, "sent", 20*time.Second)
 	before := providerReceived(s)
 
 	valkeyDown(t, s, p, outageClosed)
@@ -435,7 +439,7 @@ func TestGapOutageWorkerSendsNothingWithValkeyDown(t *testing.T) {
 	created := make([]string, 0, 20)
 	channels := []string{"sms", "email", "push"}
 	for i := range 20 {
-		created = append(created, s.create(t, msg(channels[i%3], "outage worker "+strconv.Itoa(i))).ID)
+		created = append(created, s.create(t, msg(channels[i%3], "outage worker "+strconv.Itoa(i))).Id.String())
 	}
 
 	// consistently for 3 s, with the observed numbers in the failure message.
@@ -445,7 +449,7 @@ func TestGapOutageWorkerSendsNothingWithValkeyDown(t *testing.T) {
 	defer tick.Stop()
 	for {
 		extra := providerReceived(s) - before
-		moved := s.count(t, q, base.ID)
+		moved := s.count(t, q, base.Id.String())
 		if extra != 0 || moved != 0 {
 			t.Fatalf("with Valkey down the worker went ahead: provider received %d new requests (want 0, the limiter fails closed); %d notifications not pending or with attempts (want 0)",
 				extra, moved)
@@ -461,7 +465,7 @@ func TestGapOutageWorkerSendsNothingWithValkeyDown(t *testing.T) {
 			t.Errorf("notification %s reached the provider while Valkey was down", id)
 		}
 	}
-	if got := s.count(t, "SELECT COUNT(*) FROM delivery_attempts WHERE notification_id <> ?", base.ID); got != 0 {
+	if got := s.count(t, "SELECT COUNT(*) FROM delivery_attempts WHERE notification_id <> ?", base.Id.String()); got != 0 {
 		t.Errorf("delivery_attempts while Valkey was down: want 0, got %d", got)
 	}
 	if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE status = 'failed'"); got != 0 {

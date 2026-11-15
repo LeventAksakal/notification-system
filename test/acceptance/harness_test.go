@@ -29,6 +29,7 @@ import (
 	"github.com/valkey-io/valkey-go"
 
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 	"github.com/LeventAksakal/notification-system/test/support"
 )
 
@@ -46,8 +47,9 @@ type stackOptions struct {
 // stack is one running system: a fresh database, `app serve`, any workers,
 // and the provider double.
 type stack struct {
-	URL         string // base URL of `app serve`, no trailing slash
-	DSN         string // DSN of this stack's database (as given to the children)
+	URL         string                         // base URL of `app serve`, no trailing slash
+	API         *apiclient.ClientWithResponses // typed client generated from api/openapi.yaml, on URL
+	DSN         string                         // DSN of this stack's database (as given to the children)
 	DB          *sql.DB
 	Provider    *fakeprovider.Server
 	ProviderURL string // base URL of the provider double
@@ -112,6 +114,7 @@ func startStack(t *testing.T, o stackOptions) *stack {
 	port := freePort(t)
 	s := &stack{
 		URL:         "http://127.0.0.1:" + strconv.Itoa(port),
+		API:         newAPIClient(t, "http://127.0.0.1:"+strconv.Itoa(port)),
 		DSN:         dsn,
 		DB:          db,
 		Provider:    provider,
@@ -155,7 +158,7 @@ func startStack(t *testing.T, o stackOptions) *stack {
 		if s.serve.exited() {
 			t.Fatalf("app serve exited before ready:\n%s", strings.Join(s.serve.logs.lines(), "\n"))
 		}
-		if st, err := quickGet(s.URL + "/readyz"); err == nil && st == http.StatusOK {
+		if st, _, err := s.readyz(); err == nil && st == http.StatusOK {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -257,6 +260,64 @@ func (s *stack) stopAll() {
 	}
 }
 
+// newAPIClient returns the typed client generated from api/openapi.yaml
+// (test/apiclient) for the API at baseURL. Every well-formed request goes
+// through it, so a contract change breaks the test build, not a test run.
+// Each request is bounded at 60 s, as the raw helpers are.
+func newAPIClient(t *testing.T, baseURL string) *apiclient.ClientWithResponses {
+	t.Helper()
+	c, err := apiclient.NewClientWithResponses(baseURL, apiclient.WithHTTPClient(&http.Client{Timeout: 60 * time.Second}))
+	if err != nil {
+		t.Fatalf("API client for %s: %v", baseURL, err)
+	}
+	return c
+}
+
+// typedAnswer is what every generated XxxResponse offers.
+type typedAnswer interface {
+	StatusCode() int
+	GetBody() []byte
+}
+
+// show renders a typed answer for a failure message.
+func show(r typedAnswer) string {
+	return fmt.Sprintf("HTTP %d %s", r.StatusCode(), truncate(r.GetBody()))
+}
+
+// answered fails the test on a transport or decode error of a typed call and
+// returns its answer: answered(t)(s.API.CancelNotificationWithResponse(ctx, id)).
+func answered(t *testing.T) func(typedAnswer, error) typedAnswer {
+	t.Helper()
+	return func(r typedAnswer, err error) typedAnswer {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+}
+
+// ptr returns a pointer to v, for the optional fields of the generated types.
+func ptr[T any](v T) *T { return &v }
+
+// deref returns *p, or the zero value when the field was absent.
+func deref[T any](p *T) T {
+	if p == nil {
+		var zero T
+		return zero
+	}
+	return *p
+}
+
+// jsonOf renders v as JSON for a failure message.
+func jsonOf(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("%+v", v)
+	}
+	return truncate(b)
+}
+
 // response is one HTTP answer, fully read.
 type response struct {
 	Status int
@@ -282,8 +343,14 @@ func (r *response) String() string {
 	return fmt.Sprintf("HTTP %d %s", r.Status, truncate(r.Body))
 }
 
-// do sends one request to the API. body is JSON-encoded unless it is nil,
-// a []byte or a string (sent as is). kv are header name/value pairs.
+// StatusCode and GetBody make a raw response a typedAnswer too.
+func (r *response) StatusCode() int { return r.Status }
+func (r *response) GetBody() []byte { return r.Body }
+
+// do sends one raw request to the API. body is JSON-encoded unless it is nil,
+// a []byte or a string (sent as is). kv are header name/value pairs. Only for
+// what the typed client cannot express (malformed JSON, a non-UUID path id, a
+// repeated query parameter, an over-limit body) or paths outside the contract.
 func (s *stack) do(t *testing.T, method, path string, body any, kv ...string) *response {
 	t.Helper()
 	r, err := s.send(method, path, body, kv...)
@@ -438,22 +505,6 @@ func freePort(t *testing.T) int {
 	}
 	defer func() { _ = ln.Close() }()
 	return ln.Addr().(*net.TCPAddr).Port
-}
-
-func quickGet(url string) (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return 0, err
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	_, _ = io.Copy(io.Discard, res.Body)
-	_ = res.Body.Close()
-	return res.StatusCode, nil
 }
 
 func truncate(b []byte) string {

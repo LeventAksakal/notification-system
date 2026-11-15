@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // R7: Process notifications asynchronously via queue workers
@@ -21,12 +22,12 @@ func TestDeliveryR7AsyncWorkers(t *testing.T) {
 			t.Errorf("status in the 201: want pending, got %q", n.Status)
 		}
 		consistently(t, time.Second, func() bool {
-			return s.Provider.Stats().Channels["sms"].Received == 0 && s.storedStatus(t, n.ID) == "pending"
+			return s.Provider.Stats().Channels["sms"].Received == 0 && s.storedStatus(t, n.Id) == "pending"
 		}, "with 0 workers the notification stays pending and nothing reaches the provider")
 
 		s.StartWorker()
 		dlEventually(t, 15*time.Second, "the notification is sent once a worker runs", func() (bool, string) {
-			st := s.storedStatus(t, n.ID)
+			st := s.storedStatus(t, n.Id)
 			return st == "sent", "stored status " + st
 		})
 	})
@@ -38,7 +39,7 @@ func TestDeliveryR7AsyncWorkers(t *testing.T) {
 		const total = 600
 		s := startStack(t, stackOptions{Workers: 0, Env: dlFastEnv(nil)})
 		chans := []string{"sms", "email", "push"}
-		ids := s.dlCreateMany(t, total, func(i int) map[string]any {
+		ids := s.dlCreateMany(t, total, func(i int) apiclient.NotificationCreate {
 			return msg(chans[i%3], fmt.Sprintf("R7 backlog %d", i))
 		})
 		s.dlFaults(t, fakeprovider.Fault{Mode: fakeprovider.ModeDelay, DelayMS: 200})
@@ -60,7 +61,7 @@ func TestDeliveryR7AsyncWorkers(t *testing.T) {
 		delivered := s.dlDeliveredKeys()
 		missing := 0
 		for _, id := range ids {
-			if !delivered[id] {
+			if !delivered[id.String()] {
 				missing++
 			}
 		}
@@ -80,10 +81,10 @@ func TestDeliveryR16ProviderCall(t *testing.T) {
 	rec.SetUpstream(s.ProviderURL)
 
 	const content = "R16 exact body: Your code is 4821 ✓"
-	n := s.create(t, map[string]any{"to": smsTo, "channel": "sms", "content": content, "priority": "high"})
+	n := s.create(t, apiclient.NotificationCreate{To: smsTo, Channel: apiclient.Sms, Content: ptr(content), Priority: ptr(apiclient.High)})
 	s.StartWorker()
 	dlEventually(t, 15*time.Second, "the notification is sent", func() (bool, string) {
-		st := s.storedStatus(t, n.ID)
+		st := s.storedStatus(t, n.Id)
 		return st == "sent", "stored status " + st
 	})
 
@@ -102,8 +103,8 @@ func TestDeliveryR16ProviderCall(t *testing.T) {
 			t.Errorf("body %q: want %q, got %v", k, v, body[k])
 		}
 	}
-	if got := c.Header.Get("Idempotency-Key"); got != n.ID {
-		t.Errorf("Idempotency-Key: want the notification id %q, got %q", n.ID, got)
+	if got := c.Header.Get("Idempotency-Key"); got != n.Id.String() {
+		t.Errorf("Idempotency-Key: want the notification id %q, got %q", n.Id, got)
 	}
 	if c.Status != 202 {
 		t.Fatalf("double answered %d: %s", c.Status, c.ResponseBody)
@@ -114,25 +115,25 @@ func TestDeliveryR16ProviderCall(t *testing.T) {
 	if err := json.Unmarshal(c.ResponseBody, &answer); err != nil || answer.MessageID == "" {
 		t.Fatalf("double's 202 has no messageId: %s (%v)", c.ResponseBody, err)
 	}
-	if rs := s.Provider.Requests(fakeprovider.Filter{Key: n.ID}); len(rs) != 1 || !rs[0].Delivery {
+	if rs := s.Provider.Requests(fakeprovider.Filter{Key: n.Id.String()}); len(rs) != 1 || !rs[0].Delivery {
 		t.Errorf("double's record for the key: want 1 delivered request, got %+v", rs)
 	}
 
-	got := s.dlGet(t, n.ID)
+	got := s.get(t, n.Id)
 	if got.Status != "sent" {
 		t.Errorf("GET status: want sent, got %q", got.Status)
 	}
-	if got.ProviderMessageID != answer.MessageID {
-		t.Errorf("providerMessageId: want the double's messageId %q, got %q", answer.MessageID, got.ProviderMessageID)
+	if deref(got.ProviderMessageId) != answer.MessageID {
+		t.Errorf("providerMessageId: want the double's messageId %q, got %q", answer.MessageID, deref(got.ProviderMessageId))
 	}
 	if got.Attempts != 1 {
 		t.Errorf("attempts: want 1, got %d", got.Attempts)
 	}
-	if len(got.History) != 1 {
-		t.Fatalf("deliveryAttempts: want 1 entry, got %v", got.History)
+	if len(history(got)) != 1 {
+		t.Fatalf("deliveryAttempts: want 1 entry, got %s", attemptsString(history(got)))
 	}
-	a := got.History[0]
-	if a.Outcome != "accepted" || a.HTTPStatus == nil || *a.HTTPStatus != 202 {
-		t.Errorf("delivery attempt: want accepted with httpStatus 202, got %s", a)
+	a := history(got)[0]
+	if a.Outcome != "accepted" || a.HttpStatus == nil || *a.HttpStatus != 202 {
+		t.Errorf("delivery attempt: want accepted with httpStatus 202, got %s", attemptString(a))
 	}
 }

@@ -3,20 +3,20 @@
 Facts every lane builds against. No verdicts here; reasons are in `docs/decisions/`. The decision records are still `proposed`; this run builds to their recommended options (owner item 0001).
 
 ## Sources of truth
-- HTTP: `api/openapi.yaml` (v1.3.0). Schema: `schema/notifications.sql`. Vocabulary, state machine, limits, ports: `internal/notification/` (`status.go`, `limits.go`, `ports.go`).
+- HTTP: the Huma operations in `internal/httpapi` (`api.go`, `contract.go`); `api/openapi.yaml` (v1.3.0) is generated from them (decision 0024), and clients generate from it. Schema: `schema/notifications.sql`. Vocabulary, state machine, limits, ports: `internal/notification/` (`status.go`, `limits.go`, `ports.go`).
 - Only the coordinator edits those. A lane that needs a change writes `.agents/owner-items/NNNN-<slug>.md`, takes the nearest assumption that needs no contract change, and continues.
-- Generated, never hand-edited: `internal/httpapi/api.gen.go`, `internal/store/sqlc/`, `migrations/`. Regenerate with `go tool -modfile=tools.mod task gen`.
+- Generated, never hand-edited: `api/openapi.yaml`, `test/apiclient/client.gen.go`, `internal/store/sqlc/`, `migrations/`. Regenerate with `go tool -modfile=tools.mod task gen`.
 
 ## Process roles (decision 0002)
 One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (delivery). Any number of each may run against one MySQL and one Valkey. `app healthcheck` exists for the container probe.
 
 ## HTTP conventions
 - Refusals use the `Error` body `{code, message, details[{index?, field, reason}]}`.
-- 400 `invalid_request` for every broken rule, whether the spec validator or the service found it; `details[].field` names the JSON field (`to`, `content`, `template.variables.name`, `scheduledAt`, `notifications`), `index` the batch position.
+- 400 `invalid_request` for every broken rule, whether Huma's request validation or the service found it; `details[].field` names the JSON field (`to`, `content`, `template.variables.name`, `scheduledAt`, `notifications`), `index` the batch position.
 - 413 `request_too_large` for a body over 8 MiB. 404 `not_found`. 409 `not_cancellable` (cancel when not pending), 409 `not_retryable` (retry when not failed). 422 `idempotency_key_reused`.
 - `X-Correlation-ID`: accepted, else generated; echoed on every response; stored on the row; on every log line about that notification in API and worker (JSON logs on stdout, field `correlation_id`; `notification_id` when known); sent to the provider as `X-Correlation-ID`.
 - `Idempotency-Key` on POST create (single or batch): same key and same payload returns the first response, same ids, status 201, header `Idempotent-Replayed: true`. Same key, different payload: 422.
-- Outside the generated routes (not validated against the spec): `GET /v1/ws` (WebSocket, `github.com/coder/websocket`), `GET /openapi.json` (the embedded spec), `GET /docs` (a page that renders it).
+- Outside the Huma operations (not validated by Huma): `GET /v1/ws` (WebSocket, `github.com/coder/websocket`; documented in the spec, its message schema `StatusEvent` from `contract.go`), `GET /openapi.json` (the spec built from the operations), `GET /docs` (a page that renders it).
 - Status shown by the API: stored status, except `scheduled` when stored status is `pending`, `attempts = 0` and `due_at` is in the future.
 
 ## Provider call (R16, decisions 0006, 0019)

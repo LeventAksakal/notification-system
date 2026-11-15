@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/coder/websocket"
-	"github.com/google/uuid"
 
 	"github.com/LeventAksakal/notification-system/internal/intake"
 	"github.com/LeventAksakal/notification-system/internal/notification"
@@ -27,22 +27,22 @@ const (
 	wsWriteTimeout = 10 * time.Second
 )
 
-// toStatusEvent maps a status change to the spec's StatusEvent
-// (api/openapi.yaml, generated in api.gen.go). An id that is not a UUID
+// toStatusEvent maps a status change to the contract's StatusEvent
+// (contract.go; documented in the spec beside GET /v1/ws). An id that is not a UUID
 // fails; the stream skips that event rather than sending a zero id.
 func toStatusEvent(e notification.Event) (StatusEvent, error) {
 	id, err := uuid.Parse(e.NotificationID)
 	if err != nil {
 		return StatusEvent{}, fmt.Errorf("notification id %q: %w", e.NotificationID, err)
 	}
-	v := StatusEvent{NotificationId: id, Status: Status(e.Status), Attempts: e.Attempts,
-		At: e.At.UTC(), CorrelationId: e.CorrelationID}
+	v := StatusEvent{NotificationID: id, Status: Status(e.Status), Attempts: e.Attempts,
+		At: e.At.UTC(), CorrelationID: e.CorrelationID}
 	if e.BatchID != "" {
 		bid, err := uuid.Parse(e.BatchID)
 		if err != nil {
 			return StatusEvent{}, fmt.Errorf("batch id %q: %w", e.BatchID, err)
 		}
-		v.BatchId = &bid
+		v.BatchID = &bid
 	}
 	if e.Error != "" {
 		v.Error = &e.Error
@@ -84,9 +84,9 @@ func (s *Server) CloseStreams() {
 	st.wg.Wait()
 }
 
-// streamEvents is GET /v1/ws (operation streamEvents). It is excluded from the
-// generated server (a WebSocket upgrade does not fit the strict interface) and
-// mounted outside the validated routes in Handler.
+// streamEvents is GET /v1/ws (operation streamEvents). A WebSocket upgrade
+// does not fit a Huma operation, so it is mounted beside them in Handler and
+// documented in the spec by documentStream (api.go).
 //
 // No change committed after the snapshot is lost: the hub subscription is
 // taken before the snapshot is read, and the events buffered meanwhile that
@@ -95,12 +95,16 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var f realtime.Filter
 	var details []ErrorDetail
-	for name, dst := range map[string]*string{"notificationId": &f.NotificationID, "batchId": &f.BatchID} {
+	for _, p := range []struct {
+		name string
+		dst  *string
+	}{{"notificationId", &f.NotificationID}, {"batchId", &f.BatchID}} {
+		name, dst := p.name, p.dst
 		v := q.Get(name)
 		if v == "" {
 			continue
 		}
-		id, err := uuid.Parse(v)
+		id, err := parseUUID(v)
 		if err != nil {
 			details = append(details, ErrorDetail{Field: name, Reason: "must be a UUID"})
 			continue
@@ -108,12 +112,13 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 		*dst = id.String()
 	}
 	if len(details) > 0 {
-		writeError(w, http.StatusBadRequest, Error{Code: "invalid_request",
-			Message: details[0].Field + ": " + details[0].Reason, Details: &details})
+		e := invalid(details)
+		e.Message = details[0].Field + ": " + details[0].Reason
+		writeError(w, e)
 		return
 	}
 	if s.hub == nil || !s.streams.begin() {
-		writeError(w, http.StatusServiceUnavailable, Error{Code: "unavailable", Message: "status stream unavailable"})
+		writeError(w, newError(http.StatusServiceUnavailable, "unavailable", "status stream unavailable"))
 		return
 	}
 	defer s.streams.wg.Done()
@@ -131,7 +136,7 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, realtime.ErrFeedLost) {
 			msg = "status stream unavailable: event feed lost; retry shortly"
 		}
-		writeError(w, http.StatusServiceUnavailable, Error{Code: "unavailable", Message: msg})
+		writeError(w, newError(http.StatusServiceUnavailable, "unavailable", msg))
 		return
 	}
 	defer sub.Close()
@@ -155,15 +160,16 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) refuseLookup(w http.ResponseWriter, r *http.Request, err error, what string) {
 	if errors.Is(err, intake.ErrNotFound) {
-		writeError(w, http.StatusNotFound, notFound(what))
+		writeError(w, notFound(what))
 		return
 	}
 	if store.IsUnavailable(err) {
-		writeUnavailable(w, r, err)
+		slog.WarnContext(r.Context(), "database unreachable; answered 503", "method", r.Method, "path", r.URL.Path, "err", err)
+		writeError(w, errUnavailable())
 		return
 	}
 	slog.ErrorContext(r.Context(), "websocket lookup failed", "what", what, "err", err)
-	writeError(w, http.StatusInternalServerError, Error{Code: "internal", Message: "internal error"})
+	writeError(w, errInternal())
 }
 
 // pump writes the snapshot, then every event of sub, until the peer leaves,

@@ -5,21 +5,30 @@ package acceptance
 import (
 	"fmt"
 	"net/http"
-	"net/url"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/LeventAksakal/notification-system/internal/notification"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
-func batchItems(n int) []map[string]any {
-	items := make([]map[string]any, n)
+func batchItems(n int) []apiclient.NotificationCreate {
+	items := make([]apiclient.NotificationCreate, n)
 	chans := []string{"sms", "email", "push"}
 	for i := range items {
 		items[i] = msg(chans[i%3], fmt.Sprintf("batch item %d", i))
 	}
 	return items
+}
+
+// postBatch posts a batch through the typed client and returns the answer
+// unchecked, for the refusals.
+func (s *stack) postBatch(t *testing.T, items []apiclient.NotificationCreate, opts ...reqOpt) typedAnswer {
+	t.Helper()
+	return s.createBatchResp(t, items, opts...)
 }
 
 // R2: Support batch creation (up to 1000 notifications per request)
@@ -30,17 +39,17 @@ func TestR2BatchCreate(t *testing.T) {
 	// 1000 accepted in one request. Not a subtest: unless this works, the
 	// refusals below prove nothing (the spec validator alone refuses 1001).
 	b := s.createBatch(t, batchItems(notification.MaxBatchSize))
-	if b.ID == "" || b.Total != notification.MaxBatchSize || len(b.NotificationIDs) != notification.MaxBatchSize {
-		t.Fatalf("batch: id=%q total=%d ids=%d", b.ID, b.Total, len(b.NotificationIDs))
+	if b.Id == uuid.Nil || b.Total != notification.MaxBatchSize || len(b.NotificationIds) != notification.MaxBatchSize {
+		t.Fatalf("batch: id=%q total=%d ids=%d", b.Id, b.Total, len(b.NotificationIds))
 	}
-	if n := s.count(t, "SELECT COUNT(*) FROM notifications WHERE batch_id = ?", b.ID); n != notification.MaxBatchSize {
+	if n := s.count(t, "SELECT COUNT(*) FROM notifications WHERE batch_id = ?", b.Id.String()); n != notification.MaxBatchSize {
 		t.Errorf("rows of the batch: want %d, got %d", notification.MaxBatchSize, n)
 	}
 	if n := s.count(t, "SELECT COUNT(*) FROM batches"); n != 1 {
 		t.Errorf("batch rows: want 1, got %d", n)
 	}
-	uniq := map[string]bool{}
-	for _, id := range b.NotificationIDs {
+	uniq := map[uuid.UUID]bool{}
+	for _, id := range b.NotificationIds {
 		uniq[id] = true
 	}
 	if len(uniq) != notification.MaxBatchSize {
@@ -50,7 +59,7 @@ func TestR2BatchCreate(t *testing.T) {
 	before := s.count(t, "SELECT COUNT(*) FROM notifications")
 
 	t.Run("1001 refused", func(t *testing.T) {
-		r := s.postJSON(t, "/v1/notifications/batch", map[string]any{"notifications": batchItems(notification.MaxBatchSize + 1)})
+		r := s.postBatch(t, batchItems(notification.MaxBatchSize+1))
 		wantError(t, r, http.StatusBadRequest, "invalid_request", "notifications")
 		if n := s.count(t, "SELECT COUNT(*) FROM notifications"); n != before {
 			t.Errorf("rows after a refused batch: want %d, got %d", before, n)
@@ -60,13 +69,13 @@ func TestR2BatchCreate(t *testing.T) {
 	t.Run("999 valid plus 1 invalid stores nothing and names index and field", func(t *testing.T) {
 		items := batchItems(notification.MaxBatchSize)
 		const bad = 500
-		items[bad] = map[string]any{"to": "not-a-phone-number", "channel": "sms", "content": "x"}
-		r := s.postJSON(t, "/v1/notifications/batch", map[string]any{"notifications": items})
+		items[bad] = apiclient.NotificationCreate{To: "not-a-phone-number", Channel: apiclient.Sms, Content: ptr("x")}
+		r := s.postBatch(t, items)
 		e := wantError(t, r, http.StatusBadRequest, "invalid_request")
-		if !slices.ContainsFunc(e.Details, func(d errorDetail) bool {
+		if !slices.ContainsFunc(deref(e.Details), func(d apiclient.ErrorDetail) bool {
 			return d.Index != nil && *d.Index == bad && d.Field == "to"
 		}) {
-			t.Errorf("details do not name index %d field to: %s", bad, r)
+			t.Errorf("details do not name index %d field to: %s", bad, show(r))
 		}
 		if n := s.count(t, "SELECT COUNT(*) FROM notifications"); n != before {
 			t.Errorf("rows after a refused batch: want %d, got %d", before, n)
@@ -77,7 +86,7 @@ func TestR2BatchCreate(t *testing.T) {
 	})
 
 	t.Run("empty batch refused", func(t *testing.T) {
-		r := s.postJSON(t, "/v1/notifications/batch", map[string]any{"notifications": []any{}})
+		r := s.postBatch(t, []apiclient.NotificationCreate{})
 		wantError(t, r, http.StatusBadRequest, "invalid_request")
 	})
 }
@@ -88,44 +97,39 @@ func TestR4GetBatch(t *testing.T) {
 	s := startStack(t, stackOptions{})
 
 	items := batchItems(5)
-	items[3]["scheduledAt"] = time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	items[3].ScheduledAt = ptr(time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second))
 	b := s.createBatch(t, items)
-	if len(b.NotificationIDs) != 5 {
-		t.Fatalf("batch ids: want 5, got %d", len(b.NotificationIDs))
+	if len(b.NotificationIds) != 5 {
+		t.Fatalf("batch ids: want 5, got %d", len(b.NotificationIds))
 	}
-	s.cancel(t, b.NotificationIDs[1])
+	s.cancel(t, b.NotificationIds[1])
 
-	r := s.getJSON(t, "/v1/batches/"+b.ID)
-	if r.Status != http.StatusOK {
-		t.Fatalf("GET batch: want 200, got %s", r)
+	st := s.getBatch(t, b.Id, apiclient.GetBatchParams{})
+	if st.Id != b.Id || st.Total != 5 {
+		t.Errorf("batch: want id %s total 5, got id %s total %d", b.Id, st.Id, st.Total)
 	}
-	var st batchStatus
-	r.decode(t, &st)
-	if st.ID != b.ID || st.Total != 5 {
-		t.Errorf("batch: want id %s total 5, got id %s total %d", b.ID, st.ID, st.Total)
-	}
-	want := statusCounts{Scheduled: 1, Pending: 3, Cancelled: 1}
+	want := apiclient.StatusCounts{Scheduled: 1, Pending: 3, Cancelled: 1}
 	if st.Counts != want {
 		t.Errorf("counts: want %+v, got %+v", want, st.Counts)
 	}
-	if got := ids(st.Items); !slices.Equal(got, b.NotificationIDs) {
-		t.Errorf("items: want request order %v, got %v", b.NotificationIDs, got)
+	if got := ids(st.Items); !slices.Equal(got, b.NotificationIds) {
+		t.Errorf("items: want request order %v, got %v", b.NotificationIds, got)
 	}
 	for i, n := range st.Items {
-		wantStatus := map[int]string{1: "cancelled", 3: "scheduled"}[i]
+		wantStatus := map[int]apiclient.Status{1: apiclient.Cancelled, 3: apiclient.Scheduled}[i]
 		if wantStatus == "" {
-			wantStatus = "pending"
+			wantStatus = apiclient.Pending
 		}
 		if n.Status != wantStatus {
 			t.Errorf("item %d: want %s, got %s", i, wantStatus, n.Status)
 		}
-		if n.BatchID != b.ID {
-			t.Errorf("item %d: batchId %q, want %s", i, n.BatchID, b.ID)
+		if n.BatchId == nil || *n.BatchId != b.Id {
+			t.Errorf("item %d: batchId %v, want %s", i, deref(n.BatchId), b.Id)
 		}
 	}
 
 	t.Run("unknown batch is 404 not_found", func(t *testing.T) {
-		wantError(t, s.getJSON(t, "/v1/batches/"+newUUID()), http.StatusNotFound, "not_found")
+		wantError(t, answered(t)(s.API.GetBatchWithResponse(t.Context(), uuid.New(), nil)), http.StatusNotFound, "not_found")
 	})
 }
 
@@ -135,16 +139,11 @@ func TestR4GetBatchPaginated(t *testing.T) {
 	s := startStack(t, stackOptions{})
 	b := s.createBatch(t, batchItems(23))
 
-	var walked []string
-	q := url.Values{"limit": {"5"}}
+	var walked []uuid.UUID
+	q := apiclient.GetBatchParams{Limit: ptr(5)}
 	pages := 0
 	for {
-		r := s.getJSON(t, "/v1/batches/"+b.ID+"?"+q.Encode())
-		if r.Status != http.StatusOK {
-			t.Fatalf("GET batch page %d: want 200, got %s", pages+1, r)
-		}
-		var st batchStatus
-		r.decode(t, &st)
+		st := s.getBatch(t, b.Id, q)
 		pages++
 		if len(st.Items) > 5 {
 			t.Fatalf("page %d: limit 5 but %d items", pages, len(st.Items))
@@ -153,18 +152,18 @@ func TestR4GetBatchPaginated(t *testing.T) {
 			t.Errorf("page %d: total %d, pending %d; want 23 and 23", pages, st.Total, st.Counts.Pending)
 		}
 		walked = append(walked, ids(st.Items)...)
-		if st.NextCursor == "" {
+		if deref(st.NextCursor) == "" {
 			break
 		}
 		if pages > 20 {
 			t.Fatal("batch pagination does not end")
 		}
-		q.Set("cursor", st.NextCursor)
+		q.Cursor = st.NextCursor
 	}
 	if pages != 5 {
 		t.Errorf("23 items at limit 5: want 5 pages, got %d", pages)
 	}
-	if !slices.Equal(walked, b.NotificationIDs) {
-		t.Errorf("walked items differ from the request order:\nwant %v\ngot  %v", b.NotificationIDs, walked)
+	if !slices.Equal(walked, b.NotificationIds) {
+		t.Errorf("walked items differ from the request order:\nwant %v\ngot  %v", b.NotificationIds, walked)
 	}
 }

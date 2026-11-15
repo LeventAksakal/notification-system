@@ -6,7 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // B2 (delivery half): Bonus: Scheduled Notifications, allow scheduling
@@ -20,29 +23,29 @@ func TestDeliveryB2ScheduledDelivery(t *testing.T) {
 	s := startStack(t, stackOptions{Workers: 1, Env: dlFastEnv(nil)})
 
 	at := time.Now().Add(3 * time.Second).UTC()
-	body := func(content string) map[string]any {
+	body := func(content string) apiclient.NotificationCreate {
 		b := msg("push", content)
-		b["scheduledAt"] = at.Format(time.RFC3339Nano)
+		b.ScheduledAt = &at
 		return b
 	}
 	due := s.create(t, body("B2 scheduled"))
 	dropped := s.create(t, body("B2 scheduled then cancelled"))
-	if c := s.cancel(t, dropped.ID); c.Status != "cancelled" {
+	if c := s.cancel(t, dropped.Id); c.Status != "cancelled" {
 		t.Fatalf("cancel before T: want cancelled, got %q", c.Status)
 	}
 
-	reached := func(id string) int { return len(s.Provider.Requests(fakeprovider.Filter{Key: id})) }
+	reached := func(id uuid.UUID) int { return len(s.Provider.Requests(fakeprovider.Filter{Key: id.String()})) }
 	consistently(t, time.Until(at.Add(-skew)), func() bool {
-		return reached(due.ID) == 0 && reached(dropped.ID) == 0
+		return reached(due.Id) == 0 && reached(dropped.Id) == 0
 	}, "nothing scheduled reaches the provider before T")
 
 	// Sent within 2 s after T (plus 300 ms for this poll and the HTTP round trip).
 	deadline := at.Add(2*time.Second + 300*time.Millisecond)
 	dlEventually(t, time.Until(deadline), "the scheduled notification is sent within 2s after T", func() (bool, string) {
-		st := s.storedStatus(t, due.ID)
+		st := s.storedStatus(t, due.Id)
 		return st == "sent", "stored status " + st
 	})
-	rs := s.dlRequests(fakeprovider.Filter{Key: due.ID})
+	rs := s.dlRequests(fakeprovider.Filter{Key: due.Id.String()})
 	if len(rs) == 0 {
 		t.Fatal("sent, but the double has no request for it")
 	}
@@ -51,8 +54,8 @@ func TestDeliveryB2ScheduledDelivery(t *testing.T) {
 	}
 	t.Logf("scheduled for %s, reached the provider %s after T", at.Format(time.RFC3339Nano), rs[0].ReceivedAt.Sub(at).Round(time.Millisecond))
 
-	consistently(t, time.Second, func() bool { return reached(dropped.ID) == 0 }, "the cancelled scheduled notification never reaches the provider")
-	if st := s.storedStatus(t, dropped.ID); st != "cancelled" {
+	consistently(t, time.Second, func() bool { return reached(dropped.Id) == 0 }, "the cancelled scheduled notification never reaches the provider")
+	if st := s.storedStatus(t, dropped.Id); st != "cancelled" {
 		t.Errorf("cancelled scheduled notification: stored status %q", st)
 	}
 }

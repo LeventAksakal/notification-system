@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // R15: Health check endpoint - "Healthy when dependencies answer" (decision
@@ -14,11 +16,11 @@ import (
 func TestR15HealthAndReadiness(t *testing.T) {
 	s := startStack(t, stackOptions{})
 
-	st, h, err := probe(s.URL + "/healthz")
+	st, h, err := s.healthz()
 	if err != nil || st != http.StatusOK || h.Status != "ok" {
 		t.Errorf("/healthz: want 200 status ok, got %d %+v (%v)", st, h, err)
 	}
-	st, h, err = probe(s.URL + "/readyz")
+	st, h, err = s.readyz()
 	if err != nil || st != http.StatusOK || h.Status != "ok" {
 		t.Errorf("/readyz: want 200 status ok, got %d %+v (%v)", st, h, err)
 	}
@@ -54,17 +56,17 @@ func TestR15ReadyzMySQLDown(t *testing.T) {
 // 503 unavailable with dep not up and other still up, while /healthz stays 200.
 func dependencyDown(t *testing.T, peer *stack, p *tcpProxy, dep, other string) {
 	t.Helper()
-	st, h, err := probe(peer.URL + "/readyz")
+	st, h, err := peer.readyz()
 	if err != nil || st != http.StatusOK || h.Checks[dep] != "up" {
 		t.Fatalf("before the outage /readyz: want 200 with %s up, got %d %+v (%v)", dep, st, h, err)
 	}
 
 	p.Close()
 
-	var last health
+	var last apiclient.Health
 	var lastSt int
 	if !poll(30*time.Second, func() bool {
-		lastSt, last, err = probe(peer.URL + "/readyz")
+		lastSt, last, err = peer.readyz()
 		return err == nil && lastSt == http.StatusServiceUnavailable
 	}) {
 		t.Fatalf("not within 30s: /readyz with %s down: want 503, last %d %+v (%v)", dep, lastSt, last, err)
@@ -79,7 +81,7 @@ func dependencyDown(t *testing.T, peer *stack, p *tcpProxy, dep, other string) {
 		t.Errorf("/readyz checks[%q]: the other dependency should still be up, got %q", other, last.Checks[other])
 	}
 	consistently(t, 2*time.Second, func() bool {
-		st, h, err := probe(peer.URL + "/healthz")
+		st, h, err := peer.healthz()
 		return err == nil && st == http.StatusOK && h.Status == "ok"
 	}, "/healthz must stay 200 ok while %s is down", dep)
 }

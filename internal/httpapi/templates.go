@@ -4,57 +4,66 @@ import (
 	"context"
 	"errors"
 
+	"github.com/danielgtaylor/huma/v2"
+
 	"github.com/LeventAksakal/notification-system/internal/intake"
 )
 
-func (s *Server) ListTemplates(ctx context.Context, _ ListTemplatesRequestObject) (ListTemplatesResponseObject, error) {
+type templatesOutput struct{ Body TemplateList }
+
+func (s *Server) ListTemplates(ctx context.Context, _ *struct{}) (*templatesOutput, error) {
 	ts, err := s.intake.ListTemplates(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := ListTemplates200JSONResponse{Items: make([]Template, len(ts))}
+	out := &templatesOutput{TemplateList{Items: make([]Template, len(ts))}}
 	for i, t := range ts {
-		out.Items[i] = toTemplate(t)
+		out.Body.Items[i] = toTemplate(t)
 	}
 	return out, nil
 }
 
-func (s *Server) PutTemplate(ctx context.Context, req PutTemplateRequestObject) (PutTemplateResponseObject, error) {
-	if req.Body == nil {
-		return PutTemplate400JSONResponse{InvalidRequestJSONResponse(missingBody)}, nil
-	}
-	t, err := s.intake.PutTemplate(ctx, req.Name, req.Body.Body)
-	if body, ok := invalidBody(err); ok {
-		return PutTemplate400JSONResponse{InvalidRequestJSONResponse(body)}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return PutTemplate200JSONResponse(toTemplate(t)), nil
+type TemplateNameInput struct {
+	Name TemplateName `path:"name"`
 }
 
-func (s *Server) GetTemplate(ctx context.Context, req GetTemplateRequestObject) (GetTemplateResponseObject, error) {
-	t, err := s.intake.GetTemplate(ctx, req.Name)
-	if errors.Is(err, intake.ErrNotFound) {
-		return GetTemplate404JSONResponse{NotFoundJSONResponse(notFound("template"))}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return GetTemplate200JSONResponse(toTemplate(t)), nil
+type putTemplateInput struct {
+	TemplateNameInput
+	Body TemplateWrite
 }
 
-func (s *Server) DeleteTemplate(ctx context.Context, req DeleteTemplateRequestObject) (DeleteTemplateResponseObject, error) {
-	err := s.intake.DeleteTemplate(ctx, req.Name)
+// Resolve: every operation with a body runs singleValues (see refuseNull).
+func (*putTemplateInput) Resolve(ctx huma.Context) []error { return singleValues(ctx) }
+
+type templateOutput struct{ Body Template }
+
+func (s *Server) PutTemplate(ctx context.Context, in *putTemplateInput) (*templateOutput, error) {
+	t, err := s.intake.PutTemplate(ctx, string(in.Name), in.Body.Body)
+	if err := refusal(err); err != nil {
+		return nil, err
+	}
+	return &templateOutput{toTemplate(t)}, nil
+}
+
+func (s *Server) GetTemplate(ctx context.Context, in *TemplateNameInput) (*templateOutput, error) {
+	t, err := s.intake.GetTemplate(ctx, string(in.Name))
 	if errors.Is(err, intake.ErrNotFound) {
-		return DeleteTemplate404JSONResponse{NotFoundJSONResponse(notFound("template"))}, nil
+		return nil, notFound("template")
 	}
 	if err != nil {
 		return nil, err
 	}
-	return DeleteTemplate204Response{}, nil
+	return &templateOutput{toTemplate(t)}, nil
+}
+
+func (s *Server) DeleteTemplate(ctx context.Context, in *TemplateNameInput) (*struct{}, error) {
+	err := s.intake.DeleteTemplate(ctx, string(in.Name))
+	if errors.Is(err, intake.ErrNotFound) {
+		return nil, notFound("template")
+	}
+	return nil, err
 }
 
 func toTemplate(t intake.Template) Template {
-	return Template{Name: t.Name, Body: t.Body, Variables: t.Variables, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt}
+	return Template{Name: TemplateName(t.Name), Body: t.Body, Variables: t.Variables, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt}
 }

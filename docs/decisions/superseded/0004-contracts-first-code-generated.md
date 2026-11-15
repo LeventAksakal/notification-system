@@ -1,9 +1,12 @@
 ---
-status: proposed
+status: superseded
+superseded-by: ../0024-server-code-owns-the-http-contract.md
 date: 2026-11-13
 decision-makers: owner (pending); proposed by the coordinator
 revisit: when a generator blocks a needed feature
 ---
+> **Superseded by [0024](../0024-server-code-owns-the-http-contract.md)** (15 Nov 2026) for the HTTP API: the server's Huma operations are the source and `api/openapi.yaml` is generated from them. The SQL half (sqlc, generated migrations, record 0023) and keyset list pagination still hold.
+
 # Contracts are written first; handlers, queries and migrations are generated from them (0004)
 
 ## Rule

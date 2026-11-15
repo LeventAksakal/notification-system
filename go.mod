@@ -4,10 +4,10 @@ go 1.27.4
 
 require (
 	github.com/coder/websocket v1.8.15
+	github.com/danielgtaylor/huma/v2 v2.40.0
 	github.com/getkin/kin-openapi v0.153.0
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/google/uuid v1.6.0
-	github.com/oapi-codegen/nethttp-middleware v1.3.1
 	github.com/oapi-codegen/runtime v1.8.0
 	github.com/pressly/goose/v3 v3.30.0
 	github.com/testcontainers/testcontainers-go v0.45.0
@@ -52,7 +52,6 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-openapi/jsonpointer v1.0.0 // indirect
-	github.com/gorilla/mux v1.8.1 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
 	github.com/klauspost/compress v1.20.4 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e // indirect

@@ -26,3 +26,4 @@ Record 0004 in this folder is still `proposed` (the owner rejected it on 15 Nov 
 - [main moves by fast-forward; releases are cut by hand from a green commit (0021)](0021-fast-forward-main-releases-cut-by-hand.md)
 - [Packages are named for their role; contracts and settings sit at the root (0022)](0022-packages-by-role-contracts-at-the-root.md)
 - [schema/ is the desired state, diffed into goose migrations by sqldef (0023)](0023-schema-as-code-with-sqldef.md)
+- [The server's endpoint code owns the HTTP contract; the spec and clients are generated from it (0024)](0024-server-code-owns-the-http-contract.md)

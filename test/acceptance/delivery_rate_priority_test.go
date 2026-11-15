@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // dlMinRate is the least average rate per channel a saturated drain of one
@@ -24,7 +25,7 @@ func TestDeliveryR8RateLimit(t *testing.T) {
 	const perChannel = 700
 	chans := []string{"sms", "email", "push"}
 	s := startStack(t, stackOptions{Workers: 0, Env: dlFastEnv(nil)})
-	s.dlCreateMany(t, perChannel*3, func(i int) map[string]any {
+	s.dlCreateMany(t, perChannel*3, func(i int) apiclient.NotificationCreate {
 		return msg(chans[i%3], fmt.Sprintf("R8 backlog %d", i))
 	})
 	// The backlog is queued before any worker starts, so the drain is steady
@@ -126,9 +127,9 @@ func dlR8LargestGap(rs []fakeprovider.Request) (int, time.Duration) {
 func TestDeliveryR9Priority(t *testing.T) {
 	t.Run("a high notification behind 5000 low is sent within 2 s", func(t *testing.T) {
 		s := startStack(t, stackOptions{Workers: 0, Env: dlFastEnv(nil)})
-		s.dlCreateMany(t, 5000, func(i int) map[string]any {
+		s.dlCreateMany(t, 5000, func(i int) apiclient.NotificationCreate {
 			b := msg("sms", fmt.Sprintf("R9 low %d", i))
-			b["priority"] = "low"
+			b.Priority = ptr(apiclient.Low)
 			return b
 		})
 		for range 3 {
@@ -139,14 +140,14 @@ func TestDeliveryR9Priority(t *testing.T) {
 			return n >= 100, fmt.Sprintf("%d sms requests", n)
 		})
 		hb := msg("sms", "R9 high behind the backlog")
-		hb["priority"] = "high"
+		hb.Priority = ptr(apiclient.High)
 		created := time.Now()
 		high := s.create(t, hb)
 		dlEventually(t, 8*time.Second, "the high notification is sent", func() (bool, string) {
-			st := s.storedStatus(t, high.ID)
+			st := s.storedStatus(t, high.Id)
 			return st == "sent", "stored status " + st
 		})
-		got := s.dlGet(t, high.ID)
+		got := s.get(t, high.Id)
 		if got.FinishedAt == nil {
 			t.Fatalf("sent notification has no finishedAt")
 		}
@@ -154,7 +155,7 @@ func TestDeliveryR9Priority(t *testing.T) {
 		if lag := got.FinishedAt.Sub(got.CreatedAt); lag > 2*time.Second {
 			t.Errorf("high notification sent %s after its creation, want within 2s", lag)
 		}
-		rs := s.dlRequests(fakeprovider.Filter{Key: high.ID})
+		rs := s.dlRequests(fakeprovider.Filter{Key: high.Id.String()})
 		if len(rs) == 0 {
 			t.Fatal("the double never received the high notification")
 		}
@@ -168,18 +169,18 @@ func TestDeliveryR9Priority(t *testing.T) {
 	t.Run("low still moves while high saturates the channel", func(t *testing.T) {
 		const highN, lowN = 1500, 300
 		s := startStack(t, stackOptions{Workers: 0, Env: dlFastEnv(nil)})
-		ids := s.dlCreateMany(t, highN+lowN, func(i int) map[string]any {
+		ids := s.dlCreateMany(t, highN+lowN, func(i int) apiclient.NotificationCreate {
 			b := msg("email", fmt.Sprintf("R9 mixed %d", i))
 			if i < highN {
-				b["priority"] = "high"
+				b.Priority = ptr(apiclient.High)
 			} else {
-				b["priority"] = "low"
+				b.Priority = ptr(apiclient.Low)
 			}
 			return b
 		})
 		isLow := map[string]bool{}
 		for _, id := range ids[highN:] {
-			isLow[id] = true
+			isLow[id.String()] = true
 		}
 		for range 3 {
 			s.StartWorker()
@@ -221,9 +222,9 @@ func TestDeliveryR9Priority(t *testing.T) {
 	t.Run("low alone uses the whole channel rate", func(t *testing.T) {
 		const lowN = 400
 		s := startStack(t, stackOptions{Workers: 0, Env: dlFastEnv(nil)})
-		s.dlCreateMany(t, lowN, func(i int) map[string]any {
+		s.dlCreateMany(t, lowN, func(i int) apiclient.NotificationCreate {
 			b := msg("push", fmt.Sprintf("R9 low alone %d", i))
-			b["priority"] = "low"
+			b.Priority = ptr(apiclient.Low)
 			return b
 		})
 		for range 3 {

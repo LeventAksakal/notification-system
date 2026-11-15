@@ -3,206 +3,311 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/validation"
 
 	"github.com/LeventAksakal/notification-system/internal/intake"
 	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/telemetry"
 )
 
-func (s *Server) CreateNotification(ctx context.Context, req CreateNotificationRequestObject) (CreateNotificationResponseObject, error) {
-	if req.Body == nil {
-		return CreateNotification400JSONResponse{InvalidRequestJSONResponse(missingBody)}, nil
-	}
-	n, replayed, err := s.intake.Create(ctx, toRequest(*req.Body), meta(ctx, req.Params.IdempotencyKey))
-	if body, ok := invalidBody(err); ok {
-		return CreateNotification400JSONResponse{InvalidRequestJSONResponse(body)}, nil
-	}
-	if errors.Is(err, intake.ErrIdempotencyKeyReused) {
-		return CreateNotification422JSONResponse{IdempotencyKeyReusedJSONResponse(keyReused)}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	cid := telemetry.CorrelationID(ctx)
-	return CreateNotification201JSONResponse{
-		Body:    toNotification(n),
-		Headers: CreateNotification201ResponseHeaders{XCorrelationID: &cid, IdempotentReplayed: replayedHeader(replayed)},
-	}, nil
+type CreateHeaders struct {
+	IdempotencyKey idempotencyKey `header:"Idempotency-Key"`
+	CorrelationID  correlationID  `header:"X-Correlation-ID"`
 }
 
-func (s *Server) CreateBatch(ctx context.Context, req CreateBatchRequestObject) (CreateBatchResponseObject, error) {
-	if req.Body == nil {
-		return CreateBatch400JSONResponse{InvalidRequestJSONResponse(missingBody)}, nil
+type createNotificationInput struct {
+	CreateHeaders
+	Body NotificationCreate
+}
+
+func (*createNotificationInput) Resolve(ctx huma.Context) []error { return singleValues(ctx) }
+
+type CreatedHeaders struct {
+	CorrelationID string  `header:"X-Correlation-ID" doc:"The correlation id in force for this request"`
+	Replayed      *string "header:\"Idempotent-Replayed\" enum:\"true\" nullable:\"false\" doc:\"Present and `true` when this response repeats an earlier one for the same Idempotency-Key\""
+}
+
+type createNotificationOutput struct {
+	CreatedHeaders
+	Body Notification
+}
+
+func (s *Server) CreateNotification(ctx context.Context, in *createNotificationInput) (*createNotificationOutput, error) {
+	n, replayed, err := s.intake.Create(ctx, toRequest(in.Body), meta(ctx, in.IdempotencyKey))
+	if err := refusal(err); err != nil {
+		return nil, err
 	}
-	rs := make([]intake.Request, len(req.Body.Notifications))
-	for i, n := range req.Body.Notifications {
+	return &createNotificationOutput{CreatedHeaders: created(ctx, replayed), Body: toNotification(n)}, nil
+}
+
+type createBatchInput struct {
+	CreateHeaders
+	Body BatchCreate
+}
+
+func (*createBatchInput) Resolve(ctx huma.Context) []error { return singleValues(ctx) }
+
+type createBatchOutput struct {
+	CreatedHeaders
+	Body BatchCreated
+}
+
+func (s *Server) CreateBatch(ctx context.Context, in *createBatchInput) (*createBatchOutput, error) {
+	rs := make([]intake.Request, len(in.Body.Notifications))
+	for i, n := range in.Body.Notifications {
 		rs[i] = toRequest(n)
 	}
-	b, replayed, err := s.intake.CreateBatch(ctx, rs, meta(ctx, req.Params.IdempotencyKey))
-	if body, ok := invalidBody(err); ok {
-		return CreateBatch400JSONResponse{InvalidRequestJSONResponse(body)}, nil
-	}
-	if errors.Is(err, intake.ErrIdempotencyKeyReused) {
-		return CreateBatch422JSONResponse{IdempotencyKeyReusedJSONResponse(keyReused)}, nil
-	}
-	if err != nil {
+	b, replayed, err := s.intake.CreateBatch(ctx, rs, meta(ctx, in.IdempotencyKey))
+	if err := refusal(err); err != nil {
 		return nil, err
 	}
 	ids := make([]uuid.UUID, len(b.NotificationIDs))
 	for i, id := range b.NotificationIDs {
 		ids[i] = uuid.MustParse(id)
 	}
-	cid := telemetry.CorrelationID(ctx)
-	return CreateBatch201JSONResponse{
-		Body:    BatchCreated{Id: uuid.MustParse(b.ID), Total: b.Total, NotificationIds: ids, CreatedAt: b.CreatedAt},
-		Headers: CreateBatch201ResponseHeaders{XCorrelationID: &cid, IdempotentReplayed: replayedHeader(replayed)},
+	return &createBatchOutput{
+		CreatedHeaders: created(ctx, replayed),
+		Body:           BatchCreated{ID: uuid.MustParse(b.ID), Total: b.Total, NotificationIDs: ids, CreatedAt: b.CreatedAt},
 	}, nil
 }
 
-func (s *Server) GetNotification(ctx context.Context, req GetNotificationRequestObject) (GetNotificationResponseObject, error) {
-	n, err := s.intake.Get(ctx, req.Id.String())
+type idInput struct {
+	ID uuidParam `path:"id"`
+}
+
+type notificationOutput struct{ Body Notification }
+
+func (s *Server) GetNotification(ctx context.Context, in *idInput) (*notificationOutput, error) {
+	n, err := s.intake.Get(ctx, in.ID.String())
 	if errors.Is(err, intake.ErrNotFound) {
-		return GetNotification404JSONResponse{NotFoundJSONResponse(notFound("notification"))}, nil
+		return nil, notFound("notification")
 	}
 	if err != nil {
 		return nil, err
 	}
-	return GetNotification200JSONResponse(toNotification(n)), nil
+	return &notificationOutput{toNotification(n)}, nil
 }
 
-func (s *Server) ListNotifications(ctx context.Context, req ListNotificationsRequestObject) (ListNotificationsResponseObject, error) {
-	p := req.Params
-	f := intake.Filter{CreatedFrom: p.CreatedFrom, CreatedTo: p.CreatedTo}
-	if p.Status != nil {
-		f.Status = string(*p.Status)
+type listNotificationsInput struct {
+	Status      Status    "query:\"status\" doc:\"`scheduled` selects pending notifications whose due time is in the future and that were never tried; `pending` selects the other pending ones.\""
+	Channel     Channel   `query:"channel"`
+	BatchID     uuidParam `query:"batchId"`
+	CreatedFrom time.Time "query:\"createdFrom\" doc:\"Inclusive lower bound on `createdAt`\""
+	CreatedTo   time.Time "query:\"createdTo\" doc:\"Exclusive upper bound on `createdAt`\""
+	Limit       pageLimit `query:"limit"`
+	Cursor      cursor    `query:"cursor"`
+}
+
+// Resolve refuses a single-value parameter given twice (Huma reads the first).
+func (*listNotificationsInput) Resolve(ctx huma.Context) []error { return singleValues(ctx) }
+
+type pageOutput struct{ Body NotificationPage }
+
+func (s *Server) ListNotifications(ctx context.Context, in *listNotificationsInput) (*pageOutput, error) {
+	f := intake.Filter{Status: string(in.Status), Channel: notification.Channel(in.Channel),
+		Limit: int(in.Limit), Cursor: string(in.Cursor)}
+	if in.BatchID != (uuidParam{}) {
+		f.BatchID = in.BatchID.String()
 	}
-	if p.Channel != nil {
-		f.Channel = notification.Channel(*p.Channel)
+	if !in.CreatedFrom.IsZero() {
+		f.CreatedFrom = &in.CreatedFrom
 	}
-	if p.BatchId != nil {
-		f.BatchID = p.BatchId.String()
-	}
-	if p.Limit != nil {
-		f.Limit = *p.Limit
-	}
-	if p.Cursor != nil {
-		f.Cursor = *p.Cursor
+	if !in.CreatedTo.IsZero() {
+		f.CreatedTo = &in.CreatedTo
 	}
 	page, err := s.intake.List(ctx, f)
-	if body, ok := invalidBody(err); ok {
-		return ListNotifications400JSONResponse{InvalidRequestJSONResponse(body)}, nil
-	}
-	if err != nil {
+	if err := refusal(err); err != nil {
 		return nil, err
 	}
-	out := ListNotifications200JSONResponse{Items: make([]Notification, len(page.Items))}
+	out := &pageOutput{NotificationPage{Items: make([]Notification, len(page.Items)), NextCursor: page.NextCursor}}
 	for i, n := range page.Items {
-		out.Items[i] = toNotification(n)
-	}
-	if page.NextCursor != "" {
-		out.NextCursor = &page.NextCursor
+		out.Body.Items[i] = toNotification(n)
 	}
 	return out, nil
 }
 
-func (s *Server) CancelNotification(ctx context.Context, req CancelNotificationRequestObject) (CancelNotificationResponseObject, error) {
-	n, err := s.intake.Cancel(ctx, req.Id.String())
+func (s *Server) CancelNotification(ctx context.Context, in *idInput) (*notificationOutput, error) {
+	n, err := s.intake.Cancel(ctx, in.ID.String())
 	switch {
 	case errors.Is(err, intake.ErrNotFound):
-		return CancelNotification404JSONResponse{NotFoundJSONResponse(notFound("notification"))}, nil
+		return nil, notFound("notification")
 	case errors.Is(err, intake.ErrNotCancellable):
-		return CancelNotification409JSONResponse{ConflictJSONResponse(Error{Code: "not_cancellable", Message: err.Error()})}, nil
+		return nil, newError(409, "not_cancellable", err.Error())
 	case err != nil:
 		return nil, err
 	}
-	return CancelNotification200JSONResponse(toNotification(n)), nil
+	return &notificationOutput{toNotification(n)}, nil
 }
 
-func (s *Server) RetryNotification(ctx context.Context, req RetryNotificationRequestObject) (RetryNotificationResponseObject, error) {
-	n, err := s.intake.Retry(ctx, req.Id.String())
+func (s *Server) RetryNotification(ctx context.Context, in *idInput) (*notificationOutput, error) {
+	n, err := s.intake.Retry(ctx, in.ID.String())
 	switch {
 	case errors.Is(err, intake.ErrNotFound):
-		return RetryNotification404JSONResponse{NotFoundJSONResponse(notFound("notification"))}, nil
+		return nil, notFound("notification")
 	case errors.Is(err, intake.ErrNotRetryable):
-		return RetryNotification409JSONResponse{ConflictJSONResponse(Error{Code: "not_retryable", Message: err.Error()})}, nil
+		return nil, newError(409, "not_retryable", err.Error())
 	case err != nil:
 		return nil, err
 	}
-	return RetryNotification200JSONResponse(toNotification(n)), nil
+	return &notificationOutput{toNotification(n)}, nil
 }
 
-func (s *Server) GetBatch(ctx context.Context, req GetBatchRequestObject) (GetBatchResponseObject, error) {
-	var limit int
-	var cursor string
-	if req.Params.Limit != nil {
-		limit = *req.Params.Limit
-	}
-	if req.Params.Cursor != nil {
-		cursor = *req.Params.Cursor
-	}
-	b, err := s.intake.GetBatch(ctx, req.Id.String(), limit, cursor)
-	if body, ok := invalidBody(err); ok {
-		return GetBatch400JSONResponse{InvalidRequestJSONResponse(body)}, nil
-	}
+type getBatchInput struct {
+	ID     uuidParam `path:"id"`
+	Limit  pageLimit `query:"limit"`
+	Cursor cursor    `query:"cursor"`
+}
+
+func (*getBatchInput) Resolve(ctx huma.Context) []error { return singleValues(ctx) }
+
+type batchOutput struct{ Body BatchStatus }
+
+func (s *Server) GetBatch(ctx context.Context, in *getBatchInput) (*batchOutput, error) {
+	b, err := s.intake.GetBatch(ctx, in.ID.String(), int(in.Limit), string(in.Cursor))
 	if errors.Is(err, intake.ErrNotFound) {
-		return GetBatch404JSONResponse{NotFoundJSONResponse(notFound("batch"))}, nil
+		return nil, notFound("batch")
 	}
-	if err != nil {
+	if err := refusal(err); err != nil {
 		return nil, err
 	}
-	out := GetBatch200JSONResponse{
-		Id:        uuid.MustParse(b.ID),
-		Total:     int(b.Total),
-		CreatedAt: b.CreatedAt,
-		Counts: StatusCounts{
-			Scheduled:  b.Counts[string(Scheduled)],
-			Pending:    b.Counts[string(Pending)],
-			Processing: b.Counts[string(Processing)],
-			Sent:       b.Counts[string(Sent)],
-			Failed:     b.Counts[string(Failed)],
-			Cancelled:  b.Counts[string(Cancelled)],
-		},
-		Items: make([]Notification, len(b.Items)),
-	}
+	out := &batchOutput{BatchStatus{
+		ID:         uuid.MustParse(b.ID),
+		Total:      int(b.Total),
+		CreatedAt:  b.CreatedAt,
+		Counts:     toCounts(b.Counts),
+		Items:      make([]Notification, len(b.Items)),
+		NextCursor: b.NextCursor,
+	}}
 	for i, n := range b.Items {
-		out.Items[i] = toNotification(n)
-	}
-	if b.NextCursor != "" {
-		out.NextCursor = &b.NextCursor
+		out.Body.Items[i] = toNotification(n)
 	}
 	return out, nil
+}
+
+// singleValues refuses what Huma lets through for a query or header
+// parameter: a single-value one given more than once (Huma reads the first),
+// and an empty value where the schema needs at least one character (Huma
+// treats it as absent, so an empty Idempotency-Key would create without a
+// key).
+func singleValues(ctx huma.Context) []error {
+	u := ctx.URL()
+	q := u.Query()
+	h := http.Header{}
+	ctx.EachHeader(func(name, value string) { h.Add(name, value) })
+	var errs []error
+	for _, p := range ctx.Operation().Parameters {
+		var vals []string
+		switch {
+		case p.In == "query" && (p.Schema == nil || p.Schema.Type != huma.TypeArray):
+			vals = q[p.Name]
+		case p.In == "header":
+			vals = h.Values(p.Name)
+		default:
+			continue
+		}
+		switch {
+		case len(vals) > 1:
+			errs = append(errs, &huma.ErrorDetail{Location: p.In + "." + p.Name,
+				Message: "expected one value, got " + strconv.Itoa(len(vals))})
+		case len(vals) == 1 && vals[0] == "" && p.Schema != nil && p.Schema.MinLength != nil && *p.Schema.MinLength > 0:
+			errs = append(errs, &huma.ErrorDetail{Location: p.In + "." + p.Name,
+				Message: fmt.Sprintf(validation.MsgExpectedMinLength, *p.Schema.MinLength)})
+		}
+	}
+	if nulls, ok := ctx.Context().Value(nullsKey{}).([]error); ok {
+		errs = append(errs, nulls...)
+	}
+	return errs
+}
+
+// uuidParam is a UUID path or query parameter, read by parseUUID.
+type uuidParam struct{ uuid.UUID }
+
+func (u *uuidParam) UnmarshalText(b []byte) (err error) {
+	u.UUID, err = parseUUID(string(b))
+	return err
+}
+
+func (uuidParam) Schema(huma.Registry) *huma.Schema {
+	return &huma.Schema{Type: huma.TypeString, Format: "uuid"}
+}
+
+// parseUUID reads a UUID as Huma's format check accepts it: the standard
+// library trims a "urn:uuid:" prefix only in lower case.
+func parseUUID(s string) (uuid.UUID, error) {
+	if len(s) > 9 && strings.EqualFold(s[:9], "urn:uuid:") {
+		s = s[9:]
+	}
+	return uuid.Parse(s)
+}
+
+// refusal maps the service's refusals to the contract's errors; any other
+// error passes through to Huma, and so to toError (500, or 503 when the
+// database cannot be reached).
+func refusal(err error) error {
+	var ve *intake.ValidationError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &ve):
+		details := make([]ErrorDetail, len(ve.Details))
+		for i, d := range ve.Details {
+			details[i] = ErrorDetail{Index: d.Index, Field: d.Field, Reason: d.Reason}
+		}
+		e := invalid(details)
+		e.Message = ve.Error()
+		return e
+	case errors.Is(err, intake.ErrIdempotencyKeyReused):
+		return errKeyReused
+	}
+	return err
 }
 
 // meta collects what the service stores besides the body: the key, the
 // correlation id the middleware put in the context, the active trace.
-func meta(ctx context.Context, key *string) intake.Meta {
-	m := intake.Meta{CorrelationID: telemetry.CorrelationID(ctx), Traceparent: telemetry.Traceparent(ctx)}
-	if key != nil {
-		m.IdempotencyKey = *key
+func meta(ctx context.Context, key idempotencyKey) intake.Meta {
+	return intake.Meta{IdempotencyKey: string(key), CorrelationID: telemetry.CorrelationID(ctx),
+		Traceparent: telemetry.Traceparent(ctx)}
+}
+
+func created(ctx context.Context, replayed bool) CreatedHeaders {
+	h := CreatedHeaders{CorrelationID: telemetry.CorrelationID(ctx)}
+	if replayed {
+		h.Replayed = ptr("true")
 	}
-	return m
+	return h
 }
 
 func toRequest(n NotificationCreate) intake.Request {
-	r := intake.Request{To: n.To, Channel: notification.Channel(n.Channel), Content: n.Content, ScheduledAt: n.ScheduledAt}
-	if n.Priority != nil {
-		r.Priority = notification.Priority(*n.Priority)
+	r := intake.Request{To: n.To, Channel: notification.Channel(n.Channel),
+		ScheduledAt: n.ScheduledAt, Priority: notification.Priority(n.Priority)}
+	if n.Content != "" {
+		r.Content = &n.Content
 	}
 	if n.Template != nil {
-		r.Template = &intake.TemplateRef{Name: n.Template.Name}
-		if n.Template.Variables != nil {
-			r.Template.Variables = *n.Template.Variables
-		}
+		r.Template = &intake.TemplateRef{Name: string(n.Template.Name), Variables: n.Template.Variables}
 	}
 	return r
 }
 
+func toCounts(c map[string]int) StatusCounts {
+	return StatusCounts{
+		Scheduled: c[string(StatusScheduled)], Pending: c[string(StatusPending)], Processing: c[string(StatusProcessing)],
+		Sent: c[string(StatusSent)], Failed: c[string(StatusFailed)], Cancelled: c[string(StatusCancelled)],
+	}
+}
+
 func toNotification(n intake.Notification) Notification {
 	out := Notification{
-		Id:            uuid.MustParse(n.ID),
+		ID:            uuid.MustParse(n.ID),
 		To:            n.Recipient,
 		Channel:       Channel(n.Channel),
 		Content:       n.Content,
@@ -210,48 +315,44 @@ func toNotification(n intake.Notification) Notification {
 		Status:        Status(n.Status()),
 		Attempts:      int(n.Attempts),
 		DueAt:         n.DueAt,
-		CorrelationId: n.CorrelationID,
+		CorrelationID: n.CorrelationID,
 		CreatedAt:     n.CreatedAt,
 		UpdatedAt:     n.UpdatedAt,
 	}
 	if n.BatchID.Valid {
-		id := uuid.MustParse(n.BatchID.String)
-		out.BatchId = &id
+		out.BatchID = ptr(uuid.MustParse(n.BatchID.String))
 	}
 	if n.FailureKind.Valid {
-		k := FailureKind(n.FailureKind.NotificationsFailureKind)
-		out.FailureKind = &k
+		out.FailureKind = ptr(FailureKind(n.FailureKind.NotificationsFailureKind))
 	}
 	if n.LastError.Valid {
 		out.LastError = &n.LastError.String
 	}
 	if n.ProviderMessageID.Valid {
-		out.ProviderMessageId = &n.ProviderMessageID.String
+		out.ProviderMessageID = &n.ProviderMessageID.String
 	}
 	out.ScheduledAt = timePtr(n.ScheduledAt.Time, n.ScheduledAt.Valid)
 	out.FinishedAt = timePtr(n.FinishedAt.Time, n.FinishedAt.Valid)
 	if n.History != nil {
-		attempts := make([]DeliveryAttempt, len(n.History))
+		out.DeliveryAttempts = make([]DeliveryAttempt, len(n.History))
 		for i, a := range n.History {
 			d := DeliveryAttempt{
 				AttemptNo:  int(a.AttemptNo),
 				StartedAt:  a.StartedAt,
 				DurationMs: int(a.DurationMs),
-				Outcome:    DeliveryAttemptOutcome(a.Outcome),
+				Outcome:    string(a.Outcome),
 			}
 			if a.HttpStatus.Valid {
-				st := int(a.HttpStatus.Int16)
-				d.HttpStatus = &st
+				d.HTTPStatus = ptr(int(a.HttpStatus.Int16))
 			}
 			if a.Error.Valid {
 				d.Error = &a.Error.String
 			}
 			if a.ProviderMessageID.Valid {
-				d.ProviderMessageId = &a.ProviderMessageID.String
+				d.ProviderMessageID = &a.ProviderMessageID.String
 			}
-			attempts[i] = d
+			out.DeliveryAttempts[i] = d
 		}
-		out.DeliveryAttempts = &attempts
 	}
 	return out
 }
@@ -261,37 +362,4 @@ func timePtr(t time.Time, ok bool) *time.Time {
 		return nil
 	}
 	return &t
-}
-
-func replayedHeader(replayed bool) *string {
-	if !replayed {
-		return nil
-	}
-	t := "true"
-	return &t
-}
-
-var (
-	missingBody = Error{Code: "invalid_request", Message: "body: a JSON body is required",
-		Details: &[]ErrorDetail{{Field: "body", Reason: "required"}}}
-	keyReused = Error{Code: "idempotency_key_reused",
-		Message: "this Idempotency-Key was used before with a different payload"}
-)
-
-func notFound(what string) Error {
-	return Error{Code: "not_found", Message: "no such " + what}
-}
-
-// invalidBody turns the service's validation error into the contract's
-// 400 body (the same shape the spec validator writes).
-func invalidBody(err error) (Error, bool) {
-	var ve *intake.ValidationError
-	if !errors.As(err, &ve) {
-		return Error{}, false
-	}
-	details := make([]ErrorDetail, len(ve.Details))
-	for i, d := range ve.Details {
-		details[i] = ErrorDetail{Index: d.Index, Field: d.Field, Reason: d.Reason}
-	}
-	return Error{Code: "invalid_request", Message: ve.Error(), Details: &details}, true
 }

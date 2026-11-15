@@ -59,6 +59,16 @@ jobs:
         run: |
           go generate ./...
           git diff --exit-code
+      # The spec is generated from the server's code (decision 0024), so a
+      # change to a handler's types can break clients without anyone editing
+      # the file. --flatten-params: a parameter moved between a path and its
+      # operations is the same parameter.
+      - name: API contract keeps every client working (no breaking change against the base)
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git show "$BASE:api/openapi.yaml" > "$RUNNER_TEMP/base-openapi.yaml"
+          $T oasdiff breaking --flatten-params --fail-on ERR "$RUNNER_TEMP/base-openapi.yaml" api/openapi.yaml
       - name: Known vulnerabilities
         run: $T govulncheck ./...
 

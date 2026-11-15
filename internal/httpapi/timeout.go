@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"sync"
@@ -55,7 +56,8 @@ func withTimeout(d time.Duration, next http.Handler) http.Handler {
 				return
 			}
 			w.Header().Set("Connection", "close")
-			writeUnavailable(w, r, context.Cause(ctx))
+			slog.WarnContext(r.Context(), "request deadline passed; answered 503", "method", r.Method, "path", r.URL.Path, "err", context.Cause(ctx))
+			writeError(w, errUnavailable())
 			_ = http.NewResponseController(w).Flush()
 			if p := <-done; p != nil {
 				panic(p)
@@ -81,7 +83,9 @@ func (tw *timeoutWriter) Write(p []byte) (int, error) {
 	tw.mu.Lock()
 	defer tw.mu.Unlock()
 	if tw.timedOut {
-		return 0, http.ErrHandlerTimeout
+		// The 503 has gone out; the late answer is dropped. No error: Huma
+		// treats a failed write as a bug and panics.
+		return len(p), nil
 	}
 	if tw.status == 0 {
 		tw.status = http.StatusOK

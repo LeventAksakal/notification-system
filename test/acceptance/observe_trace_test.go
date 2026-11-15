@@ -15,8 +15,8 @@ func TestB5TraceparentToProvider(t *testing.T) {
 
 	t.Run("incoming trace id reaches the provider with a new span", func(t *testing.T) {
 		traceID, spanID := randHex(32), randHex(16)
-		n := s.create(t, msg("push", "b5 traced"), "traceparent", "00-"+traceID+"-"+spanID+"-01")
-		reqs := s.providerRequests(t, n.ID, 60*time.Second)
+		n := s.create(t, msg("push", "b5 traced"), header("traceparent", "00-"+traceID+"-"+spanID+"-01"))
+		reqs := s.providerRequests(t, n.Id, 60*time.Second)
 		for _, r := range reqs {
 			gotTrace, gotSpan, ok := parseTraceparent(r.Traceparent)
 			if !ok {
@@ -34,7 +34,7 @@ func TestB5TraceparentToProvider(t *testing.T) {
 
 	t.Run("no incoming traceparent: provider still gets a valid one", func(t *testing.T) {
 		n := s.create(t, msg("sms", "b5 untraced"))
-		reqs := s.providerRequests(t, n.ID, 60*time.Second)
+		reqs := s.providerRequests(t, n.Id, 60*time.Second)
 		for _, r := range reqs {
 			if _, _, ok := parseTraceparent(r.Traceparent); !ok {
 				t.Errorf("provider traceparent is not valid W3C: %q", r.Traceparent)

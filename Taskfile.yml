@@ -23,6 +23,7 @@ tasks:
       - '{{.T}} golangci-lint version'
       - '{{.T}} sqlc version'
       - '{{.T}} oapi-codegen -version'
+      - '{{.T}} oasdiff --version'
       - '{{.T}} gotestsum --version'
       - '{{.T}} mockgen -version'
       - docker version --format 'docker {{"{{"}}.Server.Version{{"}}"}}'
@@ -61,8 +62,15 @@ tasks:
     cmds: ['go build -o .claude/bin/agentguard.exe ./tools/agentguard']
 
   gen:
-    desc: Regenerate SQL and API code from their sources (migrations come from migrate:diff)
+    desc: 'Regenerate from the sources: sqlc types from SQL, api/openapi.yaml from internal/httpapi, the Go client from the spec (migrations come from migrate:diff)'
     cmds: ['go generate ./...']
+
+  api:breaking:
+    desc: 'Fail if api/openapi.yaml breaks clients of a base revision (usage: task api:breaking [BASE=main])'
+    cmds:
+      - git show {{.BASE | default "main"}}:api/openapi.yaml > .task-base-openapi.yaml
+      - defer: rm -f .task-base-openapi.yaml
+      - '{{.T}} oasdiff breaking --flatten-params --fail-on ERR .task-base-openapi.yaml api/openapi.yaml'
 
   lint:
     desc: golangci-lint, failing on any silent typecheck error

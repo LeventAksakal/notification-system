@@ -1,0 +1,9 @@
+# Default rules, minus Go checksum files: every line of go.sum and tools.sum is
+# a module hash (h1:<base64>) verified against the checksum database, and
+# generic-api-key matches some of them.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Go module checksums"
+paths = ['''(^|/)(go|tools)\.sum$''']

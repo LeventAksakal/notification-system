@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // R15: Health check endpoint - "unready when the database or Valkey is down"
@@ -26,7 +28,7 @@ func TestR15APIUnavailableWhileMySQLDown(t *testing.T) {
 	const limit = 10 * time.Second
 	s := startStack(t, stackOptions{})
 	n := s.create(t, msg("sms", "before the database outage"))
-	b := s.createBatch(t, []map[string]any{msg("email", "batch before the database outage")})
+	b := s.createBatch(t, []apiclient.NotificationCreate{msg("email", "batch before the database outage")})
 
 	mysqlAddr := shared(t).mysqlAddr
 	p := newLinkProxy(t, mysqlAddr)
@@ -38,7 +40,7 @@ func TestR15APIUnavailableWhileMySQLDown(t *testing.T) {
 
 	healthz := func(when string) {
 		t.Helper()
-		if st, h, err := probe(peer.URL + "/healthz"); err != nil || st != http.StatusOK || h.Status != "ok" {
+		if st, h, err := peer.healthz(); err != nil || st != http.StatusOK || h.Status != "ok" {
 			t.Errorf("/healthz %s: want 200 ok, got %d %+v (%v)", when, st, h, err)
 		}
 	}
@@ -47,23 +49,31 @@ func TestR15APIUnavailableWhileMySQLDown(t *testing.T) {
 	p.down(outageClosed)
 	waitReadyz(t, peer, 30*time.Second, "kept answering 200 after MySQL went away", func(st int) bool { return st != http.StatusOK })
 
-	create := msg("push", "during the database outage")
+	create := func(ctx context.Context) (*http.Response, error) {
+		return peer.API.CreateNotification(ctx, nil, msg("push", "during the database outage"))
+	}
 	ops := []struct {
-		name, method, path string
-		body               any
+		name, what string
+		call       apiCall
 	}{
-		{"create", http.MethodPost, "/v1/notifications", create},
-		{"read by id", http.MethodGet, "/v1/notifications/" + n.ID, nil},
-		{"list", http.MethodGet, "/v1/notifications?channel=sms", nil},
-		{"batch read", http.MethodGet, "/v1/batches/" + b.ID, nil},
+		{"create", "POST /v1/notifications", create},
+		{"read by id", "GET /v1/notifications/" + n.Id.String(), func(ctx context.Context) (*http.Response, error) {
+			return peer.API.GetNotification(ctx, n.Id)
+		}},
+		{"list", "GET /v1/notifications?channel=sms", func(ctx context.Context) (*http.Response, error) {
+			return peer.API.ListNotifications(ctx, &apiclient.ListNotificationsParams{Channel: ptr(apiclient.Sms)})
+		}},
+		{"batch read", "GET /v1/batches/" + b.Id.String(), func(ctx context.Context) (*http.Response, error) {
+			return peer.API.GetBatch(ctx, b.Id, nil)
+		}},
 	}
 	for _, op := range ops {
 		t.Run(op.name+" answers 503 unavailable", func(t *testing.T) {
-			r, took, err := unavailableDo(peer, op.method, op.path, op.body, 30*time.Second)
+			r, took, err := unavailableDo(op.call, 30*time.Second)
 			if err != nil {
-				t.Fatalf("%s %s with MySQL down: %v (after %s)", op.method, op.path, err, took.Round(time.Millisecond))
+				t.Fatalf("%s with MySQL down: %v (after %s)", op.what, err, took.Round(time.Millisecond))
 			}
-			t.Logf("%s %s with MySQL down: %s in %s; Retry-After %q", op.method, op.path, r, took.Round(time.Millisecond), r.Header.Get("Retry-After"))
+			t.Logf("%s with MySQL down: %s in %s; Retry-After %q", op.what, r, took.Round(time.Millisecond), r.Header.Get("Retry-After"))
 			if took > limit {
 				t.Errorf("answered after %s, want within %s", took.Round(time.Millisecond), limit)
 			}
@@ -78,7 +88,7 @@ func TestR15APIUnavailableWhileMySQLDown(t *testing.T) {
 	waitReadyz(t, peer, 30*time.Second, "never answered 200 after MySQL came back", func(st int) bool { return st == http.StatusOK })
 	var last *response
 	if !poll(limit, func() bool {
-		r, _, err := unavailableDo(peer, http.MethodPost, "/v1/notifications", create, 10*time.Second)
+		r, _, err := unavailableDo(create, 10*time.Second)
 		if err == nil {
 			last = r
 		}
@@ -118,12 +128,12 @@ func TestR15APIUnavailableWhileMySQLHangs(t *testing.T) {
 
 	healthz := func(when string) {
 		t.Helper()
-		r, took, err := unavailableDo(peer, http.MethodGet, "/healthz", nil, clientTimeout)
+		r, took, err := unavailableDo(func(ctx context.Context) (*http.Response, error) { return peer.API.Health(ctx) }, clientTimeout)
 		if err != nil {
 			t.Errorf("/healthz %s: no answer within %s (%v)", when, took.Round(time.Millisecond), err)
 			return
 		}
-		var h health
+		var h apiclient.Health
 		if r.Status != http.StatusOK || json.Unmarshal(r.Body, &h) != nil || h.Status != "ok" {
 			t.Errorf("/healthz %s: want 200 ok, got %s", when, r)
 		}
@@ -135,22 +145,28 @@ func TestR15APIUnavailableWhileMySQLHangs(t *testing.T) {
 
 	p.down(outageUnresponsive)
 
-	create := msg("push", "during the database hang")
+	create := func(ctx context.Context) (*http.Response, error) {
+		return peer.API.CreateNotification(ctx, nil, msg("push", "during the database hang"))
+	}
 	ops := []struct {
-		name, method, path string
-		body               any
+		name, what string
+		call       apiCall
 	}{
-		{"create", http.MethodPost, "/v1/notifications", create},
-		{"read by id", http.MethodGet, "/v1/notifications/" + n.ID, nil},
-		{"list", http.MethodGet, "/v1/notifications?channel=sms", nil},
+		{"create", "POST /v1/notifications", create},
+		{"read by id", "GET /v1/notifications/" + n.Id.String(), func(ctx context.Context) (*http.Response, error) {
+			return peer.API.GetNotification(ctx, n.Id)
+		}},
+		{"list", "GET /v1/notifications?channel=sms", func(ctx context.Context) (*http.Response, error) {
+			return peer.API.ListNotifications(ctx, &apiclient.ListNotificationsParams{Channel: ptr(apiclient.Sms)})
+		}},
 	}
 	for _, op := range ops {
 		t.Run(op.name+" answers 503 unavailable in time", func(t *testing.T) {
-			r, took, err := unavailableDo(peer, op.method, op.path, op.body, clientTimeout)
+			r, took, err := unavailableDo(op.call, clientTimeout)
 			if err != nil {
-				t.Fatalf("%s %s with MySQL hanging: no answer within %s, want 503 within %s (%v)", op.method, op.path, took.Round(time.Millisecond), limit, err)
+				t.Fatalf("%s with MySQL hanging: no answer within %s, want 503 within %s (%v)", op.what, took.Round(time.Millisecond), limit, err)
 			}
-			t.Logf("%s %s with MySQL hanging: %s in %s; Retry-After %q", op.method, op.path, r, took.Round(time.Millisecond), r.Header.Get("Retry-After"))
+			t.Logf("%s with MySQL hanging: %s in %s; Retry-After %q", op.what, r, took.Round(time.Millisecond), r.Header.Get("Retry-After"))
 			if took > limit {
 				t.Errorf("answered after %s, want within %s", took.Round(time.Millisecond), limit)
 			}
@@ -165,7 +181,7 @@ func TestR15APIUnavailableWhileMySQLHangs(t *testing.T) {
 	var last *response
 	var lastErr error
 	if !poll(recoverLimit, func() bool {
-		r, _, err := unavailableDo(peer, http.MethodPost, "/v1/notifications", create, clientTimeout)
+		r, _, err := unavailableDo(create, clientTimeout)
 		last, lastErr = r, err
 		return err == nil && r.Status == http.StatusCreated
 	}) {
@@ -174,27 +190,12 @@ func TestR15APIUnavailableWhileMySQLHangs(t *testing.T) {
 	healthz("after MySQL answered again")
 }
 
-// unavailableDo sends one request to peer with a hard client timeout.
-func unavailableDo(peer *stack, method, path string, body any, clientTimeout time.Duration) (*response, time.Duration, error) {
-	var rdr io.Reader
-	if body != nil {
-		buf, err := json.Marshal(body)
-		if err != nil {
-			return nil, 0, err
-		}
-		rdr = strings.NewReader(string(buf))
-	}
+// unavailableDo sends one typed request with a hard client timeout.
+func unavailableDo(call apiCall, clientTimeout time.Duration) (*response, time.Duration, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, peer.URL+path, rdr)
-	if err != nil {
-		return nil, 0, err
-	}
-	if rdr != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
 	start := time.Now()
-	res, err := http.DefaultClient.Do(req)
+	res, err := call(ctx)
 	if err != nil {
 		return nil, time.Since(start), err
 	}
@@ -216,7 +217,7 @@ func wantUnavailable(t *testing.T, r *response) {
 	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
 		t.Errorf("Content-Type: want application/json, got %q", r.Header.Get("Content-Type"))
 	}
-	var e apiError
+	var e apiclient.Error
 	if err := json.Unmarshal(r.Body, &e); err != nil {
 		t.Errorf("want an Error body, got %s (%v)", r, err)
 	} else if e.Code != "unavailable" {

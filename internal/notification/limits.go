@@ -2,8 +2,9 @@ package notification
 
 import "time"
 
-// Every limit is declared once, here (decision 0017). The OpenAPI spec and the
-// database CHECKs repeat these numbers; a test fails if any of them disagrees.
+// Every limit is declared once, here (decision 0017). The HTTP contract reads
+// them (internal/httpapi, so the generated spec carries them, decision 0024);
+// the database CHECKs repeat them, and a test fails if one disagrees.
 const (
 	// MaxBatchSize is the most notifications one batch request may carry.
 	MaxBatchSize = 1000
@@ -42,6 +43,9 @@ const (
 
 	// MaxErrorLen bounds a stored error message; longer ones are cut.
 	MaxErrorLen = 1024
+
+	// MaxCursorLen bounds the opaque `cursor` of list endpoints.
+	MaxCursorLen = 255
 
 	// DefaultPageSize and MaxPageSize bound `limit` on list endpoints.
 	DefaultPageSize = 50

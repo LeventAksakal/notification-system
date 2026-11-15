@@ -12,7 +12,8 @@ Router, not a manual. Every line is something you could not work out from the co
 - `lefthook install` once per clone: pre-commit runs gofmt, gitleaks and go vet on staged files. commit-msg holds the subject to Conventional Commits (`tools/commitcheck`; CI checks every commit of a pull request).
 - `go tool -modfile=tools.mod task --list` lists every command. Alias it: `T="go tool -modfile=tools.mod"`.
 - While iterating: `go test ./internal/<pkg> -run <Test>`; the narrowest check that can fail.
-- `task gen`: regenerate API (oapi-codegen) and SQL (sqlc) code. Never hand-edit `*.gen.go` or `internal/store/sqlc/`.
+- `task gen`: regenerate `api/openapi.yaml` from the server's Huma operations (decision 0024), the Go client in `test/apiclient` from that spec, and SQL code (sqlc). Change the API in `internal/httpapi`, never in the YAML. Never hand-edit `api/openapi.yaml`, `*.gen.go` or `internal/store/sqlc/`.
+- `task api:breaking`: fail if the spec breaks clients of `main` (CI runs it against the base).
 - `task migrate:diff -- <name>`: write the next migration from `schema/*.sql`. Never hand-write `migrations/`.
 - `task check`: the full gate (build, vet, lint, tests, vuln). Once, before merge, by the coordinator.
 - `docker compose up --wait`: the whole stack; `docker compose logs app`.

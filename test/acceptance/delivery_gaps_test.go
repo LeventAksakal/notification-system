@@ -11,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // dgAttemptRows returns delivery_attempts rows per notification id.
@@ -69,7 +72,7 @@ func (s *stack) dgRequestsPerKey() map[string]int {
 // for every id, the delivery_attempts rows equal the provider requests the
 // double recorded for that key: no provider call goes unrecorded and no row
 // stands for a call that never happened. It returns both maps.
-func (s *stack) dgAccounted(t *testing.T, ids []string, timeout time.Duration) (rows, reqs map[string]int) {
+func (s *stack) dgAccounted(t *testing.T, ids []uuid.UUID, timeout time.Duration) (rows, reqs map[string]int) {
 	t.Helper()
 	dlEventually(t, timeout, "delivery_attempts rows == provider requests for every notification", func() (bool, string) {
 		if n := s.dgInFlight(); n != 0 {
@@ -78,7 +81,8 @@ func (s *stack) dgAccounted(t *testing.T, ids []string, timeout time.Duration) (
 		reqs = s.dgRequestsPerKey()
 		rows = s.dgAttemptRows(t)
 		var bad []string
-		for _, id := range ids {
+		for _, u := range ids {
+			id := u.String()
 			if rows[id] != reqs[id] {
 				bad = append(bad, fmt.Sprintf("%s rows=%d requests=%d", id, rows[id], reqs[id]))
 			}
@@ -114,7 +118,7 @@ func TestGapDeliveryR11CallOutlivesLease(t *testing.T) {
 	for _, dedupe := range []bool{true, false} {
 		t.Run(fmt.Sprintf("provider dedupe %v", dedupe), func(t *testing.T) {
 			s := startStack(t, stackOptions{Workers: 0, Env: env, Provider: []fakeprovider.Option{fakeprovider.WithDedupe(dedupe)}})
-			ids := s.dlCreateMany(t, n, func(i int) map[string]any {
+			ids := s.dlCreateMany(t, n, func(i int) apiclient.NotificationCreate {
 				return msg("sms", fmt.Sprintf("gap R11 lease %d", i))
 			})
 			s.dlFaults(t, fakeprovider.Fault{Channel: "sms", Mode: fakeprovider.ModeDelay, DelayMS: 4000, Count: held})
@@ -158,7 +162,7 @@ func TestGapDeliveryR12AttemptsAccountedExactly(t *testing.T) {
 		"APP_MAX_ATTEMPTS":         "10",
 		"APP_BREAKER_MIN_REQUESTS": "1000",
 	})})
-	ids := s.dlCreateMany(t, n, func(i int) map[string]any {
+	ids := s.dlCreateMany(t, n, func(i int) apiclient.NotificationCreate {
 		return msg(chans[i%3], fmt.Sprintf("gap R12 accounting %d", i))
 	})
 	s.dlFaults(t, fakeprovider.Fault{Mode: fakeprovider.ModeStatus, Status: 503, Ratio: 0.3})
@@ -175,10 +179,10 @@ func TestGapDeliveryR12AttemptsAccountedExactly(t *testing.T) {
 	}
 
 	for _, id := range ids {
-		got := s.dlGet(t, id)
-		if got.Attempts != reqs[id] || len(got.History) != reqs[id] {
+		got := s.get(t, id)
+		if got.Attempts != reqs[id.String()] || len(history(got)) != reqs[id.String()] {
 			t.Errorf("%s: GET attempts=%d, deliveryAttempts=%d, provider requests=%d; want all equal",
-				id, got.Attempts, len(got.History), reqs[id])
+				id, got.Attempts, len(history(got)), reqs[id.String()])
 		}
 	}
 
@@ -252,9 +256,9 @@ func TestGapDeliveryB1HangingOutage(t *testing.T) {
 	const perFast, perSMS = 900, 300
 	const outage = 6 * time.Second
 	s := startStack(t, stackOptions{Workers: 0, Env: dgB1Env(5)})
-	s.dlCreateMany(t, perSMS, func(i int) map[string]any { return msg("sms", fmt.Sprintf("gap B1 hang sms %d", i)) })
+	s.dlCreateMany(t, perSMS, func(i int) apiclient.NotificationCreate { return msg("sms", fmt.Sprintf("gap B1 hang sms %d", i)) })
 	fast := []string{"email", "push"}
-	s.dlCreateMany(t, 2*perFast, func(i int) map[string]any {
+	s.dlCreateMany(t, 2*perFast, func(i int) apiclient.NotificationCreate {
 		return msg(fast[i%2], fmt.Sprintf("gap B1 hang fast %d", i))
 	})
 	s.dlFaults(t, fakeprovider.Fault{Channel: "sms", Mode: fakeprovider.ModeDelay, DelayMS: 2000})
@@ -327,9 +331,9 @@ func TestGapDeliveryB1HungChannelDoesNotStallOthers(t *testing.T) {
 		"APP_LEASE_DURATION":       "5s",
 		"APP_BREAKER_MIN_REQUESTS": "10000",
 	})})
-	s.dlCreateMany(t, perSMS, func(i int) map[string]any { return msg("sms", fmt.Sprintf("gap B1 stall sms %d", i)) })
+	s.dlCreateMany(t, perSMS, func(i int) apiclient.NotificationCreate { return msg("sms", fmt.Sprintf("gap B1 stall sms %d", i)) })
 	fast := []string{"email", "push"}
-	s.dlCreateMany(t, 2*perFast, func(i int) map[string]any {
+	s.dlCreateMany(t, 2*perFast, func(i int) apiclient.NotificationCreate {
 		return msg(fast[i%2], fmt.Sprintf("gap B1 stall fast %d", i))
 	})
 	s.dlFaults(t, fakeprovider.Fault{Channel: "sms", Mode: fakeprovider.ModeDelay, DelayMS: 5000})
@@ -373,7 +377,7 @@ func TestGapDeliveryB1BreakerBurnsNoAttempts(t *testing.T) {
 	const n, maxAttempts = 200, 3
 	const outage = 8 * time.Second
 	s := startStack(t, stackOptions{Workers: 0, Env: dgB1Env(maxAttempts)})
-	ids := s.dlCreateMany(t, n, func(i int) map[string]any { return msg("sms", fmt.Sprintf("gap B1 burn %d", i)) })
+	ids := s.dlCreateMany(t, n, func(i int) apiclient.NotificationCreate { return msg("sms", fmt.Sprintf("gap B1 burn %d", i)) })
 	s.dlFaults(t, fakeprovider.Fault{Channel: "sms", Mode: fakeprovider.ModeStatus, Status: 503})
 	for range 3 {
 		s.StartWorker()
@@ -404,7 +408,7 @@ func TestGapDeliveryR8RateUnderDisturbedWorker(t *testing.T) {
 	const perChannel = 500
 	chans := []string{"sms", "email", "push"}
 	s := startStack(t, stackOptions{Workers: 0, Env: dlFastEnv(nil)})
-	s.dlCreateMany(t, perChannel*3, func(i int) map[string]any {
+	s.dlCreateMany(t, perChannel*3, func(i int) apiclient.NotificationCreate {
 		return msg(chans[i%3], fmt.Sprintf("gap R8 disturbed %d", i))
 	})
 	s.dlFaults(t, fakeprovider.Fault{Mode: fakeprovider.ModeDelay, DelayMS: 100})
@@ -436,13 +440,13 @@ func TestGapDeliveryR8RateUnderDisturbedWorker(t *testing.T) {
 // gap "R16 does not assert the correlation and trace headers").
 func TestGapDeliveryR16CorrelationAndTraceHeaders(t *testing.T) {
 	s := startStack(t, stackOptions{Workers: 1, Env: dlFastEnv(nil)})
-	n := s.create(t, msg("push", "gap R16 headers"), "X-Correlation-ID", "gap-r16-"+randHex(16))
-	rs := s.providerRequests(t, n.ID, 15*time.Second)
+	n := s.create(t, msg("push", "gap R16 headers"), corrID("gap-r16-"+randHex(16)))
+	rs := s.providerRequests(t, n.Id, 15*time.Second)
 
 	t.Run("X-Correlation-ID equals the notification's", func(t *testing.T) {
 		for _, r := range rs {
-			if r.CorrelationID != n.CorrelationID {
-				t.Errorf("provider request X-Correlation-ID: want %q, got %q", n.CorrelationID, r.CorrelationID)
+			if r.CorrelationID != n.CorrelationId {
+				t.Errorf("provider request X-Correlation-ID: want %q, got %q", n.CorrelationId, r.CorrelationID)
 			}
 		}
 	})

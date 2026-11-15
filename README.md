@@ -48,10 +48,10 @@ Every endpoint, field, limit and error is in the API reference at `/docs`. Live 
 
 | What | Source of truth |
 |---|---|
-| HTTP and WebSocket contract | [`api/openapi.yaml`](api/openapi.yaml), rendered at `/docs`; server types are generated from it |
+| HTTP and WebSocket contract | The Huma operations in [`internal/httpapi`](internal/httpapi/api.go); [`api/openapi.yaml`](api/openapi.yaml) is generated from them (decision 0024), rendered at `/docs`, and a typed Go client in [`test/apiclient`](test/apiclient) is generated from it |
 | Database | [`schema/`](schema), one file per aggregate; [`migrations/`](migrations) are generated from it |
 | Settings and secrets | [`config/`](config); `go run ./cmd/app env` prints every setting with its default and bounds, `app env check` validates an environment |
-| Limits (lengths, batch size) | [`internal/notification/limits.go`](internal/notification/limits.go); the spec and the schema repeat them and a test asserts they agree |
+| Limits (lengths, batch size) | [`internal/notification/limits.go`](internal/notification/limits.go); the API reads them, so the generated spec carries them; the schema repeats them and a test asserts they agree |
 | Why it is built this way | [`docs/decisions/`](docs/decisions) |
 | Requirements, the test that proves each, measured numbers | [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md) |
 | Dev commands | `go tool -modfile=tools.mod task --list` |

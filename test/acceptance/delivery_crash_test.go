@@ -3,14 +3,16 @@
 package acceptance
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // R11 (delivery half): Idempotency support to prevent duplicate sends
@@ -26,12 +28,12 @@ func TestDeliveryR11OnceUnderTimeoutsAndCrashes(t *testing.T) {
 		"APP_MAX_ATTEMPTS":         fmt.Sprint(maxAttempts),
 		"APP_BREAKER_MIN_REQUESTS": "1000",
 	})
-	hangThenSend := func(t *testing.T, s *stack, channel string, n int) []string {
+	hangThenSend := func(t *testing.T, s *stack, channel string, n int) []uuid.UUID {
 		t.Helper()
 		// The first n requests on the channel are accepted (counted as delivered)
 		// and then held past the sender's timeout: an unknown outcome.
 		s.dlFaults(t, fakeprovider.Fault{Channel: channel, Mode: fakeprovider.ModeAcceptThenHang, DelayMS: 1500, Count: n})
-		ids := s.dlCreateMany(t, n, func(i int) map[string]any {
+		ids := s.dlCreateMany(t, n, func(i int) apiclient.NotificationCreate {
 			return msg(channel, fmt.Sprintf("R11 hang %d", i))
 		})
 		s.dlAllSent(t, 30*time.Second, n, "channel = ?", channel)
@@ -77,7 +79,7 @@ func TestDeliveryR11OnceUnderTimeoutsAndCrashes(t *testing.T) {
 			"APP_PROVIDER_TIMEOUT": "5s",
 			"APP_MAX_ATTEMPTS":     fmt.Sprint(maxAttempts),
 		})})
-		ids := s.dlCreateMany(t, n, func(i int) map[string]any {
+		ids := s.dlCreateMany(t, n, func(i int) apiclient.NotificationCreate {
 			return msg("sms", fmt.Sprintf("R11 crash %d", i))
 		})
 		s.dlFaults(t, fakeprovider.Fault{Mode: fakeprovider.ModeDelay, DelayMS: 3000})
@@ -96,7 +98,7 @@ func TestDeliveryR11OnceUnderTimeoutsAndCrashes(t *testing.T) {
 		}
 		delivered := s.dlDeliveredKeys()
 		for _, id := range ids {
-			if !delivered[id] {
+			if !delivered[id.String()] {
 				t.Errorf("%s never delivered at the provider", id)
 			}
 		}
@@ -121,12 +123,12 @@ func TestDeliveryR5CancelRacesClaim(t *testing.T) {
 	// Baseline: the workers deliver; without it an all-cancelled run proves nothing.
 	base := s.create(t, msg("sms", "R5 baseline"))
 	dlEventually(t, 15*time.Second, "the baseline notification is sent", func() (bool, string) {
-		st := s.storedStatus(t, base.ID)
+		st := s.storedStatus(t, base.Id)
 		return st == "sent", "stored status " + st
 	})
 
 	type result struct {
-		id     string
+		id     uuid.UUID
 		cancel int
 		err    error
 	}
@@ -135,33 +137,28 @@ func TestDeliveryR5CancelRacesClaim(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range n {
 		wg.Go(func() {
-			r, err := s.send(http.MethodPost, "/v1/notifications", msg(chans[i%3], fmt.Sprintf("R5 race %d", i)))
+			r, err := s.API.CreateNotificationWithResponse(t.Context(), nil, msg(chans[i%3], fmt.Sprintf("R5 race %d", i)))
 			if err != nil {
 				results[i].err = fmt.Errorf("create: %w", err)
 				return
 			}
-			if r.Status != http.StatusCreated {
-				results[i].err = fmt.Errorf("create: %v", r)
+			if r.StatusCode() != http.StatusCreated || r.JSON201 == nil {
+				results[i].err = fmt.Errorf("create: %s", show(r))
 				return
 			}
-			var created apiNotification
-			if err := json.Unmarshal(r.Body, &created); err != nil {
-				results[i].err = err
-				return
-			}
-			results[i].id = created.ID
+			results[i].id = r.JSON201.Id
 			// Spread the cancels from immediately to ~0.9 s after create so
 			// both outcomes of the race occur.
 			if d := time.Duration(i%10) * 100 * time.Millisecond; d > 0 {
 				timer := time.NewTimer(d)
 				<-timer.C
 			}
-			c, err := s.send(http.MethodPost, "/v1/notifications/"+created.ID+"/cancel", nil)
+			c, err := s.API.CancelNotificationWithResponse(t.Context(), results[i].id)
 			if err != nil {
 				results[i].err = err
 				return
 			}
-			results[i].cancel = c.Status
+			results[i].cancel = c.StatusCode()
 		})
 	}
 	wg.Wait()
@@ -181,7 +178,7 @@ func TestDeliveryR5CancelRacesClaim(t *testing.T) {
 	sent, cancelled := 0, 0
 	for _, r := range results {
 		st := s.storedStatus(t, r.id)
-		reached := len(s.Provider.Requests(fakeprovider.Filter{Key: r.id})) > 0
+		reached := len(s.Provider.Requests(fakeprovider.Filter{Key: r.id.String()})) > 0
 		switch st {
 		case "sent":
 			sent++

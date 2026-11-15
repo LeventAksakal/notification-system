@@ -3,7 +3,6 @@
 package acceptance
 
 import (
-	"encoding/json"
 	"math"
 	"net/http"
 	"reflect"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // R13: Real-time metrics endpoint (queue depth, success/failure rates, latency)
@@ -23,22 +23,22 @@ func TestR13MetricsQueueDepth(t *testing.T) {
 
 	type mix struct{ due, scheduled int }
 	want := map[string]mix{"sms": {3, 2}, "email": {2, 1}, "push": {1, 3}}
-	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	future := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	for ch, m := range want {
 		for range m.due {
 			s.create(t, msg(ch, "r13 due "+ch))
 		}
 		for range m.scheduled {
 			b := msg(ch, "r13 later "+ch)
-			b["scheduledAt"] = future
+			b.ScheduledAt = &future
 			s.create(t, b)
 		}
 		// One cancelled per channel: counted in totals, not in the queue.
 		n := s.create(t, msg(ch, "r13 cancelled "+ch))
-		s.cancel(t, n.ID)
+		s.cancel(t, n.Id)
 	}
 
-	m := s.metrics(t, "")
+	m := s.metrics(t, 0)
 	q := queueByChannel(t, m)
 	depth, dueAll, schedAll := 0, 0, 0
 	for ch, w := range want {
@@ -57,7 +57,7 @@ func TestR13MetricsQueueDepth(t *testing.T) {
 	if m.QueueDepth != depth {
 		t.Errorf("queueDepth: want %d (every unfinished notification), got %d", depth, m.QueueDepth)
 	}
-	wantTotals := statusCounts{Scheduled: schedAll, Pending: dueAll, Cancelled: 3}
+	wantTotals := apiclient.StatusCounts{Scheduled: schedAll, Pending: dueAll, Cancelled: 3}
 	if m.Totals != wantTotals {
 		t.Errorf("totals: want %+v, got %+v", wantTotals, m.Totals)
 	}
@@ -97,18 +97,19 @@ func TestR13MetricsDeliveryOutcomes(t *testing.T) {
 	}
 	wantFailed := map[string]int{"sms": 0, "email": k, "push": 0}
 
-	var m metrics
-	var last *response
+	var m apiclient.Metrics
+	last := "none"
 	if !poll(120*time.Second, func() bool {
-		r, err := s.send(http.MethodGet, "/v1/metrics?windowSeconds=3600", nil)
+		r, err := s.API.GetMetricsWithResponse(t.Context(), &apiclient.GetMetricsParams{WindowSeconds: ptr(3600)})
 		if err != nil {
 			return false
 		}
-		last = r
-		m = metrics{}
-		if r.Status != http.StatusOK || json.Unmarshal(r.Body, &m) != nil {
+		last = show(r)
+		m = apiclient.Metrics{}
+		if r.StatusCode() != http.StatusOK || r.JSON200 == nil {
 			return false
 		}
+		m = *r.JSON200
 		return m.QueueDepth == 0 && m.Delivery.Sent+m.Delivery.Failed == total
 	}) {
 		t.Fatalf("not within 120s: metrics never showed all %d notifications finished; last response %v; finished in db: %d",
@@ -148,7 +149,7 @@ func TestR13MetricsDeliveryOutcomes(t *testing.T) {
 	}
 
 	byCh := deliveryByChannel(t, m)
-	var sum deliveryTotals
+	var sum apiclient.DeliveryTotals
 	for ch, n := range perChannel {
 		c := byCh[ch]
 		if c.Sent != n-wantFailed[ch] || c.Failed != wantFailed[ch] {
@@ -177,10 +178,10 @@ func TestR13MetricsDeliveryOutcomes(t *testing.T) {
 
 	t.Run("same numbers from a second API instance", func(t *testing.T) {
 		peer := s.startServe(t, nil)
-		var a, b metrics
+		var a, b apiclient.Metrics
 		if !poll(10*time.Second, func() bool {
-			a = s.metrics(t, "windowSeconds=3600")
-			b = peer.metrics(t, "windowSeconds=3600")
+			a = s.metrics(t, 3600)
+			b = peer.metrics(t, 3600)
 			return reflect.DeepEqual(sortedQueue(a.Queue), sortedQueue(b.Queue)) &&
 				a.Totals == b.Totals && a.Delivery == b.Delivery
 		}) {
@@ -197,14 +198,15 @@ func TestR13MetricsDeliveryOutcomes(t *testing.T) {
 // (api/openapi.yaml, /v1/metrics).
 func TestR13MetricsWindowSeconds(t *testing.T) {
 	s := startStack(t, stackOptions{})
-	for _, w := range []string{"0", "3601"} {
-		t.Run("windowSeconds="+w+" refused", func(t *testing.T) {
-			wantError(t, s.getJSON(t, "/v1/metrics?windowSeconds="+w), http.StatusBadRequest, "invalid_request", "windowSeconds")
+	for _, w := range []int{0, 3601} {
+		t.Run("windowSeconds="+strconv.Itoa(w)+" refused", func(t *testing.T) {
+			r := answered(t)(s.API.GetMetricsWithResponse(t.Context(), &apiclient.GetMetricsParams{WindowSeconds: ptr(w)}))
+			wantError(t, r, http.StatusBadRequest, "invalid_request", "windowSeconds")
 		})
 	}
 	for _, w := range []int{1, 3600} {
 		t.Run("windowSeconds="+strconv.Itoa(w)+" echoed", func(t *testing.T) {
-			m := s.metrics(t, "windowSeconds="+strconv.Itoa(w))
+			m := s.metrics(t, w)
 			if m.WindowSeconds != w {
 				t.Errorf("windowSeconds: want %d echoed, got %d", w, m.WindowSeconds)
 			}

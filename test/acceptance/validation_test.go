@@ -15,6 +15,7 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 
 	"github.com/LeventAksakal/notification-system/internal/notification"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // emailOfLen returns a syntactically plausible address of exactly n characters (n >= 70).
@@ -36,11 +37,11 @@ func TestR10ContentLimitsPerChannel(t *testing.T) {
 			// Multi-byte characters: the limit counts characters, not bytes.
 			at := strings.Repeat("é", limit)
 			n := s.create(t, msg(string(ch), at))
-			if got := s.get(t, n.ID); got.Content != at {
+			if got := s.get(t, n.Id); got.Content != at {
 				t.Errorf("content at the limit (%d characters) not stored intact: got %d characters",
 					limit, len([]rune(got.Content)))
 			}
-			r := s.postJSON(t, "/v1/notifications", msg(string(ch), at+"é"))
+			r := s.postCreate(t, msg(string(ch), at+"é"))
 			wantError(t, r, http.StatusBadRequest, "invalid_request", "content")
 		})
 	}
@@ -54,31 +55,40 @@ func TestR10RequiredAndMalformedFields(t *testing.T) {
 
 	t.Run("email to at 254 characters accepted", func(t *testing.T) {
 		body := msg("email", "hi")
-		body["to"] = emailOfLen(notification.MaxEmailRecipientLen)
+		body.To = emailOfLen(notification.MaxEmailRecipientLen)
 		s.create(t, body)
 	})
 
+	// A body the typed client can express goes through it; a body without a
+	// required field (the generated type always sends `to` and `channel`) is
+	// sent raw.
+	type create = apiclient.NotificationCreate
 	cases := []struct {
 		name  string
-		body  map[string]any
+		body  any    // create through the typed client; map[string]any raw
 		field string // "" when no single field is required by the contract
 	}{
 		{"missing to", map[string]any{"channel": "sms", "content": "x"}, "to"},
 		{"missing channel", map[string]any{"to": smsTo, "content": "x"}, "channel"},
-		{"neither content nor template", map[string]any{"to": smsTo, "channel": "sms"}, "content"},
-		{"both content and template", map[string]any{"to": smsTo, "channel": "sms", "content": "x",
-			"template": map[string]any{"name": "welcome", "variables": map[string]any{"name": "Ada"}}}, ""},
-		{"empty content", map[string]any{"to": smsTo, "channel": "sms", "content": ""}, "content"},
-		{"sms to not E.164", map[string]any{"to": "05551234567", "channel": "sms", "content": "x"}, "to"},
-		{"sms to too short", map[string]any{"to": "+123456", "channel": "sms", "content": "x"}, "to"},
-		{"email to over 254 characters", map[string]any{"to": emailOfLen(notification.MaxEmailRecipientLen + 1), "channel": "email", "content": "x"}, "to"},
-		{"push to over 255 characters", map[string]any{"to": strings.Repeat("t", notification.MaxRecipientLen+1), "channel": "push", "content": "x"}, "to"},
-		{"unknown channel", map[string]any{"to": smsTo, "channel": "fax", "content": "x"}, "channel"},
-		{"unknown priority", map[string]any{"to": smsTo, "channel": "sms", "content": "x", "priority": "urgent"}, "priority"},
+		{"neither content nor template", create{To: smsTo, Channel: apiclient.Sms}, "content"},
+		{"both content and template", create{To: smsTo, Channel: apiclient.Sms, Content: ptr("x"),
+			Template: &apiclient.TemplateRef{Name: "welcome", Variables: &map[string]string{"name": "Ada"}}}, ""},
+		{"empty content", create{To: smsTo, Channel: apiclient.Sms, Content: ptr("")}, "content"},
+		{"sms to not E.164", create{To: "05551234567", Channel: apiclient.Sms, Content: ptr("x")}, "to"},
+		{"sms to too short", create{To: "+123456", Channel: apiclient.Sms, Content: ptr("x")}, "to"},
+		{"email to over 254 characters", create{To: emailOfLen(notification.MaxEmailRecipientLen + 1), Channel: apiclient.Email, Content: ptr("x")}, "to"},
+		{"push to over 255 characters", create{To: strings.Repeat("t", notification.MaxRecipientLen+1), Channel: apiclient.Push, Content: ptr("x")}, "to"},
+		{"unknown channel", create{To: smsTo, Channel: "fax", Content: ptr("x")}, "channel"},
+		{"unknown priority", create{To: smsTo, Channel: apiclient.Sms, Content: ptr("x"), Priority: ptr(apiclient.Priority("urgent"))}, "priority"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := s.postJSON(t, "/v1/notifications", tc.body)
+			var r typedAnswer
+			if b, typed := tc.body.(create); typed {
+				r = s.postCreate(t, b)
+			} else {
+				r = s.postJSON(t, "/v1/notifications", tc.body)
+			}
 			if tc.field == "" {
 				wantError(t, r, http.StatusBadRequest, "invalid_request")
 				return
@@ -93,7 +103,8 @@ func TestR10RequiredAndMalformedFields(t *testing.T) {
 // Conventions): "Every refused request has the `Error` body. `details` names
 // each offending field." Finding 2 of the 14 Nov fault run: a malformed id and
 // a repeated single-value query parameter were refused with a plain-text body.
-// The reason's wording is not asserted.
+// The reason's wording is not asserted. Sent raw on purpose: the typed client
+// cannot send a non-UUID id or a repeated single-value parameter.
 func TestR10MalformedParametersRefusedWithErrorBody(t *testing.T) {
 	s := startStack(t, stackOptions{})
 	requireIntake(t, s)
@@ -140,12 +151,22 @@ func TestR10LimitsAgreeSpecAndCore(t *testing.T) {
 		}
 		return p.Value
 	}
-	param := func(name string) *openapi3.Schema {
-		p := doc.Components.Parameters[name]
-		if p == nil || p.Value == nil || p.Value.Schema == nil {
-			t.Fatalf("parameter %s missing", name)
+	// The spec is generated from the Huma operations, which inline every
+	// parameter into its operation: there is no components.parameters.
+	param := func(path, method, in, name string) *openapi3.Schema {
+		item := doc.Paths.Value(path)
+		if item == nil {
+			t.Fatalf("path %s missing from the spec", path)
 		}
-		return p.Value.Schema.Value
+		op := item.GetOperation(method)
+		if op == nil {
+			t.Fatalf("%s %s missing from the spec", method, path)
+		}
+		p := op.Parameters.GetByInAndName(in, name)
+		if p == nil || p.Schema == nil || p.Schema.Value == nil {
+			t.Fatalf("%s parameter %s missing from %s (%s %s)", in, name, op.OperationID, method, path)
+		}
+		return p.Schema.Value
 	}
 	u := func(p *uint64) int {
 		if p == nil {
@@ -159,32 +180,41 @@ func TestR10LimitsAgreeSpecAndCore(t *testing.T) {
 	}
 	create := schema("NotificationCreate")
 	tref := schema("TemplateRef")
-	checks := []struct {
+	type check = struct {
 		what      string
 		spec, cor int
-	}{
+	}
+	checks := []check{
 		{"BatchCreate.notifications maxItems", u(prop(schema("BatchCreate"), "notifications").MaxItems), notification.MaxBatchSize},
 		{"NotificationCreate.content maxLength", u(prop(create, "content").MaxLength), notification.MaxContentLen},
 		{"NotificationCreate.to maxLength", u(prop(create, "to").MaxLength), notification.MaxRecipientLen},
 		{"TemplateWrite.body maxLength", u(prop(schema("TemplateWrite"), "body").MaxLength), notification.MaxTemplateBodyLen},
 		{"TemplateName maxLength", u(schema("TemplateName").MaxLength), notification.MaxTemplateNameLen},
 		{"TemplateRef.variables maxProperties", u(prop(tref, "variables").MaxProps), notification.MaxTemplateVariables},
-		{"IdempotencyKey maxLength", u(param("IdempotencyKey").MaxLength), notification.MaxIdempotencyKeyLen},
-		{"CorrelationId maxLength", u(param("CorrelationId").MaxLength), notification.MaxCorrelationIDLen},
+	}
+	// The two request headers, on both create operations.
+	for _, path := range []string{"/v1/notifications", "/v1/notifications/batch"} {
+		checks = append(checks,
+			check{"POST " + path + " Idempotency-Key maxLength", u(param(path, http.MethodPost, openapi3.ParameterInHeader, "Idempotency-Key").MaxLength), notification.MaxIdempotencyKeyLen},
+			check{"POST " + path + " X-Correlation-ID maxLength", u(param(path, http.MethodPost, openapi3.ParameterInHeader, "X-Correlation-ID").MaxLength), notification.MaxCorrelationIDLen},
+		)
 	}
 	if ap := prop(tref, "variables").AdditionalProperties.Schema; ap == nil || ap.Value == nil {
 		t.Error("TemplateRef.variables has no value schema")
 	} else {
-		checks = append(checks, struct {
-			what      string
-			spec, cor int
-		}{"TemplateRef.variables value maxLength", u(ap.Value.MaxLength), notification.MaxTemplateVariableLen})
+		checks = append(checks, check{"TemplateRef.variables value maxLength", u(ap.Value.MaxLength), notification.MaxTemplateVariableLen})
 	}
-	if mx := param("Limit").Max; mx == nil || int(*mx) != notification.MaxPageSize {
-		t.Errorf("Limit maximum: spec %v, core %d", mx, notification.MaxPageSize)
-	}
-	if df, ok := param("Limit").Default.(float64); !ok || int(df) != notification.DefaultPageSize {
-		t.Errorf("Limit default: spec %v, core %d", param("Limit").Default, notification.DefaultPageSize)
+	// limit and cursor, on both list endpoints.
+	for _, path := range []string{"/v1/notifications", "/v1/batches/{id}"} {
+		limit := param(path, http.MethodGet, openapi3.ParameterInQuery, "limit")
+		if mx := limit.Max; mx == nil || int(*mx) != notification.MaxPageSize {
+			t.Errorf("GET %s limit maximum: spec %v, core %d", path, mx, notification.MaxPageSize)
+		}
+		if df, ok := limit.Default.(float64); !ok || int(df) != notification.DefaultPageSize {
+			t.Errorf("GET %s limit default: spec %v, core %d", path, limit.Default, notification.DefaultPageSize)
+		}
+		checks = append(checks, check{"GET " + path + " cursor maxLength",
+			u(param(path, http.MethodGet, openapi3.ParameterInQuery, "cursor").MaxLength), notification.MaxCursorLen})
 	}
 	if p := schema("TemplateName").Pattern; p != notification.TemplateNamePattern {
 		t.Errorf("TemplateName pattern: spec %q, core %q", p, notification.TemplateNamePattern)

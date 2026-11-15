@@ -2,8 +2,6 @@ package httpapi
 
 import (
 	"bufio"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -19,8 +17,11 @@ import (
 // correlationHeader is accepted on every request and echoed on every response.
 const correlationHeader = "X-Correlation-ID"
 
-// correlationShape repeats the spec's pattern for the header.
-var correlationShape = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
+// correlationPattern is the header's shape, in the spec (correlationID) and
+// here.
+const correlationPattern = `^[A-Za-z0-9._:-]+$`
+
+var correlationShape = regexp.MustCompile(correlationPattern)
 
 // withCorrelation takes the request's X-Correlation-ID, or generates one when
 // it is absent or malformed, puts it in the context (so every log line of the
@@ -65,9 +66,9 @@ func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // Flush passes flushes through to the underlying writer.
 func (s *statusRecorder) Flush() { _ = http.NewResponseController(s.ResponseWriter).Flush() }
 
-// limitBody caps every request body at notification.MaxRequestBodyBytes. It runs
-// before the spec validator, which reads the body first: the read fails with
-// *http.MaxBytesError, and the validator's error handler answers 413.
+// limitBody caps every request body at notification.MaxRequestBodyBytes, for
+// routes outside the contract too. Huma enforces the same limit on each
+// operation (MaxBodyBytes) and answers 413 through toError.
 func limitBody(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body != nil && r.Body != http.NoBody {
@@ -75,16 +76,4 @@ func limitBody(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// tooLarge reports whether err comes from reading a body over the limit.
-// kin-openapi's MultiError and RequestError both unwrap to the read error.
-func tooLarge(err error) bool {
-	var mbe *http.MaxBytesError
-	return errors.As(err, &mbe)
-}
-
-func writeTooLarge(w http.ResponseWriter) {
-	writeError(w, http.StatusRequestEntityTooLarge, Error{Code: "request_too_large",
-		Message: fmt.Sprintf("a request body is at most %d bytes", notification.MaxRequestBodyBytes)})
 }
