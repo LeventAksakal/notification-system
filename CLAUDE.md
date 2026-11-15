@@ -21,10 +21,8 @@ Router, not a manual. Every line is something you could not work out from the co
 - Telemetry: Grafana at http://localhost:3000 (otel-lgtm); `mcp-grafana` when configured.
 - Docs: context7 MCP for library docs. `go doc <pkg>.<Symbol>` for the standard library.
 
-## Go traps agents fall into here
-- Pass `ctx` as the first parameter; never store it in a struct. Every goroutine has an owner that waits for it.
-- Wrap errors with `fmt.Errorf("doing x: %w", err)`; compare with `errors.Is`. Map `sql.ErrNoRows` to a typed 404 response, not a 500.
-- Use the generated strict-server types; if the spec lacks a field, that is a contract change for the coordinator, not a local struct.
+## Traps agents fall into here
+- Go-specific traps live in `.claude/rules/go-code.md` (loaded with `.go` files).
 - MySQL readiness must be checked over TCP (`--protocol=tcp`); the first-boot server answers socket pings with networking off.
 
 ## Pushing
