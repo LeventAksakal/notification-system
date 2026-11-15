@@ -9,3 +9,6 @@ output-options:
   # GET /v1/ws upgrades to a WebSocket; it is mounted outside the generated,
   # validated routes (docs/briefs/CONTRACT.md).
   exclude-operation-ids: [streamEvents]
+  # Keep every component schema, including StatusEvent, which only the
+  # excluded WebSocket operation uses (its messages are typed from the spec).
+  skip-prune: true

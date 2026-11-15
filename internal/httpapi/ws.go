@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -26,22 +27,27 @@ const (
 	wsWriteTimeout = 10 * time.Second
 )
 
-// statusEvent is the spec's StatusEvent (api/openapi.yaml). The operation is
-// excluded from code generation, and with it this schema.
-type statusEvent struct {
-	NotificationID string    `json:"notificationId"`
-	BatchID        string    `json:"batchId,omitempty"`
-	Status         string    `json:"status"`
-	Attempts       int       `json:"attempts"`
-	Error          string    `json:"error,omitempty"`
-	At             time.Time `json:"at"`
-	CorrelationID  string    `json:"correlationId"`
-	Snapshot       bool      `json:"snapshot,omitempty"`
-}
-
-func toStatusEvent(e notification.Event) statusEvent {
-	return statusEvent{NotificationID: e.NotificationID, BatchID: e.BatchID, Status: string(e.Status),
-		Attempts: e.Attempts, Error: e.Error, At: e.At.UTC(), CorrelationID: e.CorrelationID}
+// toStatusEvent maps a status change to the spec's StatusEvent
+// (api/openapi.yaml, generated in api.gen.go). An id that is not a UUID
+// fails; the stream skips that event rather than sending a zero id.
+func toStatusEvent(e notification.Event) (StatusEvent, error) {
+	id, err := uuid.Parse(e.NotificationID)
+	if err != nil {
+		return StatusEvent{}, fmt.Errorf("notification id %q: %w", e.NotificationID, err)
+	}
+	v := StatusEvent{NotificationId: id, Status: Status(e.Status), Attempts: e.Attempts,
+		At: e.At.UTC(), CorrelationId: e.CorrelationID}
+	if e.BatchID != "" {
+		bid, err := uuid.Parse(e.BatchID)
+		if err != nil {
+			return StatusEvent{}, fmt.Errorf("batch id %q: %w", e.BatchID, err)
+		}
+		v.BatchId = &bid
+	}
+	if e.Error != "" {
+		v.Error = &e.Error
+	}
+	return v, nil
 }
 
 // streams tracks open WebSocket handlers so shutdown can end them and wait.
@@ -166,7 +172,7 @@ func (s *Server) pump(ctx context.Context, conn *websocket.Conn, sub *realtime.S
 	// Nothing is read from the client; CloseRead answers its pings and close
 	// frame and cancels peerCtx when the peer goes away.
 	peerCtx := conn.CloseRead(ctx)
-	write := func(v statusEvent) error {
+	write := func(v StatusEvent) error {
 		b, err := json.Marshal(v)
 		if err != nil {
 			return err
@@ -179,9 +185,13 @@ func (s *Server) pump(ctx context.Context, conn *websocket.Conn, sub *realtime.S
 	var covers *notification.Event // the snapshot, until an event goes past it
 	if snap != nil {
 		e := snapshotEvent(*snap)
-		v := toStatusEvent(e)
-		v.Status, v.Snapshot = snap.Status(), true
-		if err := write(v); err != nil {
+		v, err := toStatusEvent(e)
+		snapshot := true
+		v.Status, v.Snapshot = Status(snap.Status()), &snapshot
+		if err == nil {
+			err = write(v)
+		}
+		if err != nil {
 			_ = conn.CloseNow()
 			return
 		}
@@ -218,7 +228,11 @@ func (s *Server) pump(ctx context.Context, conn *websocket.Conn, sub *realtime.S
 				}
 				covers = nil
 			}
-			if err := write(toStatusEvent(e)); err != nil {
+			v, err := toStatusEvent(e)
+			if err != nil {
+				continue
+			}
+			if err := write(v); err != nil {
 				_ = conn.CloseNow()
 				return
 			}
