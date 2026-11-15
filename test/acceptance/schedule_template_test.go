@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // B2: Scheduled Notifications, allow scheduling notifications for future delivery
@@ -23,7 +23,7 @@ func TestB2ScheduleAtIntake(t *testing.T) {
 		body["scheduledAt"] = at.Format(time.RFC3339Nano)
 		n := s.create(t, body)
 		got := s.get(t, n.ID)
-		for _, x := range []notification{n, got} {
+		for _, x := range []apiNotification{n, got} {
 			if x.Status != "scheduled" {
 				t.Errorf("status: want scheduled, got %q", x.Status)
 			}
@@ -50,7 +50,7 @@ func TestB2ScheduleAtIntake(t *testing.T) {
 
 	t.Run("beyond the horizon: 400 naming scheduledAt", func(t *testing.T) {
 		body := msg("email", "too far")
-		body["scheduledAt"] = time.Now().UTC().Add(core.ScheduleHorizon + 2*time.Hour).Format(time.RFC3339)
+		body["scheduledAt"] = time.Now().UTC().Add(notification.ScheduleHorizon + 2*time.Hour).Format(time.RFC3339)
 		wantError(t, s.postJSON(t, "/v1/notifications", body), http.StatusBadRequest, "invalid_request", "scheduledAt")
 	})
 }
@@ -165,9 +165,9 @@ func TestB3CreateFromTemplate(t *testing.T) {
 	t.Run("rendering past the channel limit: 400", func(t *testing.T) {
 		// 1000 fixed characters plus a 700-character variable: 1700 > sms limit 1600.
 		s.putTemplate(t, "long", strings.Repeat("x", 1000)+"{{tail}}")
-		at := s.create(t, withTemplate("sms", "long", map[string]any{"tail": strings.Repeat("y", core.MaxSMSContentLen-1000)}))
-		if len([]rune(at.Content)) != core.MaxSMSContentLen {
-			t.Errorf("rendering at the limit: want %d characters, got %d", core.MaxSMSContentLen, len([]rune(at.Content)))
+		at := s.create(t, withTemplate("sms", "long", map[string]any{"tail": strings.Repeat("y", notification.MaxSMSContentLen-1000)}))
+		if len([]rune(at.Content)) != notification.MaxSMSContentLen {
+			t.Errorf("rendering at the limit: want %d characters, got %d", notification.MaxSMSContentLen, len([]rune(at.Content)))
 		}
 		r := s.postJSON(t, "/v1/notifications", withTemplate("sms", "long", map[string]any{"tail": strings.Repeat("y", 700)}))
 		wantError(t, r, http.StatusBadRequest, "invalid_request")

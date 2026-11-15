@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 func ptr[T any](v T) *T { return &v }
@@ -16,7 +16,7 @@ func TestValidateNamesEveryBrokenField(t *testing.T) {
 	templates := map[string]string{"welcome": "Hello {{name}}", "long": strings.Repeat("x", 1000) + "{{tail}}"}
 	ok := func(r Request) Request { return r }
 	sms := func(content string) Request {
-		return Request{To: "+905551234567", Channel: core.ChannelSMS, Content: &content}
+		return Request{To: "+905551234567", Channel: notification.ChannelSMS, Content: &content}
 	}
 
 	for _, tc := range []struct {
@@ -25,33 +25,33 @@ func TestValidateNamesEveryBrokenField(t *testing.T) {
 		fields []string // nil: accepted
 	}{
 		{"plain sms accepted", sms("hi"), nil},
-		{"sms content at its limit, multi-byte", sms(strings.Repeat("é", core.MaxSMSContentLen)), nil},
-		{"sms content past its limit", sms(strings.Repeat("é", core.MaxSMSContentLen+1)), []string{"content"}},
-		{"push content past its limit", Request{To: "tok", Channel: core.ChannelPush, Content: ptr(strings.Repeat("a", core.MaxPushContentLen+1))}, []string{"content"}},
-		{"email content at its limit", Request{To: "a@b.c", Channel: core.ChannelEmail, Content: ptr(strings.Repeat("a", core.MaxEmailContentLen))}, nil},
+		{"sms content at its limit, multi-byte", sms(strings.Repeat("é", notification.MaxSMSContentLen)), nil},
+		{"sms content past its limit", sms(strings.Repeat("é", notification.MaxSMSContentLen+1)), []string{"content"}},
+		{"push content past its limit", Request{To: "tok", Channel: notification.ChannelPush, Content: ptr(strings.Repeat("a", notification.MaxPushContentLen+1))}, []string{"content"}},
+		{"email content at its limit", Request{To: "a@b.c", Channel: notification.ChannelEmail, Content: ptr(strings.Repeat("a", notification.MaxEmailContentLen))}, nil},
 		{"empty content", sms(""), []string{"content"}},
-		{"neither content nor template", Request{To: "+905551234567", Channel: core.ChannelSMS}, []string{"content"}},
-		{"both content and template", ok(Request{To: "+905551234567", Channel: core.ChannelSMS, Content: ptr("x"),
+		{"neither content nor template", Request{To: "+905551234567", Channel: notification.ChannelSMS}, []string{"content"}},
+		{"both content and template", ok(Request{To: "+905551234567", Channel: notification.ChannelSMS, Content: ptr("x"),
 			Template: &TemplateRef{Name: "welcome"}}), []string{"template"}},
-		{"sms recipient not E.164", Request{To: "05551234567", Channel: core.ChannelSMS, Content: ptr("x")}, []string{"to"}},
-		{"sms recipient too short", Request{To: "+123456", Channel: core.ChannelSMS, Content: ptr("x")}, []string{"to"}},
-		{"email recipient without @", Request{To: "ada.example.com", Channel: core.ChannelEmail, Content: ptr("x")}, []string{"to"}},
-		{"email recipient with two @", Request{To: "a@b@c", Channel: core.ChannelEmail, Content: ptr("x")}, []string{"to"}},
-		{"email recipient past 254", Request{To: strings.Repeat("a", 250) + "@b.cd", Channel: core.ChannelEmail, Content: ptr("x")}, []string{"to"}},
-		{"push recipient at 255", Request{To: strings.Repeat("t", 255), Channel: core.ChannelPush, Content: ptr("x")}, nil},
-		{"push recipient past 255", Request{To: strings.Repeat("t", 256), Channel: core.ChannelPush, Content: ptr("x")}, []string{"to"}},
-		{"push recipient empty", Request{To: "", Channel: core.ChannelPush, Content: ptr("x")}, []string{"to"}},
+		{"sms recipient not E.164", Request{To: "05551234567", Channel: notification.ChannelSMS, Content: ptr("x")}, []string{"to"}},
+		{"sms recipient too short", Request{To: "+123456", Channel: notification.ChannelSMS, Content: ptr("x")}, []string{"to"}},
+		{"email recipient without @", Request{To: "ada.example.com", Channel: notification.ChannelEmail, Content: ptr("x")}, []string{"to"}},
+		{"email recipient with two @", Request{To: "a@b@c", Channel: notification.ChannelEmail, Content: ptr("x")}, []string{"to"}},
+		{"email recipient past 254", Request{To: strings.Repeat("a", 250) + "@b.cd", Channel: notification.ChannelEmail, Content: ptr("x")}, []string{"to"}},
+		{"push recipient at 255", Request{To: strings.Repeat("t", 255), Channel: notification.ChannelPush, Content: ptr("x")}, nil},
+		{"push recipient past 255", Request{To: strings.Repeat("t", 256), Channel: notification.ChannelPush, Content: ptr("x")}, []string{"to"}},
+		{"push recipient empty", Request{To: "", Channel: notification.ChannelPush, Content: ptr("x")}, []string{"to"}},
 		{"unknown channel", Request{To: "x", Channel: "fax", Content: ptr("x")}, []string{"channel"}},
-		{"unknown priority", Request{To: "+905551234567", Channel: core.ChannelSMS, Content: ptr("x"), Priority: "urgent"}, []string{"priority"}},
-		{"schedule at the horizon", Request{To: "t", Channel: core.ChannelPush, Content: ptr("x"), ScheduledAt: ptr(now.Add(core.ScheduleHorizon))}, nil},
-		{"schedule past the horizon", Request{To: "t", Channel: core.ChannelPush, Content: ptr("x"), ScheduledAt: ptr(now.Add(core.ScheduleHorizon + time.Second))}, []string{"scheduledAt"}},
-		{"schedule in the past", Request{To: "t", Channel: core.ChannelPush, Content: ptr("x"), ScheduledAt: ptr(now.Add(-time.Hour))}, nil},
-		{"template rendered", Request{To: "t", Channel: core.ChannelPush, Template: &TemplateRef{Name: "welcome", Variables: map[string]string{"name": "Ada"}}}, nil},
-		{"template variable missing", Request{To: "t", Channel: core.ChannelPush, Template: &TemplateRef{Name: "welcome"}}, []string{"template.variables.name"}},
-		{"template unknown", Request{To: "t", Channel: core.ChannelPush, Template: &TemplateRef{Name: "nope"}}, []string{"template.name"}},
-		{"template renders past the channel limit", Request{To: "+905551234567", Channel: core.ChannelSMS,
+		{"unknown priority", Request{To: "+905551234567", Channel: notification.ChannelSMS, Content: ptr("x"), Priority: "urgent"}, []string{"priority"}},
+		{"schedule at the horizon", Request{To: "t", Channel: notification.ChannelPush, Content: ptr("x"), ScheduledAt: ptr(now.Add(notification.ScheduleHorizon))}, nil},
+		{"schedule past the horizon", Request{To: "t", Channel: notification.ChannelPush, Content: ptr("x"), ScheduledAt: ptr(now.Add(notification.ScheduleHorizon + time.Second))}, []string{"scheduledAt"}},
+		{"schedule in the past", Request{To: "t", Channel: notification.ChannelPush, Content: ptr("x"), ScheduledAt: ptr(now.Add(-time.Hour))}, nil},
+		{"template rendered", Request{To: "t", Channel: notification.ChannelPush, Template: &TemplateRef{Name: "welcome", Variables: map[string]string{"name": "Ada"}}}, nil},
+		{"template variable missing", Request{To: "t", Channel: notification.ChannelPush, Template: &TemplateRef{Name: "welcome"}}, []string{"template.variables.name"}},
+		{"template unknown", Request{To: "t", Channel: notification.ChannelPush, Template: &TemplateRef{Name: "nope"}}, []string{"template.name"}},
+		{"template renders past the channel limit", Request{To: "+905551234567", Channel: notification.ChannelSMS,
 			Template: &TemplateRef{Name: "long", Variables: map[string]string{"tail": strings.Repeat("y", 601)}}}, []string{"content"}},
-		{"several broken fields at once", Request{To: "nope", Channel: core.ChannelSMS, Content: ptr(""), Priority: "urgent"}, []string{"priority", "to", "content"}},
+		{"several broken fields at once", Request{To: "nope", Channel: notification.ChannelSMS, Content: ptr(""), Priority: "urgent"}, []string{"priority", "to", "content"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, errs := Validate(tc.req, templates, now)
@@ -71,13 +71,13 @@ func TestValidateNamesEveryBrokenField(t *testing.T) {
 
 func TestValidateRendersAndDefaults(t *testing.T) {
 	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
-	a, errs := Validate(Request{To: "t", Channel: core.ChannelPush,
+	a, errs := Validate(Request{To: "t", Channel: notification.ChannelPush,
 		Template: &TemplateRef{Name: "w", Variables: map[string]string{"name": "Ada", "extra": "ignored"}}},
 		map[string]string{"w": "Hi {{ name }}!"}, now)
 	if len(errs) > 0 {
 		t.Fatalf("refused: %v", errs)
 	}
-	if a.Content != "Hi Ada!" || a.Priority != core.PriorityNormal {
+	if a.Content != "Hi Ada!" || a.Priority != notification.PriorityNormal {
 		t.Fatalf("got content %q priority %q", a.Content, a.Priority)
 	}
 }
@@ -121,9 +121,9 @@ func TestCheckTemplate(t *testing.T) {
 	}{
 		{"valid", "welcome-1_x", "Hi", nil},
 		{"name with capitals", "Welcome", "Hi", []string{"name"}},
-		{"name too long", strings.Repeat("n", core.MaxTemplateNameLen+1), "Hi", []string{"name"}},
+		{"name too long", strings.Repeat("n", notification.MaxTemplateNameLen+1), "Hi", []string{"name"}},
 		{"empty body", "ok", "", []string{"body"}},
-		{"body past its limit", "ok", strings.Repeat("é", core.MaxTemplateBodyLen+1), []string{"body"}},
+		{"body past its limit", "ok", strings.Repeat("é", notification.MaxTemplateBodyLen+1), []string{"body"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var got []string
@@ -168,9 +168,9 @@ func TestCursorsRoundTripAndRefuseForeignInput(t *testing.T) {
 
 func TestRequestHashIgnoresDefaultsButNotContent(t *testing.T) {
 	at := time.Date(2026, 12, 1, 9, 0, 0, 0, time.FixedZone("x", 3600))
-	a := Request{To: "t", Channel: core.ChannelPush, Content: ptr("x"), ScheduledAt: &at}
+	a := Request{To: "t", Channel: notification.ChannelPush, Content: ptr("x"), ScheduledAt: &at}
 	b := a
-	b.Priority = core.PriorityNormal
+	b.Priority = notification.PriorityNormal
 	utc := at.UTC()
 	b.ScheduledAt = &utc
 	c := a
@@ -193,8 +193,8 @@ func TestIdempotencyKeyOutsideVisibleASCIIIsRefusedNamingTheHeader(t *testing.T)
 	}{
 		{"absent", "", true},
 		{"visible ASCII", "order-42:retry_1!~", true},
-		{"at its limit", strings.Repeat("k", core.MaxIdempotencyKeyLen), true},
-		{"past its limit", strings.Repeat("k", core.MaxIdempotencyKeyLen+1), false},
+		{"at its limit", strings.Repeat("k", notification.MaxIdempotencyKeyLen), true},
+		{"past its limit", strings.Repeat("k", notification.MaxIdempotencyKeyLen+1), false},
 		{"non-ASCII", "clé", false},
 		{"space", "a key", false},
 		{"control character", "a\tkey", false},
@@ -213,7 +213,7 @@ func TestIdempotencyKeyOutsideVisibleASCIIIsRefusedNamingTheHeader(t *testing.T)
 
 func TestTheRequestHashCoversTheRequestNotTheRenderedContent(t *testing.T) {
 	tpl := func(v string) Request {
-		return Request{To: "a@example.com", Channel: core.ChannelEmail,
+		return Request{To: "a@example.com", Channel: notification.ChannelEmail,
 			Template: &TemplateRef{Name: "welcome", Variables: map[string]string{"name": v}}}
 	}
 	if !slices.Equal(requestHash("notification", tpl("Ada")), requestHash("notification", tpl("Ada"))) {

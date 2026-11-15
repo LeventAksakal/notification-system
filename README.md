@@ -113,7 +113,7 @@ curl -s -X DELETE localhost:8090/_control/faults
 
 Refusals share one body: `{"code","message","details":[{"index","field","reason"}]}`. 400 names each offending field or parameter (and the item index in a batch); 409 means the notification is not in a state that allows the action; 413 is a body over 8 MiB; 422 is an `Idempotency-Key` reused with a different payload; 503 with `Retry-After` means the database cannot be reached and nothing was stored.
 
-Limits, defined once in [`internal/core/limits.go`](internal/core/limits.go) and enforced by the spec, the service and database `CHECK`s: SMS `to` is E.164 and content is 1 to 1600 characters; email `to` is at most 254 characters and content 1 to 100,000; push `to` is a device token of 1 to 255 characters and content 1 to 1024.
+Limits, defined once in [`internal/notification/limits.go`](internal/notification/limits.go) and enforced by the spec, the service and database `CHECK`s: SMS `to` is E.164 and content is 1 to 1600 characters; email `to` is at most 254 characters and content 1 to 100,000; push `to` is a device token of 1 to 255 characters and content 1 to 1024.
 
 ## How it works
 
@@ -159,7 +159,7 @@ One MySQL node carries this design to the low thousands of messages per second. 
 
 ## Settings
 
-Every application setting is an `APP_*` environment variable declared once in [`internal/config`](internal/config/config.go) with a default, bounds and a doc line. `go run ./cmd/app env` prints all of them as an env file, bounds included; a test fails if this table misses one.
+Every application setting is an `APP_*` environment variable declared once in [`config`](config/config.go) with a default, bounds and a doc line. `go run ./cmd/app env` prints all of them as an env file, bounds included; a test fails if this table misses one.
 
 That declaration is the one shape every environment fits: local, test, stage, production. Values may differ between them; names, types and bounds may not. The binary refuses to start on a value that does not fit, and `app env check` runs the same validation without starting anything (it also reports an `APP_*` variable the service does not know, which is how a typo in a deploy manifest is caught, and never prints a secret):
 
@@ -224,12 +224,12 @@ The rate tests assert the cap (at most 100 in any second) everywhere, and the th
 |---|---|
 | `api/openapi.yaml` | HTTP contract; the server interface is generated from it and requests are validated against it at runtime |
 | `schema/*.sql` | Desired database state; `migrations/` is generated from it by Atlas (versioned, goose format) |
-| `internal/core` | Vocabulary, the state machine, the limits, and the ports between the parts |
-| `internal/intake`, `internal/api` | Accepting, validating, reading, cancelling; HTTP handlers, WebSocket |
-| `internal/worker`, `internal/limiter`, `internal/breaker`, `internal/provider` | Delivery loop, rate limit, circuit breaker, provider client and retry classifier |
+| `internal/notification` | Vocabulary, the state machine, the limits, and the ports between the parts |
+| `internal/intake`, `internal/httpapi` | Accepting, validating, reading, cancelling; HTTP handlers, WebSocket |
+| `internal/delivery`, `internal/delivery/limiter`, `internal/delivery/breaker`, `internal/provider` | Delivery loop, rate limit, circuit breaker, provider client and retry classifier |
 | `internal/store`, `migrations/` | SQL queries (sqlc), the queue; the versioned migrations, embedded in the binary |
 | `internal/realtime` | Status events over Valkey |
-| `internal/obs`, `internal/config` | Logs, traces, metrics; every setting |
+| `internal/telemetry`, `config` | Logs, traces, metrics; every setting |
 | `internal/fakeprovider`, `cmd/fakeprovider` | The provider stand-in: faults, dedupe switch, exact counts |
 | `docs/decisions` | Why things are the way they are, one record per decision |
 | `docs/AI-WORKFLOW.md`, `.agents/` | How AI agents built this: roles, briefs, reviews, mistakes and how each was caught |

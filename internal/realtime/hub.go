@@ -11,7 +11,7 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 var (
@@ -44,7 +44,7 @@ type Filter struct {
 	BatchID        string
 }
 
-func (f Filter) match(e core.Event) bool {
+func (f Filter) match(e notification.Event) bool {
 	return (f.NotificationID == "" || f.NotificationID == e.NotificationID) &&
 		(f.BatchID == "" || f.BatchID == e.BatchID)
 }
@@ -52,9 +52,9 @@ func (f Filter) match(e core.Event) bool {
 // Subscription receives the events matching its filter, in commit order per
 // notification. C is closed when the subscription ends; Err then says why.
 type Subscription struct {
-	C <-chan core.Event
+	C <-chan notification.Event
 
-	ch     chan core.Event
+	ch     chan notification.Event
 	filter Filter
 	hub    *Hub
 	err    error // set under hub.mu before ch is closed
@@ -112,7 +112,7 @@ func (h *Hub) Subscribe(f Filter, buf int) (*Subscription, error) {
 	if !h.live.Load() {
 		return nil, ErrFeedLost
 	}
-	ch := make(chan core.Event, max(buf, 1))
+	ch := make(chan notification.Event, max(buf, 1))
 	s := &Subscription{C: ch, ch: ch, filter: f, hub: h}
 	h.subs[s] = struct{}{}
 	return s, nil

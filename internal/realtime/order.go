@@ -4,7 +4,7 @@ import (
 	"container/list"
 	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // sequencer restores commit order per notification where two processes race
@@ -50,7 +50,7 @@ type sequencer struct {
 
 type seen struct {
 	id       string
-	status   core.Status
+	status   notification.Status
 	attempts int
 	at       time.Time // local receive time, for expiry
 }
@@ -91,8 +91,8 @@ func (s *sequencer) push(m Message, now time.Time) []Message {
 	}
 	// With as many holds as the cap allows, a claim goes out unheld: order is
 	// best effort, memory is not.
-	if m.Status == core.StatusProcessing && len(s.held) < s.max {
-		if e, ok := s.last[id]; !ok || e.Value.(*seen).status != core.StatusPending || e.Value.(*seen).attempts != m.Attempts {
+	if m.Status == notification.StatusProcessing && len(s.held) < s.max {
+		if e, ok := s.last[id]; !ok || e.Value.(*seen).status != notification.StatusPending || e.Value.(*seen).attempts != m.Attempts {
 			q := &heldQueue{id: id, msgs: []Message{m}, until: now.Add(s.hold)}
 			s.held[id] = q
 			s.holds.PushBack(q)
@@ -147,7 +147,7 @@ func (s *sequencer) forget(e *list.Element) {
 
 // predecessor reports whether p is the pending that the held claim c follows.
 func predecessor(p, c Message) bool {
-	if p.Status != core.StatusPending || p.Attempts != c.Attempts {
+	if p.Status != notification.StatusPending || p.Attempts != c.Attempts {
 		return false
 	}
 	return p.Origin == OriginAPI || p.Error != "" || !p.At.After(c.At)
@@ -162,11 +162,11 @@ func predecessor(p, c Message) bool {
 //
 // Only events up to the first uncovered one are checked; after that the
 // stream is in commit order and everything is new.
-func Covered(snapshot, e core.Event) bool {
+func Covered(snapshot, e notification.Event) bool {
 	if e.Status == snapshot.Status && e.Attempts == snapshot.Attempts {
 		return true
 	}
-	if snapshot.Status == core.StatusFailed && e.Status == core.StatusPending && e.Attempts == 0 {
+	if snapshot.Status == notification.StatusFailed && e.Status == notification.StatusPending && e.Attempts == 0 {
 		return false
 	}
 	if e.Attempts != snapshot.Attempts {
@@ -175,11 +175,11 @@ func Covered(snapshot, e core.Event) bool {
 	return phase(e.Status) < phase(snapshot.Status)
 }
 
-func phase(s core.Status) int {
+func phase(s notification.Status) int {
 	switch s {
-	case core.StatusPending:
+	case notification.StatusPending:
 		return 0
-	case core.StatusProcessing:
+	case notification.StatusProcessing:
 		return 1
 	default:
 		return 2

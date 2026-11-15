@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // Verdict is what one provider call means for the notification.
 type Verdict struct {
-	Outcome core.AttemptOutcome
+	Outcome notification.AttemptOutcome
 	// RetryAfter is the provider's Retry-After, 0 when absent or unparsable.
 	RetryAfter time.Duration
 	// Error describes a failed call for last_error; "" when accepted.
@@ -42,21 +42,21 @@ func classifyAt(now time.Time, status int, err error, h http.Header) Verdict {
 				msg = "timeout: " + msg
 			}
 		}
-		return Verdict{Outcome: core.OutcomeTransient, Error: msg, ProviderFault: true}
+		return Verdict{Outcome: notification.OutcomeTransient, Error: msg, ProviderFault: true}
 	}
 	switch {
 	case status >= 200 && status < 300:
-		return Verdict{Outcome: core.OutcomeAccepted}
+		return Verdict{Outcome: notification.OutcomeAccepted}
 	case status == http.StatusRequestTimeout, status == http.StatusTooEarly,
 		status == http.StatusTooManyRequests, status >= 500 && status < 600:
 		return Verdict{
-			Outcome:       core.OutcomeTransient,
+			Outcome:       notification.OutcomeTransient,
 			RetryAfter:    retryAfter(now, h.Get("Retry-After")),
 			Error:         statusError(status),
 			ProviderFault: true,
 		}
 	default:
-		return Verdict{Outcome: core.OutcomePermanent, Error: statusError(status)}
+		return Verdict{Outcome: notification.OutcomePermanent, Error: statusError(status)}
 	}
 }
 

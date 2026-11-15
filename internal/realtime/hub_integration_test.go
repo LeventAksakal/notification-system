@@ -12,7 +12,7 @@ import (
 	"github.com/valkey-io/valkey-go"
 	"go.uber.org/goleak"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/realtime"
 	"github.com/LeventAksakal/notification-system/internal/realtime/realtimetest"
 	"github.com/LeventAksakal/notification-system/test/support"
@@ -50,7 +50,7 @@ func startHub(t *testing.T, c valkey.Client) (*realtime.Hub, func()) {
 	return h, stop
 }
 
-func next(t *testing.T, s *realtime.Subscription) core.Event {
+func next(t *testing.T, s *realtime.Subscription) notification.Event {
 	t.Helper()
 	select {
 	case e, ok := <-s.C:
@@ -61,7 +61,7 @@ func next(t *testing.T, s *realtime.Subscription) core.Event {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no event within 5s")
 	}
-	return core.Event{}
+	return notification.Event{}
 }
 
 func TestHubFansOutPublishedEventsByFilter(t *testing.T) {
@@ -78,9 +78,9 @@ func TestHubFansOutPublishedEventsByFilter(t *testing.T) {
 	batch, _ := h.Subscribe(realtime.Filter{BatchID: "b1"}, 16)
 	api := realtime.NewPublisher(pubClient, realtime.OriginAPI)
 	now := time.Now().UTC()
-	for _, e := range []core.Event{
-		{NotificationID: "n1", BatchID: "b1", Status: core.StatusPending, At: now, CorrelationID: "c1"},
-		{NotificationID: "n2", Status: core.StatusPending, At: now, CorrelationID: "c2"},
+	for _, e := range []notification.Event{
+		{NotificationID: "n1", BatchID: "b1", Status: notification.StatusPending, At: now, CorrelationID: "c1"},
+		{NotificationID: "n2", Status: notification.StatusPending, At: now, CorrelationID: "c2"},
 	} {
 		if err := api.Publish(t.Context(), e); err != nil {
 			t.Fatal(err)
@@ -110,7 +110,7 @@ func TestHubDropsASlowSubscriberWithoutBlockingOthers(t *testing.T) {
 	fast, _ := h.Subscribe(realtime.Filter{}, 64)
 	pub := realtime.NewPublisher(pubClient, realtime.OriginAPI)
 	for i := range 5 {
-		e := core.Event{NotificationID: "n" + string(rune('a'+i)), Status: core.StatusPending, At: time.Now()}
+		e := notification.Event{NotificationID: "n" + string(rune('a'+i)), Status: notification.StatusPending, At: time.Now()}
 		if err := pub.Publish(t.Context(), e); err != nil {
 			t.Fatal(err)
 		}
@@ -193,7 +193,7 @@ func TestHubEndsStreamsWhenItsFeedDropsAndRefusesUntilBack(t *testing.T) {
 		t.Fatalf("subscribe after the feed came back: %v", err)
 	}
 	defer again.Close()
-	e := core.Event{NotificationID: "back", Status: core.StatusPending, At: time.Now().UTC()}
+	e := notification.Event{NotificationID: "back", Status: notification.StatusPending, At: time.Now().UTC()}
 	if err := realtime.NewPublisher(pubClient, realtime.OriginAPI).Publish(t.Context(), e); err != nil {
 		t.Fatal(err)
 	}

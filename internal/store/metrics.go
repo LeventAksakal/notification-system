@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/store/sqlc"
 )
 
 // QueueDepth is one channel's unfinished work.
 type QueueDepth struct {
-	Channel            core.Channel
+	Channel            notification.Channel
 	Pending            int // stored pending and due now
 	Scheduled          int // stored pending and due later (scheduled or backing off)
 	Processing         int
@@ -48,15 +48,15 @@ func (d Delivery) FailureRate() float64 {
 // Metrics is the summary GET /v1/metrics shows (decision 0014). Every number
 // is read from MySQL on the database clock, so every instance agrees.
 type Metrics struct {
-	Queue     []QueueDepth // one per channel, in core.Channels order
+	Queue     []QueueDepth // one per channel, in notification.Channels order
 	Totals    map[string]int
 	Delivery  Delivery
-	ByChannel []ChannelDelivery // one per channel, in core.Channels order
+	ByChannel []ChannelDelivery // one per channel, in notification.Channels order
 }
 
 // ChannelDelivery is one channel's Delivery.
 type ChannelDelivery struct {
-	Channel core.Channel
+	Channel notification.Channel
 	Delivery
 }
 
@@ -124,17 +124,17 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 	since := now.Add(-window)
 
 	m := Metrics{Totals: map[string]int{}}
-	queue := map[core.Channel]QueueDepth{}
+	queue := map[notification.Channel]QueueDepth{}
 	rows, err := q.MetricsQueue(ctx, sqlc.MetricsQueueParams{Now: now})
 	if err != nil {
 		return Metrics{}, fmt.Errorf("metrics queue: %w", err)
 	}
 	for _, row := range rows {
-		ch := core.Channel(row.Channel)
+		ch := notification.Channel(row.Channel)
 		queue[ch] = QueueDepth{Channel: ch, Pending: int(row.PendingDue), Scheduled: int(row.PendingLater),
 			Processing: int(row.Processing), OldestPendingAgeMs: max(int(row.OldestDueAgeMs), 0)}
 	}
-	for _, ch := range core.Channels {
+	for _, ch := range notification.Channels {
 		qd := queue[ch]
 		qd.Channel = ch
 		m.Queue = append(m.Queue, qd)
@@ -151,13 +151,13 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 	if err != nil {
 		return Metrics{}, fmt.Errorf("metrics scheduled: %w", err)
 	}
-	// The API view splits scheduled out of pending (core.Status docs). On one
+	// The API view splits scheduled out of pending (notification.Status docs). On one
 	// snapshot scheduled rows are a subset of pending ones; the clamp is a guard.
 	m.Totals["scheduled"] = int(scheduled)
-	m.Totals[string(core.StatusPending)] = max(m.Totals[string(core.StatusPending)]-int(scheduled), 0)
+	m.Totals[string(notification.StatusPending)] = max(m.Totals[string(notification.StatusPending)]-int(scheduled), 0)
 
-	by := map[core.Channel]*Delivery{}
-	for _, ch := range core.Channels {
+	by := map[notification.Channel]*Delivery{}
+	for _, ch := range notification.Channels {
 		by[ch] = &Delivery{}
 	}
 	finished, err := q.MetricsFinished(ctx, sql.NullTime{Time: since, Valid: true})
@@ -165,7 +165,7 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 		return Metrics{}, fmt.Errorf("metrics finished: %w", err)
 	}
 	for _, f := range finished {
-		if d := by[core.Channel(f.Channel)]; d != nil {
+		if d := by[notification.Channel(f.Channel)]; d != nil {
 			d.Sent, d.Failed = int(f.Sent), int(f.Failed)
 		}
 	}
@@ -174,14 +174,14 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 		return Metrics{}, fmt.Errorf("metrics attempts: %w", err)
 	}
 	for _, a := range attempts {
-		if d := by[core.Channel(a.Channel)]; d != nil {
+		if d := by[notification.Channel(a.Channel)]; d != nil {
 			d.Attempts, d.FailedAttempts = int(a.Attempts), int(a.FailedAttempts)
 		}
 	}
 	if err := latency(ctx, tx, since, by, &m.Delivery.Latency); err != nil {
 		return Metrics{}, err
 	}
-	for _, ch := range core.Channels {
+	for _, ch := range notification.Channels {
 		d := *by[ch]
 		m.ByChannel = append(m.ByChannel, ChannelDelivery{Channel: ch, Delivery: d})
 		m.Delivery.Sent += d.Sent
@@ -192,7 +192,7 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 	return m, nil
 }
 
-func latency(ctx context.Context, tx *sql.Tx, since time.Time, by map[core.Channel]*Delivery, all *Latency) error {
+func latency(ctx context.Context, tx *sql.Tx, since time.Time, by map[notification.Channel]*Delivery, all *Latency) error {
 	query, args := LatencyQuery(since)
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -205,7 +205,7 @@ func latency(ctx context.Context, tx *sql.Tx, since time.Time, by map[core.Chann
 		if err := rows.Scan(&ch, &ms, &rn, &n, &rnAll, &nAll); err != nil {
 			return fmt.Errorf("metrics latency: %w", err)
 		}
-		if d := by[core.Channel(ch)]; d != nil {
+		if d := by[notification.Channel(ch)]; d != nil {
 			setRank(&d.Latency, rn, n, ms)
 		}
 		setRank(all, rnAll, nAll, ms)

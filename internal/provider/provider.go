@@ -15,12 +15,12 @@ import (
 
 	"go.opentelemetry.io/otel/propagation"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // Message is what one provider call carries.
 type Message struct {
-	Channel       core.Channel
+	Channel       notification.Channel
 	To            string
 	Content       string
 	Key           string // Idempotency-Key: the notification id, identical across attempts
@@ -45,16 +45,16 @@ const maxBody = 64 << 10
 
 // Client sends notifications to the per-channel provider URLs.
 type Client struct {
-	urls    map[core.Channel]string
+	urls    map[notification.Channel]string
 	timeout time.Duration
 	http    *http.Client
 }
 
 // New returns a client. conns sizes the idle pool per host to the number of
 // calls in flight, so connections are reused instead of re-dialled.
-func New(urls map[core.Channel]string, timeout time.Duration, conns int) *Client {
+func New(urls map[notification.Channel]string, timeout time.Duration, conns int) *Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.MaxIdleConns = max(conns*len(core.Channels), 100)
+	tr.MaxIdleConns = max(conns*len(notification.Channels), 100)
 	tr.MaxIdleConnsPerHost = max(conns, 2)
 	return &Client{
 		urls:    urls,

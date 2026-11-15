@@ -12,7 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/store"
 	"github.com/LeventAksakal/notification-system/internal/store/sqlc"
 	"github.com/LeventAksakal/notification-system/test/support"
@@ -20,10 +20,10 @@ import (
 
 // insertListed inserts n notifications on ch with the given status and
 // created_at taken from the id, as intake does.
-func insertListed(t *testing.T, db *sql.DB, n int, ch core.Channel, status core.Status) []string {
+func insertListed(t *testing.T, db *sql.DB, n int, ch notification.Channel, status notification.Status) []string {
 	t.Helper()
-	to := map[core.Channel]string{core.ChannelSMS: "+905551234567", core.ChannelEmail: "a@example.com", core.ChannelPush: "device-1"}[ch]
-	kind := sql.NullString{String: "permanent", Valid: status == core.StatusFailed}
+	to := map[notification.Channel]string{notification.ChannelSMS: "+905551234567", notification.ChannelEmail: "a@example.com", notification.ChannelPush: "device-1"}[ch]
+	kind := sql.NullString{String: "permanent", Valid: status == notification.StatusFailed}
 	ids := make([]string, n)
 	for i := range n {
 		id := uuid.Must(uuid.NewV7())
@@ -79,10 +79,10 @@ func explain(t *testing.T, db *sql.DB, query string, args []any) []map[string]st
 func TestList(t *testing.T) {
 	db, _ := support.MySQL(t)
 	var all []string // creation order
-	for _, ch := range core.Channels {
-		all = append(all, insertListed(t, db, 60, ch, core.StatusPending)...)
-		all = append(all, insertListed(t, db, 60, ch, core.StatusSent)...)
-		all = append(all, insertListed(t, db, 20, ch, core.StatusFailed)...)
+	for _, ch := range notification.Channels {
+		all = append(all, insertListed(t, db, 60, ch, notification.StatusPending)...)
+		all = append(all, insertListed(t, db, 60, ch, notification.StatusSent)...)
+		all = append(all, insertListed(t, db, 20, ch, notification.StatusFailed)...)
 	}
 	if _, err := db.ExecContext(t.Context(), "ANALYZE TABLE notifications"); err != nil {
 		t.Fatalf("analyze: %v", err)

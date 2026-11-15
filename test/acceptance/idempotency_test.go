@@ -46,7 +46,7 @@ func TestR11IdempotentCreate(t *testing.T) {
 		if first.Status != http.StatusCreated || second.Status != http.StatusCreated {
 			t.Fatalf("want 201 twice, got %s and %s", first, second)
 		}
-		var a, b notification
+		var a, b apiNotification
 		first.decode(t, &a)
 		second.decode(t, &b)
 		if a.ID == "" || a.ID != b.ID {
@@ -76,7 +76,7 @@ func TestR11IdempotentCreate(t *testing.T) {
 				t.Errorf("copy %d: want 201, got %s", i, r)
 				continue
 			}
-			var n notification
+			var n apiNotification
 			r.decode(t, &n)
 			idSeen[n.ID]++
 		}

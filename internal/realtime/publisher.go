@@ -20,7 +20,7 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // Channel is the Valkey pub/sub channel every status change is published on.
@@ -50,7 +50,7 @@ const (
 
 // Message is one status change as it travels between processes.
 type Message struct {
-	core.Event
+	notification.Event
 	Origin Origin
 }
 
@@ -77,11 +77,11 @@ func decode(b []byte) (Message, error) {
 	if err := json.Unmarshal(b, &w); err != nil {
 		return Message{}, fmt.Errorf("decode status event: %w", err)
 	}
-	if w.NotificationID == "" || !core.Status(w.Status).Valid() {
+	if w.NotificationID == "" || !notification.Status(w.Status).Valid() {
 		return Message{}, fmt.Errorf("decode status event: id %q status %q", w.NotificationID, w.Status)
 	}
-	return Message{Origin: w.Origin, Event: core.Event{
-		NotificationID: w.NotificationID, BatchID: w.BatchID, Status: core.Status(w.Status), Attempts: w.Attempts,
+	return Message{Origin: w.Origin, Event: notification.Event{
+		NotificationID: w.NotificationID, BatchID: w.BatchID, Status: notification.Status(w.Status), Attempts: w.Attempts,
 		Error: w.Error, At: w.At, CorrelationID: w.CorrelationID,
 	}}, nil
 }
@@ -93,7 +93,7 @@ func decode(b []byte) (Message, error) {
 // the hold-off.
 var ErrUnavailable = errors.New("status events: valkey unavailable")
 
-// Publisher is the core.Publisher that sends each change to Valkey.
+// Publisher is the notification.Publisher that sends each change to Valkey.
 type Publisher struct {
 	client  valkey.Client
 	channel string
@@ -108,7 +108,7 @@ type Publisher struct {
 	probing   bool // a publish is trying during the hold-off
 }
 
-var _ core.Publisher = (*Publisher)(nil)
+var _ notification.Publisher = (*Publisher)(nil)
 
 // NewPublisher publishes on Channel through client, marking messages with origin.
 func NewPublisher(client valkey.Client, origin Origin) *Publisher {
@@ -119,15 +119,15 @@ func NewPublisher(client valkey.Client, origin Origin) *Publisher {
 // one goroutine reach Valkey, and every subscriber, in that order. It ignores
 // the caller's cancellation (the change is committed; a client that went away
 // does not make it unannounced) but not its values.
-func (p *Publisher) Publish(ctx context.Context, e core.Event) error {
-	return p.PublishAll(ctx, []core.Event{e})
+func (p *Publisher) Publish(ctx context.Context, e notification.Event) error {
+	return p.PublishAll(ctx, []notification.Event{e})
 }
 
 // PublishAll sends es in order as one pipeline under one deadline of
 // publishTimeout, whatever their number. After a timeout or a connection
 // failure, calls fail at once with ErrUnavailable for publishHoldOff, except
 // one probe at a time; the first success ends the hold-off.
-func (p *Publisher) PublishAll(ctx context.Context, es []core.Event) error {
+func (p *Publisher) PublishAll(ctx context.Context, es []notification.Event) error {
 	if len(es) == 0 {
 		return nil
 	}

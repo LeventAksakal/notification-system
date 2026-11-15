@@ -8,17 +8,17 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/store/sqlc"
 )
 
-// Queue is the MySQL core.Queue (decisions 0003, 0018).
+// Queue is the MySQL notification.Queue (decisions 0003, 0018).
 type Queue struct {
 	db *sql.DB
 	q  *sqlc.Queries
 }
 
-var _ core.Queue = (*Queue)(nil)
+var _ notification.Queue = (*Queue)(nil)
 
 // NewQueue returns the queue over db (opened with Open).
 func NewQueue(db *sql.DB) *Queue { return &Queue{db: db, q: sqlc.New(db)} }
@@ -30,14 +30,14 @@ const maxProviderIDLen = 255
 // The SELECT ... FOR UPDATE SKIP LOCKED runs through claim_idx in a READ
 // COMMITTED transaction, so concurrent claimers never wait on each other and
 // never get the same row.
-func (s *Queue) Claim(ctx context.Context, channel core.Channel, priority core.Priority, n int, lease time.Duration) ([]core.Job, error) {
+func (s *Queue) Claim(ctx context.Context, channel notification.Channel, priority notification.Priority, n int, lease time.Duration) ([]notification.Job, error) {
 	if n <= 0 {
 		return nil, nil
 	}
-	if err := core.Transition(core.StatusPending, core.StatusProcessing); err != nil {
+	if err := notification.Transition(notification.StatusPending, notification.StatusProcessing); err != nil {
 		return nil, err
 	}
-	var jobs []core.Job
+	var jobs []notification.Job
 	err := retryLockConflict(ctx, func() error {
 		var err error
 		jobs, err = s.claimOnce(ctx, channel, priority, n, lease)
@@ -46,7 +46,7 @@ func (s *Queue) Claim(ctx context.Context, channel core.Channel, priority core.P
 	return jobs, err
 }
 
-func (s *Queue) claimOnce(ctx context.Context, channel core.Channel, priority core.Priority, n int, lease time.Duration) ([]core.Job, error) {
+func (s *Queue) claimOnce(ctx context.Context, channel notification.Channel, priority notification.Priority, n int, lease time.Duration) ([]notification.Job, error) {
 	// Taken before the transaction, so LeaseUntil is never later than the
 	// lease_until the database sets (the worker stops sending by it).
 	started := time.Now()
@@ -80,9 +80,9 @@ func (s *Queue) claimOnce(ctx context.Context, channel core.Channel, priority co
 		// that was not taken.
 		return nil, fmt.Errorf("claim: %d of %d locked rows leased", affected, len(ids))
 	}
-	jobs := make([]core.Job, 0, len(rows))
+	jobs := make([]notification.Job, 0, len(rows))
 	for _, r := range rows {
-		jobs = append(jobs, core.Job{
+		jobs = append(jobs, notification.Job{
 			ID:       r.ID,
 			BatchID:  r.BatchID.String,
 			Channel:  channel,
@@ -107,8 +107,8 @@ func (s *Queue) claimOnce(ctx context.Context, channel core.Channel, priority co
 }
 
 // MarkSent records the accepted attempt and ends the notification as sent.
-func (s *Queue) MarkSent(ctx context.Context, job core.Job, a core.Attempt) error {
-	return s.finish(ctx, job, a, core.StatusSent, func(q *sqlc.Queries) (int64, error) {
+func (s *Queue) MarkSent(ctx context.Context, job notification.Job, a notification.Attempt) error {
+	return s.finish(ctx, job, a, notification.StatusSent, func(q *sqlc.Queries) (int64, error) {
 		return q.FinishSent(ctx, sqlc.FinishSentParams{
 			ProviderMessageID: nullString(cut(a.ProviderMessageID, maxProviderIDLen)),
 			ID:                job.ID,
@@ -119,10 +119,10 @@ func (s *Queue) MarkSent(ctx context.Context, job core.Job, a core.Attempt) erro
 
 // Reschedule records the failed attempt and returns the notification to
 // pending, due at dueAt. The delay is applied on the database clock.
-func (s *Queue) Reschedule(ctx context.Context, job core.Job, a core.Attempt, dueAt time.Time) error {
-	return s.finish(ctx, job, a, core.StatusPending, func(q *sqlc.Queries) (int64, error) {
+func (s *Queue) Reschedule(ctx context.Context, job notification.Job, a notification.Attempt, dueAt time.Time) error {
+	return s.finish(ctx, job, a, notification.StatusPending, func(q *sqlc.Queries) (int64, error) {
 		return q.FinishRetry(ctx, sqlc.FinishRetryParams{
-			LastError:    nullString(cut(a.Error, core.MaxErrorLen)),
+			LastError:    nullString(cut(a.Error, notification.MaxErrorLen)),
 			DelayUs:      delayUs(dueAt),
 			ID:           job.ID,
 			ClaimVersion: job.ClaimVersion,
@@ -131,10 +131,10 @@ func (s *Queue) Reschedule(ctx context.Context, job core.Job, a core.Attempt, du
 }
 
 // MarkFailed records the failed attempt and ends the notification as failed.
-func (s *Queue) MarkFailed(ctx context.Context, job core.Job, a core.Attempt, kind core.FailureKind) error {
-	return s.finish(ctx, job, a, core.StatusFailed, func(q *sqlc.Queries) (int64, error) {
+func (s *Queue) MarkFailed(ctx context.Context, job notification.Job, a notification.Attempt, kind notification.FailureKind) error {
+	return s.finish(ctx, job, a, notification.StatusFailed, func(q *sqlc.Queries) (int64, error) {
 		return q.FinishFailed(ctx, sqlc.FinishFailedParams{
-			LastError:    nullString(cut(a.Error, core.MaxErrorLen)),
+			LastError:    nullString(cut(a.Error, notification.MaxErrorLen)),
 			FailureKind:  sqlc.NullNotificationsFailureKind{NotificationsFailureKind: sqlc.NotificationsFailureKind(kind), Valid: true},
 			ID:           job.ID,
 			ClaimVersion: job.ClaimVersion,
@@ -144,14 +144,14 @@ func (s *Queue) MarkFailed(ctx context.Context, job core.Job, a core.Attempt, ki
 
 // finish updates the claimed row (fenced by claim_version) and inserts its
 // delivery_attempts row in one transaction.
-func (s *Queue) finish(ctx context.Context, job core.Job, a core.Attempt, to core.Status, update func(*sqlc.Queries) (int64, error)) error {
-	if err := core.Transition(core.StatusProcessing, to); err != nil {
+func (s *Queue) finish(ctx context.Context, job notification.Job, a notification.Attempt, to notification.Status, update func(*sqlc.Queries) (int64, error)) error {
+	if err := notification.Transition(notification.StatusProcessing, to); err != nil {
 		return err
 	}
 	return retryLockConflict(ctx, func() error { return s.finishOnce(ctx, job, a, to, update) })
 }
 
-func (s *Queue) finishOnce(ctx context.Context, job core.Job, a core.Attempt, to core.Status, update func(*sqlc.Queries) (int64, error)) error {
+func (s *Queue) finishOnce(ctx context.Context, job notification.Job, a notification.Attempt, to notification.Status, update func(*sqlc.Queries) (int64, error)) error {
 	// READ COMMITTED like the claim: no gap locks, so a result write and a
 	// claim on the same channel do not deadlock on claim_idx.
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -165,7 +165,7 @@ func (s *Queue) finishOnce(ctx context.Context, job core.Job, a core.Attempt, to
 		return fmt.Errorf("finish %s as %s: %w", job.ID, to, err)
 	}
 	if affected == 0 {
-		return fmt.Errorf("finish %s as %s: %w", job.ID, to, core.ErrLeaseLost)
+		return fmt.Errorf("finish %s as %s: %w", job.ID, to, notification.ErrLeaseLost)
 	}
 	var status sql.NullInt16
 	if a.HTTPStatus > 0 {
@@ -179,7 +179,7 @@ func (s *Queue) finishOnce(ctx context.Context, job core.Job, a core.Attempt, to
 		DurationMs:        uint32(max(a.Duration.Milliseconds(), 0)), //nolint:gosec // non-negative, bounded by the timeout
 		Outcome:           sqlc.DeliveryAttemptsOutcome(a.Outcome),
 		HttpStatus:        status,
-		Error:             nullString(cut(a.Error, core.MaxErrorLen)),
+		Error:             nullString(cut(a.Error, notification.MaxErrorLen)),
 		ProviderMessageID: nullString(cut(a.ProviderMessageID, maxProviderIDLen)),
 	})
 	if err != nil {
@@ -192,8 +192,8 @@ func (s *Queue) finishOnce(ctx context.Context, job core.Job, a core.Attempt, to
 }
 
 // Release returns a claimed notification to pending without an attempt.
-func (s *Queue) Release(ctx context.Context, job core.Job, dueAt time.Time) error {
-	if err := core.Transition(core.StatusProcessing, core.StatusPending); err != nil {
+func (s *Queue) Release(ctx context.Context, job notification.Job, dueAt time.Time) error {
+	if err := notification.Transition(notification.StatusProcessing, notification.StatusPending); err != nil {
 		return err
 	}
 	// One autocommit statement: a deadlock or lock wait timeout rolled it
@@ -204,7 +204,7 @@ func (s *Queue) Release(ctx context.Context, job core.Job, dueAt time.Time) erro
 			return fmt.Errorf("release %s: %w", job.ID, err)
 		}
 		if affected == 0 {
-			return fmt.Errorf("release %s: %w", job.ID, core.ErrLeaseLost)
+			return fmt.Errorf("release %s: %w", job.ID, notification.ErrLeaseLost)
 		}
 		return nil
 	})
@@ -215,13 +215,13 @@ func (s *Queue) Release(ctx context.Context, job core.Job, dueAt time.Time) erro
 // can publish the change. Each batch of up to 1000 is locked, updated and
 // committed in one READ COMMITTED transaction; concurrent reapers skip each
 // other's rows.
-func (s *Queue) ReapExpired(ctx context.Context) ([]core.Job, error) {
-	if err := core.Transition(core.StatusProcessing, core.StatusPending); err != nil {
+func (s *Queue) ReapExpired(ctx context.Context) ([]notification.Job, error) {
+	if err := notification.Transition(notification.StatusProcessing, notification.StatusPending); err != nil {
 		return nil, err
 	}
-	var all []core.Job
+	var all []notification.Job
 	for {
-		var jobs []core.Job
+		var jobs []notification.Job
 		err := retryLockConflict(ctx, func() error {
 			var err error
 			jobs, err = s.reapOnce(ctx)
@@ -240,7 +240,7 @@ func (s *Queue) ReapExpired(ctx context.Context) ([]core.Job, error) {
 // reapBatch is the LIMIT of ReapCandidates.
 const reapBatch = 1000
 
-func (s *Queue) reapOnce(ctx context.Context) ([]core.Job, error) {
+func (s *Queue) reapOnce(ctx context.Context) ([]notification.Job, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("reap: begin: %w", err)
@@ -255,11 +255,11 @@ func (s *Queue) reapOnce(ctx context.Context) ([]core.Job, error) {
 		return nil, nil
 	}
 	ids := make([]string, len(rows))
-	jobs := make([]core.Job, len(rows))
+	jobs := make([]notification.Job, len(rows))
 	for i, r := range rows {
 		ids[i] = r.ID
-		jobs[i] = core.Job{
-			ID: r.ID, BatchID: r.BatchID.String, Channel: core.Channel(r.Channel),
+		jobs[i] = notification.Job{
+			ID: r.ID, BatchID: r.BatchID.String, Channel: notification.Channel(r.Channel),
 			Attempts: int(r.Attempts), CorrelationID: r.CorrelationID,
 		}
 	}

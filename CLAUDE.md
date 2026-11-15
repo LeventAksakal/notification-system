@@ -34,4 +34,4 @@ Router, not a manual. Every line is something you could not work out from the co
 - Fast-forward `main` to the PR branch locally (`git merge --ff-only`, then `git push origin main`; GitHub marks the PR merged). Squash-merge a PR too large to read commit by commit. Never a merge commit, never GitHub's "Rebase and merge" (it rewrites the commits CI tested), never rebase a pushed branch.
 
 ## Roles
-Subagents: `researcher`, `test-writer`, `implementer`, `verifier` (`.claude/agents/`). The main thread coordinates and alone edits contracts (`api/`, `schema/`, `internal/core/`). Limits are enforced by `tools/agentguard` and at merge by `tools/ownercheck`; a deny message says what to do instead.
+Subagents: `researcher`, `test-writer`, `implementer`, `verifier` (`.claude/agents/`). The main thread coordinates and alone edits contracts (`api/`, `schema/`, `internal/notification/`). Limits are enforced by `tools/agentguard` and at merge by `tools/ownercheck`; a deny message says what to do instead.

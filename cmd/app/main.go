@@ -28,17 +28,17 @@ import (
 	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/LeventAksakal/notification-system/internal/api"
-	"github.com/LeventAksakal/notification-system/internal/breaker"
-	"github.com/LeventAksakal/notification-system/internal/config"
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/config"
+	delivery "github.com/LeventAksakal/notification-system/internal/delivery"
+	"github.com/LeventAksakal/notification-system/internal/delivery/breaker"
+	"github.com/LeventAksakal/notification-system/internal/delivery/limiter"
+	"github.com/LeventAksakal/notification-system/internal/httpapi"
 	"github.com/LeventAksakal/notification-system/internal/intake"
-	"github.com/LeventAksakal/notification-system/internal/limiter"
-	"github.com/LeventAksakal/notification-system/internal/obs"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/provider"
 	"github.com/LeventAksakal/notification-system/internal/realtime"
 	"github.com/LeventAksakal/notification-system/internal/store"
-	delivery "github.com/LeventAksakal/notification-system/internal/worker"
+	"github.com/LeventAksakal/notification-system/internal/telemetry"
 )
 
 func main() {
@@ -61,13 +61,13 @@ func run(ctx context.Context, cmd string) error {
 		return healthcheck(ctx, "http://127.0.0.1:8080/readyz")
 	case "env":
 		// No config, no connections, no telemetry.
-		return env(os.Stdout, os.Args[2:], os.Environ()) //nolint:forbidigo // app env check validates the whole environment against internal/config
+		return env(os.Stdout, os.Args[2:], os.Environ()) //nolint:forbidigo // app env check validates the whole environment against config
 	}
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	shutdownObs, err := obs.Setup(ctx, cfg.ServiceName, cfg.OTLPEndpoint, cfg.LogLevel)
+	shutdownObs, err := telemetry.Setup(ctx, cfg.ServiceName, cfg.OTLPEndpoint, cfg.LogLevel)
 	if err != nil {
 		return err
 	}
@@ -145,8 +145,8 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		return err
 	}
 
-	breakers := make(map[core.Channel]*breaker.Breaker, len(core.Channels))
-	for _, ch := range core.Channels {
+	breakers := make(map[notification.Channel]*breaker.Breaker, len(notification.Channels))
+	for _, ch := range notification.Channels {
 		breakers[ch] = breaker.New(breaker.Config{
 			Window:       cfg.BreakerWindow,
 			MinRequests:  cfg.BreakerMinRequests,
@@ -191,7 +191,7 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 	// One Valkey subscription per process feeds every WebSocket (decision 0013).
 	hub := realtime.NewHub(vk)
 	svc := intake.New(db, realtime.NewPublisher(vk, realtime.OriginAPI), cfg.IdempotencyRetention)
-	srv := api.NewServer(svc, map[string]api.Check{
+	srv := httpapi.NewServer(svc, map[string]httpapi.Check{
 		"mysql": db.PingContext,
 		// Ready only while events reach this instance: a subscriber accepted
 		// now must not miss the next change.
@@ -204,7 +204,7 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 			}
 			return nil
 		},
-	}, api.Options{Metrics: store.NewMetricsReader(db), Hub: hub, WSSendBuffer: cfg.WSSendBuffer,
+	}, httpapi.Options{Metrics: store.NewMetricsReader(db), Hub: hub, WSSendBuffer: cfg.WSSendBuffer,
 		RequestTimeout: cfg.RequestTimeout})
 	h, err := srv.Handler()
 	if err != nil {

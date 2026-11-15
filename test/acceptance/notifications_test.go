@@ -26,13 +26,13 @@ func TestR1CreateAndRead(t *testing.T) {
 		if got := r.Header.Get("X-Correlation-ID"); got != "r1-corr-given" {
 			t.Errorf("X-Correlation-ID echoed: want r1-corr-given, got %q", got)
 		}
-		var created notification
+		var created apiNotification
 		r.decode(t, &created)
 		if created.ID == "" {
 			t.Fatalf("no id in %s", r)
 		}
 		got := s.get(t, created.ID)
-		for _, n := range []notification{created, got} {
+		for _, n := range []apiNotification{created, got} {
 			if n.ID != created.ID || n.To != smsTo || n.Channel != "sms" || n.Content != "Your code is 4821" {
 				t.Errorf("fields: got id=%q to=%q channel=%q content=%q", n.ID, n.To, n.Channel, n.Content)
 			}
@@ -71,7 +71,7 @@ func TestR1CreateAndRead(t *testing.T) {
 		if h == "" {
 			t.Fatal("no X-Correlation-ID on the response")
 		}
-		var n notification
+		var n apiNotification
 		r.decode(t, &n)
 		if got := s.get(t, n.ID); got.CorrelationID != h {
 			t.Errorf("stored correlationId %q differs from the generated header %q", got.CorrelationID, h)
@@ -173,9 +173,9 @@ func (s *stack) list(t *testing.T, q url.Values) notificationPage {
 }
 
 // listAll walks every page of a filtered list.
-func (s *stack) listAll(t *testing.T, q url.Values) []notification {
+func (s *stack) listAll(t *testing.T, q url.Values) []apiNotification {
 	t.Helper()
-	var out []notification
+	var out []apiNotification
 	q = cloneValues(q)
 	q.Set("limit", "200")
 	for range 100 {
@@ -198,7 +198,7 @@ func cloneValues(q url.Values) url.Values {
 	return out
 }
 
-func idSet(ns []notification) map[string]bool {
+func idSet(ns []apiNotification) map[string]bool {
 	m := map[string]bool{}
 	for _, n := range ns {
 		m[n.ID] = true
@@ -211,7 +211,7 @@ func idSet(ns []notification) map[string]bool {
 func TestR6ListFilters(t *testing.T) {
 	s := startStack(t, stackOptions{})
 
-	var all []notification
+	var all []apiNotification
 	for i := range 4 {
 		all = append(all, s.create(t, msg("sms", fmt.Sprintf("sms %d", i))))
 		all = append(all, s.create(t, msg("email", fmt.Sprintf("email %d", i))))
@@ -343,13 +343,13 @@ func TestR6ListFilters(t *testing.T) {
 func TestR6PaginationWhileRowsArrive(t *testing.T) {
 	s := startStack(t, stackOptions{})
 
-	var initial []notification
+	var initial []apiNotification
 	for i := range 25 {
 		initial = append(initial, s.create(t, msg([]string{"sms", "email", "push"}[i%3], fmt.Sprintf("page row %d", i))))
 	}
 
 	seen := map[string]int{}
-	var walked []notification
+	var walked []apiNotification
 	q := url.Values{"limit": {"7"}}
 	pages := 0
 	for {

@@ -1,7 +1,7 @@
 // Package intake accepts notifications: it validates and renders create
 // requests, stores them (one transaction per request, batches included),
 // deduplicates client retries by Idempotency-Key, and serves the reads,
-// cancels and replays of the API. Every limit comes from internal/core.
+// cancels and replays of the API. Every limit comes from internal/notification.
 package intake
 
 import (
@@ -13,7 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // Conditions the API maps to its error codes.
@@ -26,12 +26,12 @@ var (
 
 // Request is one notification as a client asked for it.
 type Request struct {
-	To          string        `json:"to"`
-	Channel     core.Channel  `json:"channel"`
-	Content     *string       `json:"content,omitempty"`
-	Template    *TemplateRef  `json:"template,omitempty"`
-	Priority    core.Priority `json:"priority,omitempty"` // "" means normal
-	ScheduledAt *time.Time    `json:"scheduledAt,omitempty"`
+	To          string                `json:"to"`
+	Channel     notification.Channel  `json:"channel"`
+	Content     *string               `json:"content,omitempty"`
+	Template    *TemplateRef          `json:"template,omitempty"`
+	Priority    notification.Priority `json:"priority,omitempty"` // "" means normal
+	ScheduledAt *time.Time            `json:"scheduledAt,omitempty"`
 }
 
 // TemplateRef names a stored template and the values of its variables.
@@ -73,13 +73,13 @@ func invalid(field, reason string) *ValidationError {
 // (templates rendered) and the priority defaulted.
 type Accepted struct {
 	To          string
-	Channel     core.Channel
-	Priority    core.Priority
+	Channel     notification.Channel
+	Priority    notification.Priority
 	Content     string
 	ScheduledAt *time.Time // nil: due now; a past time is stored and due now
 }
 
-var smsRecipient = regexp.MustCompile(core.SMSRecipientPattern)
+var smsRecipient = regexp.MustCompile(notification.SMSRecipientPattern)
 
 // Validate checks one request against every intake rule and renders its
 // template. templates maps the names of the stored templates the request may
@@ -91,7 +91,7 @@ func Validate(r Request, templates map[string]string, now time.Time) (Accepted, 
 
 	a := Accepted{To: r.To, Channel: r.Channel, Priority: r.Priority, ScheduledAt: r.ScheduledAt}
 	if a.Priority == "" {
-		a.Priority = core.PriorityNormal
+		a.Priority = notification.PriorityNormal
 	}
 	if !a.Priority.Valid() {
 		add("priority", "must be one of high, normal, low")
@@ -123,8 +123,8 @@ func Validate(r Request, templates map[string]string, now time.Time) (Accepted, 
 	}
 
 	if r.ScheduledAt != nil {
-		if r.ScheduledAt.After(now.Add(core.ScheduleHorizon)) {
-			add("scheduledAt", fmt.Sprintf("must be at most %s ahead", humanDuration(core.ScheduleHorizon)))
+		if r.ScheduledAt.After(now.Add(notification.ScheduleHorizon)) {
+			add("scheduledAt", fmt.Sprintf("must be at most %s ahead", humanDuration(notification.ScheduleHorizon)))
 		}
 		t := r.ScheduledAt.UTC().Truncate(time.Millisecond)
 		a.ScheduledAt = &t
@@ -132,20 +132,20 @@ func Validate(r Request, templates map[string]string, now time.Time) (Accepted, 
 	return a, errs
 }
 
-func checkRecipient(c core.Channel, to string) string {
+func checkRecipient(c notification.Channel, to string) string {
 	n := utf8.RuneCountInString(to)
 	if n == 0 {
 		return "must not be empty"
 	}
-	if limit := core.MaxRecipientLenFor(c); n > limit {
+	if limit := notification.MaxRecipientLenFor(c); n > limit {
 		return fmt.Sprintf("must be at most %d characters", limit)
 	}
 	switch c {
-	case core.ChannelSMS:
+	case notification.ChannelSMS:
 		if !smsRecipient.MatchString(to) {
 			return "must be an E.164 phone number (+ and 7 to 15 digits)"
 		}
-	case core.ChannelEmail:
+	case notification.ChannelEmail:
 		if strings.Count(to, "@") != 1 {
 			return "must be an email address with exactly one @"
 		}
@@ -153,12 +153,12 @@ func checkRecipient(c core.Channel, to string) string {
 	return ""
 }
 
-func checkContent(c core.Channel, content string) string {
+func checkContent(c notification.Channel, content string) string {
 	n := utf8.RuneCountInString(content)
 	if n == 0 {
 		return "must not be empty"
 	}
-	if limit := core.MaxContentLenFor(c); n > limit {
+	if limit := notification.MaxContentLenFor(c); n > limit {
 		return fmt.Sprintf("is %d characters; %s allows at most %d", n, c, limit)
 	}
 	return ""
@@ -166,13 +166,13 @@ func checkContent(c core.Channel, content string) string {
 
 func renderRef(ref TemplateRef, templates map[string]string) (string, []FieldError) {
 	var errs []FieldError
-	if len(ref.Variables) > core.MaxTemplateVariables {
-		errs = append(errs, FieldError{Field: "template.variables", Reason: fmt.Sprintf("at most %d variables", core.MaxTemplateVariables)})
+	if len(ref.Variables) > notification.MaxTemplateVariables {
+		errs = append(errs, FieldError{Field: "template.variables", Reason: fmt.Sprintf("at most %d variables", notification.MaxTemplateVariables)})
 	}
 	for name, v := range ref.Variables {
-		if utf8.RuneCountInString(v) > core.MaxTemplateVariableLen {
+		if utf8.RuneCountInString(v) > notification.MaxTemplateVariableLen {
 			errs = append(errs, FieldError{Field: "template.variables." + name,
-				Reason: fmt.Sprintf("must be at most %d characters", core.MaxTemplateVariableLen)})
+				Reason: fmt.Sprintf("must be at most %d characters", notification.MaxTemplateVariableLen)})
 		}
 	}
 	body, ok := templates[ref.Name]
@@ -189,16 +189,16 @@ func renderRef(ref TemplateRef, templates map[string]string) (string, []FieldErr
 // CheckTemplate validates a template before it is stored.
 func CheckTemplate(name, body string) []FieldError {
 	var errs []FieldError
-	if n := len(name); n == 0 || n > core.MaxTemplateNameLen || !templateName.MatchString(name) {
-		errs = append(errs, FieldError{Field: "name", Reason: fmt.Sprintf("must match %s, at most %d characters", core.TemplateNamePattern, core.MaxTemplateNameLen)})
+	if n := len(name); n == 0 || n > notification.MaxTemplateNameLen || !templateName.MatchString(name) {
+		errs = append(errs, FieldError{Field: "name", Reason: fmt.Sprintf("must match %s, at most %d characters", notification.TemplateNamePattern, notification.MaxTemplateNameLen)})
 	}
-	if n := utf8.RuneCountInString(body); n == 0 || n > core.MaxTemplateBodyLen {
-		errs = append(errs, FieldError{Field: "body", Reason: fmt.Sprintf("must be 1 to %d characters", core.MaxTemplateBodyLen)})
+	if n := utf8.RuneCountInString(body); n == 0 || n > notification.MaxTemplateBodyLen {
+		errs = append(errs, FieldError{Field: "body", Reason: fmt.Sprintf("must be 1 to %d characters", notification.MaxTemplateBodyLen)})
 	}
 	return errs
 }
 
-var templateName = regexp.MustCompile(core.TemplateNamePattern)
+var templateName = regexp.MustCompile(notification.TemplateNamePattern)
 
 func humanDuration(d time.Duration) string {
 	if d%(24*time.Hour) == 0 {

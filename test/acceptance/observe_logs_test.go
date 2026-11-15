@@ -24,7 +24,7 @@ func TestR14CorrelationIDOnLogsAndProvider(t *testing.T) {
 		if r.Status != 201 {
 			t.Fatalf("create: want 201, got %s", r)
 		}
-		var n notification
+		var n apiNotification
 		r.decode(t, &n)
 		corr := r.Header.Get("X-Correlation-ID")
 		if len(kv) == 2 && corr != kv[1] {

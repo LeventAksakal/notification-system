@@ -10,8 +10,8 @@ import (
 
 	"github.com/valkey-io/valkey-go"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
 	"github.com/LeventAksakal/notification-system/internal/intake"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/realtime"
 	"github.com/LeventAksakal/notification-system/internal/realtime/realtimetest"
 	"github.com/LeventAksakal/notification-system/test/support"
@@ -31,10 +31,10 @@ func TestCreateAnswersPromptlyWithValkeyDown(t *testing.T) {
 	proxy.Close()
 
 	batch := func() []intake.Request {
-		rs := make([]intake.Request, core.MaxBatchSize)
+		rs := make([]intake.Request, notification.MaxBatchSize)
 		for i := range rs {
 			c := "outage " + strconv.Itoa(i)
-			rs[i] = intake.Request{To: "+905551234567", Channel: core.ChannelSMS, Content: &c}
+			rs[i] = intake.Request{To: "+905551234567", Channel: notification.ChannelSMS, Content: &c}
 		}
 		return rs
 	}
@@ -63,19 +63,19 @@ func TestCreateAnswersPromptlyWithValkeyDown(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Logf("%d-item batch with Valkey down: %s", core.MaxBatchSize, took)
+			t.Logf("%d-item batch with Valkey down: %s", notification.MaxBatchSize, took)
 			if took > 3*time.Second {
 				t.Errorf("batch took %s with Valkey down, want < 3s", took)
 			}
-			if n := count(`SELECT COUNT(*) FROM notifications WHERE batch_id = ?`, b.ID); n != core.MaxBatchSize {
-				t.Errorf("rows of the batch: want %d, got %d", core.MaxBatchSize, n)
+			if n := count(`SELECT COUNT(*) FROM notifications WHERE batch_id = ?`, b.ID); n != notification.MaxBatchSize {
+				t.Errorf("rows of the batch: want %d, got %d", notification.MaxBatchSize, n)
 			}
 		})
 	}
 	t.Run("single create", func(t *testing.T) {
 		c := "outage single"
 		start := time.Now()
-		n, _, err := svc.Create(t.Context(), intake.Request{To: "+905551234567", Channel: core.ChannelSMS, Content: &c}, intake.Meta{CorrelationID: "c"})
+		n, _, err := svc.Create(t.Context(), intake.Request{To: "+905551234567", Channel: notification.ChannelSMS, Content: &c}, intake.Meta{CorrelationID: "c"})
 		if err != nil {
 			t.Fatal(err)
 		}

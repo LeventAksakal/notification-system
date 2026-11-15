@@ -30,14 +30,14 @@ func TestDecide(t *testing.T) {
 		{"coordinator edits app code", edit("", "internal/sender/send.go"), true, ""},
 		{"coordinator edits a contract", edit("", "api/openapi.yaml"), true, ""},
 		{"coordinator cannot hand-edit sqlc output", edit("", "internal/store/sqlc/query.sql.go"), false, "go generate"},
-		{"nobody hand-edits *.gen.go", edit("implementer", "internal/api/server.gen.go"), false, "generated"},
+		{"nobody hand-edits *.gen.go", edit("implementer", "internal/httpapi/server.gen.go"), false, "generated"},
 		{"generated migrations", edit("", "migrations/20261110_init.sql"), false, "generated"},
 
 		{"implementer writes app code", edit("implementer", "internal/sender/send.go"), true, ""},
 		{"implementer writes unit tests", edit("implementer", "internal/sender/send_test.go"), true, ""},
 		{"implementer cannot touch the judge", edit("implementer", "test/acceptance/send_once_test.go"), false, "may not write"},
 		{"implementer cannot change a contract", edit("implementer", "schema/messages.sql"), false, "frozen contract"},
-		{"implementer cannot change the core types", edit("implementer", "internal/core/types.go"), false, "frozen contract"},
+		{"implementer cannot change the core types", edit("implementer", "internal/notification/types.go"), false, "frozen contract"},
 		{"implementer cannot edit the guard", edit("implementer", "tools/agentguard/main.go"), false, "may not write"},
 		{"implementer cannot edit decision records", edit("implementer", "docs/decisions/0001-record-decisions-as-adrs.md"), false, "may not write"},
 		{"implementer writes an owner item", edit("implementer", ".agents/owner-items/0001-limit.md"), true, ""},
@@ -87,8 +87,8 @@ func TestGlob(t *testing.T) {
 		want       bool
 	}{
 		{"**/*.gen.go", "a.gen.go", true},
-		{"**/*.gen.go", "internal/api/server.gen.go", true},
-		{"**/*.gen.go", "internal/api/server.go", false},
+		{"**/*.gen.go", "internal/httpapi/server.gen.go", true},
+		{"**/*.gen.go", "internal/httpapi/server.go", false},
 		{"test/acceptance/**", "test/acceptance/x/y_test.go", true},
 		{"test/acceptance/**", "test/unit/y_test.go", false},
 		{"internal/*.go", "internal/a/b.go", false},

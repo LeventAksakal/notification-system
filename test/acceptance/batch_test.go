@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 func batchItems(n int) []map[string]any {
@@ -29,12 +29,12 @@ func TestR2BatchCreate(t *testing.T) {
 
 	// 1000 accepted in one request. Not a subtest: unless this works, the
 	// refusals below prove nothing (the spec validator alone refuses 1001).
-	b := s.createBatch(t, batchItems(core.MaxBatchSize))
-	if b.ID == "" || b.Total != core.MaxBatchSize || len(b.NotificationIDs) != core.MaxBatchSize {
+	b := s.createBatch(t, batchItems(notification.MaxBatchSize))
+	if b.ID == "" || b.Total != notification.MaxBatchSize || len(b.NotificationIDs) != notification.MaxBatchSize {
 		t.Fatalf("batch: id=%q total=%d ids=%d", b.ID, b.Total, len(b.NotificationIDs))
 	}
-	if n := s.count(t, "SELECT COUNT(*) FROM notifications WHERE batch_id = ?", b.ID); n != core.MaxBatchSize {
-		t.Errorf("rows of the batch: want %d, got %d", core.MaxBatchSize, n)
+	if n := s.count(t, "SELECT COUNT(*) FROM notifications WHERE batch_id = ?", b.ID); n != notification.MaxBatchSize {
+		t.Errorf("rows of the batch: want %d, got %d", notification.MaxBatchSize, n)
 	}
 	if n := s.count(t, "SELECT COUNT(*) FROM batches"); n != 1 {
 		t.Errorf("batch rows: want 1, got %d", n)
@@ -43,14 +43,14 @@ func TestR2BatchCreate(t *testing.T) {
 	for _, id := range b.NotificationIDs {
 		uniq[id] = true
 	}
-	if len(uniq) != core.MaxBatchSize {
-		t.Errorf("notificationIds: want %d distinct, got %d", core.MaxBatchSize, len(uniq))
+	if len(uniq) != notification.MaxBatchSize {
+		t.Errorf("notificationIds: want %d distinct, got %d", notification.MaxBatchSize, len(uniq))
 	}
 
 	before := s.count(t, "SELECT COUNT(*) FROM notifications")
 
 	t.Run("1001 refused", func(t *testing.T) {
-		r := s.postJSON(t, "/v1/notifications/batch", map[string]any{"notifications": batchItems(core.MaxBatchSize + 1)})
+		r := s.postJSON(t, "/v1/notifications/batch", map[string]any{"notifications": batchItems(notification.MaxBatchSize + 1)})
 		wantError(t, r, http.StatusBadRequest, "invalid_request", "notifications")
 		if n := s.count(t, "SELECT COUNT(*) FROM notifications"); n != before {
 			t.Errorf("rows after a refused batch: want %d, got %d", before, n)
@@ -58,7 +58,7 @@ func TestR2BatchCreate(t *testing.T) {
 	})
 
 	t.Run("999 valid plus 1 invalid stores nothing and names index and field", func(t *testing.T) {
-		items := batchItems(core.MaxBatchSize)
+		items := batchItems(notification.MaxBatchSize)
 		const bad = 500
 		items[bad] = map[string]any{"to": "not-a-phone-number", "channel": "sms", "content": "x"}
 		r := s.postJSON(t, "/v1/notifications/batch", map[string]any{"notifications": items})

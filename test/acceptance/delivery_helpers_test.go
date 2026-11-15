@@ -56,7 +56,7 @@ var dlRateFloorOverride float64
 // whole run on it rather than silently keeping or dropping the floors.
 func dlReadRateFloor() (float64, error) {
 	// A knob of the test run itself (how starved the runner is), not a
-	// setting of the service, so it is not read through internal/config.
+	// setting of the service, so it is not read through config.
 	raw, ok := os.LookupEnv(dlRateFloorEnv) //nolint:forbidigo // test-run knob, not a service setting
 	if !ok {
 		return 0, nil
@@ -121,10 +121,10 @@ func (a dlAttempt) String() string {
 // dlNotification is the Notification schema with the delivery fields the
 // intake helpers do not decode.
 type dlNotification struct {
-	notification
+	apiNotification
 	ProviderMessageID string      `json:"providerMessageId"`
 	FinishedAt        *time.Time  `json:"finishedAt"`
-	History           []dlAttempt `json:"deliveryAttempts"` // shadows notification.DeliveryAttempts
+	History           []dlAttempt `json:"deliveryAttempts"` // shadows apiNotification.DeliveryAttempts
 }
 
 // dlGet fetches one notification with its attempt history; requires 200.

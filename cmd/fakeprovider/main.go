@@ -1,6 +1,6 @@
 // Command fakeprovider serves the provider double for the compose stack and
 // manual runs. It is a test tool, not part of the service, so it reads its two
-// settings itself instead of through internal/config:
+// settings itself instead of through config:
 //
 //	PROVIDER_ADDR    listen address (default :8090)
 //	PROVIDER_DEDUPE  true|false, Idempotency-Key dedupe at start (default true)

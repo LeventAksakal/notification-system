@@ -12,7 +12,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // lockDB is a database/sql driver that answers every statement with one
@@ -81,21 +81,23 @@ func newLockQueue(t *testing.T, failOn string, fails int) (*Queue, *lockDB) {
 	return NewQueue(db), d
 }
 
-func lockJob() (core.Job, core.Attempt) {
-	return core.Job{ID: "01J00000000000000000000000", Channel: core.ChannelSMS, ClaimVersion: 3, Attempts: 0},
-		core.Attempt{Outcome: core.OutcomeAccepted, StartedAt: time.Now(), ProviderMessageID: "p-1"}
+func lockJob() (notification.Job, notification.Attempt) {
+	return notification.Job{ID: "01J00000000000000000000000", Channel: notification.ChannelSMS, ClaimVersion: 3, Attempts: 0},
+		notification.Attempt{Outcome: notification.OutcomeAccepted, StartedAt: time.Now(), ProviderMessageID: "p-1"}
 }
 
 // TestQueueWritesRetryALockConflict: every result write and Release runs its
 // whole transaction again after a deadlock and then succeeds.
 func TestQueueWritesRetryALockConflict(t *testing.T) {
-	writes := map[string]func(*Queue, core.Job, core.Attempt) error{
-		"MarkSent": func(q *Queue, j core.Job, a core.Attempt) error { return q.MarkSent(context.Background(), j, a) },
-		"Reschedule": func(q *Queue, j core.Job, a core.Attempt) error {
+	writes := map[string]func(*Queue, notification.Job, notification.Attempt) error{
+		"MarkSent": func(q *Queue, j notification.Job, a notification.Attempt) error {
+			return q.MarkSent(context.Background(), j, a)
+		},
+		"Reschedule": func(q *Queue, j notification.Job, a notification.Attempt) error {
 			return q.Reschedule(context.Background(), j, a, time.Now().Add(time.Second))
 		},
-		"MarkFailed": func(q *Queue, j core.Job, a core.Attempt) error {
-			return q.MarkFailed(context.Background(), j, a, core.FailurePermanent)
+		"MarkFailed": func(q *Queue, j notification.Job, a notification.Attempt) error {
+			return q.MarkFailed(context.Background(), j, a, notification.FailurePermanent)
 		},
 	}
 	for name, write := range writes {
@@ -152,7 +154,7 @@ func TestQueueWritesGiveUpAfterBoundedRetries(t *testing.T) {
 	q, d := newLockQueue(t, "UPDATE", -1)
 	j, a := lockJob()
 	err := q.MarkSent(context.Background(), j, a)
-	if !IsLockConflict(err) || errors.Is(err, core.ErrLeaseLost) {
+	if !IsLockConflict(err) || errors.Is(err, notification.ErrLeaseLost) {
 		t.Fatalf("MarkSent under a lasting deadlock: %v, want the lock conflict", err)
 	}
 	if d.execs["UPDATE notifications"] != lockRetries || d.commits != 0 || d.rollbacks != lockRetries {

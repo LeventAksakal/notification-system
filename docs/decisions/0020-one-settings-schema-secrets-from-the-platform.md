@@ -7,7 +7,7 @@ revisit: when a second service or a shared development secret (a real provider k
 # One settings schema in code; secret values come from the platform, never from the repository (0020)
 
 ## Rule
-Every setting and secret of the service is declared once in `internal/config` (name, type, default, bounds, doc, secret or not). Every environment (local, test, stage, production) supplies values against that one shape; the binary refuses to start, and `app env check` refuses to pass, when the environment does not fit. A secret has no default and is supplied at run time by whatever manages secrets where the service runs, as an environment variable or as a mounted file (`<NAME>_FILE`). No secret value is committed, encrypted or not.
+Every setting and secret of the service is declared once in `config` (name, type, default, bounds, doc, secret or not). Every environment (local, test, stage, production) supplies values against that one shape; the binary refuses to start, and `app env check` refuses to pass, when the environment does not fit. A secret has no default and is supplied at run time by whatever manages secrets where the service runs, as an environment variable or as a mounted file (`<NAME>_FILE`). No secret value is committed, encrypted or not.
 
 ## Context
 The repository had a hand-kept `.env.example` beside the schema in code: two shapes that drift. The owner asked for one shape that every environment abides by and an idiomatic way to manage secrets (14 Nov 2026).
@@ -21,4 +21,4 @@ The repository had a hand-kept `.env.example` beside the schema in code: two sha
 Option 1. The local compose stack keeps working with no setup: its MySQL passwords are development-only fallbacks in `docker-compose.yml`, overridable from the environment. Revisit option 2 when local development needs a secret that is real (a provider sandbox key shared by the team).
 
 ## Confirmation
-`go test ./internal/config`: every setting has a default or is required, bounds and a doc line; a secret is read from `<NAME>` or `<NAME>_FILE`, never both; `app env check` reports an unknown `APP_` variable and never prints a secret's value. `TestReadmeNamesEverySetting`: the README table and the schema agree.
+`go test ./config`: every setting has a default or is required, bounds and a doc line; a secret is read from `<NAME>` or `<NAME>_FILE`, never both; `app env check` reports an unknown `APP_` variable and never prints a secret's value. `TestReadmeNamesEverySetting`: the README table and the schema agree.

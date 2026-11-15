@@ -32,7 +32,7 @@ linters:
     forbidigo:
       forbid:
         - pattern: ^os\.(Getenv|LookupEnv|Environ)$
-          msg: read settings through internal/config so every dial has a default, bounds and a doc
+          msg: read settings through config so every dial has a default, bounds and a doc
         - pattern: ^fmt\.Print
           msg: log with slog so lines carry the trace id
   exclusions:
@@ -45,7 +45,7 @@ linters:
         text: os\.Getenv
       # The provider double is a separate test tool with two settings of its
       # own (PROVIDER_ADDR, PROVIDER_DEDUPE), not the service, so it reads
-      # them itself instead of through internal/config.
+      # them itself instead of through config.
       - path: ^cmd/fakeprovider/main\.go$
         linters: [forbidigo]
         text: os\.LookupEnv

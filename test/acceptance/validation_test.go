@@ -14,7 +14,7 @@ import (
 
 	"github.com/getkin/kin-openapi/openapi3"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // emailOfLen returns a syntactically plausible address of exactly n characters (n >= 70).
@@ -30,8 +30,8 @@ func emailOfLen(n int) string {
 func TestR10ContentLimitsPerChannel(t *testing.T) {
 	s := startStack(t, stackOptions{})
 
-	for _, ch := range core.Channels {
-		limit := core.MaxContentLenFor(ch)
+	for _, ch := range notification.Channels {
+		limit := notification.MaxContentLenFor(ch)
 		t.Run(string(ch), func(t *testing.T) {
 			// Multi-byte characters: the limit counts characters, not bytes.
 			at := strings.Repeat("é", limit)
@@ -54,7 +54,7 @@ func TestR10RequiredAndMalformedFields(t *testing.T) {
 
 	t.Run("email to at 254 characters accepted", func(t *testing.T) {
 		body := msg("email", "hi")
-		body["to"] = emailOfLen(core.MaxEmailRecipientLen)
+		body["to"] = emailOfLen(notification.MaxEmailRecipientLen)
 		s.create(t, body)
 	})
 
@@ -71,8 +71,8 @@ func TestR10RequiredAndMalformedFields(t *testing.T) {
 		{"empty content", map[string]any{"to": smsTo, "channel": "sms", "content": ""}, "content"},
 		{"sms to not E.164", map[string]any{"to": "05551234567", "channel": "sms", "content": "x"}, "to"},
 		{"sms to too short", map[string]any{"to": "+123456", "channel": "sms", "content": "x"}, "to"},
-		{"email to over 254 characters", map[string]any{"to": emailOfLen(core.MaxEmailRecipientLen + 1), "channel": "email", "content": "x"}, "to"},
-		{"push to over 255 characters", map[string]any{"to": strings.Repeat("t", core.MaxRecipientLen+1), "channel": "push", "content": "x"}, "to"},
+		{"email to over 254 characters", map[string]any{"to": emailOfLen(notification.MaxEmailRecipientLen + 1), "channel": "email", "content": "x"}, "to"},
+		{"push to over 255 characters", map[string]any{"to": strings.Repeat("t", notification.MaxRecipientLen+1), "channel": "push", "content": "x"}, "to"},
 		{"unknown channel", map[string]any{"to": smsTo, "channel": "fax", "content": "x"}, "channel"},
 		{"unknown priority", map[string]any{"to": smsTo, "channel": "sms", "content": "x", "priority": "urgent"}, "priority"},
 	}
@@ -119,7 +119,7 @@ func TestR10MalformedParametersRefusedWithErrorBody(t *testing.T) {
 	}
 }
 
-// R10 / decision 0017: the same limit holds in the API spec and in core.
+// R10 / decision 0017: the same limit holds in the API spec and in internal/notification.
 func TestR10LimitsAgreeSpecAndCore(t *testing.T) {
 	loader := openapi3.NewLoader()
 	doc, err := loader.LoadFromFile(filepath.Join(repoRoot, "api", "openapi.yaml"))
@@ -163,14 +163,14 @@ func TestR10LimitsAgreeSpecAndCore(t *testing.T) {
 		what      string
 		spec, cor int
 	}{
-		{"BatchCreate.notifications maxItems", u(prop(schema("BatchCreate"), "notifications").MaxItems), core.MaxBatchSize},
-		{"NotificationCreate.content maxLength", u(prop(create, "content").MaxLength), core.MaxContentLen},
-		{"NotificationCreate.to maxLength", u(prop(create, "to").MaxLength), core.MaxRecipientLen},
-		{"TemplateWrite.body maxLength", u(prop(schema("TemplateWrite"), "body").MaxLength), core.MaxTemplateBodyLen},
-		{"TemplateName maxLength", u(schema("TemplateName").MaxLength), core.MaxTemplateNameLen},
-		{"TemplateRef.variables maxProperties", u(prop(tref, "variables").MaxProps), core.MaxTemplateVariables},
-		{"IdempotencyKey maxLength", u(param("IdempotencyKey").MaxLength), core.MaxIdempotencyKeyLen},
-		{"CorrelationId maxLength", u(param("CorrelationId").MaxLength), core.MaxCorrelationIDLen},
+		{"BatchCreate.notifications maxItems", u(prop(schema("BatchCreate"), "notifications").MaxItems), notification.MaxBatchSize},
+		{"NotificationCreate.content maxLength", u(prop(create, "content").MaxLength), notification.MaxContentLen},
+		{"NotificationCreate.to maxLength", u(prop(create, "to").MaxLength), notification.MaxRecipientLen},
+		{"TemplateWrite.body maxLength", u(prop(schema("TemplateWrite"), "body").MaxLength), notification.MaxTemplateBodyLen},
+		{"TemplateName maxLength", u(schema("TemplateName").MaxLength), notification.MaxTemplateNameLen},
+		{"TemplateRef.variables maxProperties", u(prop(tref, "variables").MaxProps), notification.MaxTemplateVariables},
+		{"IdempotencyKey maxLength", u(param("IdempotencyKey").MaxLength), notification.MaxIdempotencyKeyLen},
+		{"CorrelationId maxLength", u(param("CorrelationId").MaxLength), notification.MaxCorrelationIDLen},
 	}
 	if ap := prop(tref, "variables").AdditionalProperties.Schema; ap == nil || ap.Value == nil {
 		t.Error("TemplateRef.variables has no value schema")
@@ -178,16 +178,16 @@ func TestR10LimitsAgreeSpecAndCore(t *testing.T) {
 		checks = append(checks, struct {
 			what      string
 			spec, cor int
-		}{"TemplateRef.variables value maxLength", u(ap.Value.MaxLength), core.MaxTemplateVariableLen})
+		}{"TemplateRef.variables value maxLength", u(ap.Value.MaxLength), notification.MaxTemplateVariableLen})
 	}
-	if mx := param("Limit").Max; mx == nil || int(*mx) != core.MaxPageSize {
-		t.Errorf("Limit maximum: spec %v, core %d", mx, core.MaxPageSize)
+	if mx := param("Limit").Max; mx == nil || int(*mx) != notification.MaxPageSize {
+		t.Errorf("Limit maximum: spec %v, core %d", mx, notification.MaxPageSize)
 	}
-	if df, ok := param("Limit").Default.(float64); !ok || int(df) != core.DefaultPageSize {
-		t.Errorf("Limit default: spec %v, core %d", param("Limit").Default, core.DefaultPageSize)
+	if df, ok := param("Limit").Default.(float64); !ok || int(df) != notification.DefaultPageSize {
+		t.Errorf("Limit default: spec %v, core %d", param("Limit").Default, notification.DefaultPageSize)
 	}
-	if p := schema("TemplateName").Pattern; p != core.TemplateNamePattern {
-		t.Errorf("TemplateName pattern: spec %q, core %q", p, core.TemplateNamePattern)
+	if p := schema("TemplateName").Pattern; p != notification.TemplateNamePattern {
+		t.Errorf("TemplateName pattern: spec %q, core %q", p, notification.TemplateNamePattern)
 	}
 	for _, c := range checks {
 		if c.spec != c.cor {
@@ -215,8 +215,8 @@ func TestR10LimitsAgreeDatabaseAndCore(t *testing.T) {
 		accept            bool
 	}
 	var rows []row
-	for _, ch := range core.Channels {
-		limit := core.MaxContentLenFor(ch)
+	for _, ch := range notification.Channels {
+		limit := notification.MaxContentLenFor(ch)
 		rows = append(rows,
 			row{string(ch) + " content at limit", string(ch), recipientFor(string(ch)), strings.Repeat("é", limit), true},
 			row{string(ch) + " content past limit", string(ch), recipientFor(string(ch)), strings.Repeat("é", limit+1), false},
@@ -224,10 +224,10 @@ func TestR10LimitsAgreeDatabaseAndCore(t *testing.T) {
 		)
 	}
 	rows = append(rows,
-		row{"email to at 254", "email", emailOfLen(core.MaxEmailRecipientLen), "x", true},
-		row{"email to at 255", "email", emailOfLen(core.MaxEmailRecipientLen + 1), "x", false},
-		row{"push to at 255", "push", strings.Repeat("t", core.MaxRecipientLen), "x", true},
-		row{"push to at 256", "push", strings.Repeat("t", core.MaxRecipientLen+1), "x", false},
+		row{"email to at 254", "email", emailOfLen(notification.MaxEmailRecipientLen), "x", true},
+		row{"email to at 255", "email", emailOfLen(notification.MaxEmailRecipientLen + 1), "x", false},
+		row{"push to at 255", "push", strings.Repeat("t", notification.MaxRecipientLen), "x", true},
+		row{"push to at 256", "push", strings.Repeat("t", notification.MaxRecipientLen+1), "x", false},
 		row{"push to empty", "push", "", "x", false},
 		row{"sms to E.164", "sms", "+1234567", "x", true},
 		row{"sms to not E.164", "sms", "1234567", "x", false},
@@ -246,25 +246,25 @@ func TestR10LimitsAgreeDatabaseAndCore(t *testing.T) {
 		_, err := s.DB.ExecContext(ctx, `INSERT INTO batches (id, total, correlation_id) VALUES (?, ?, 'limits-test')`, newUUID(), total)
 		return err
 	}
-	if err := batch(core.MaxBatchSize); err != nil {
-		t.Errorf("batch of %d refused by the database: %v", core.MaxBatchSize, err)
+	if err := batch(notification.MaxBatchSize); err != nil {
+		t.Errorf("batch of %d refused by the database: %v", notification.MaxBatchSize, err)
 	}
-	if err := batch(core.MaxBatchSize + 1); err == nil {
-		t.Errorf("batch of %d accepted by the database", core.MaxBatchSize+1)
+	if err := batch(notification.MaxBatchSize + 1); err == nil {
+		t.Errorf("batch of %d accepted by the database", notification.MaxBatchSize+1)
 	}
 
 	tmpl := func(name, body string) error {
 		_, err := s.DB.ExecContext(ctx, `INSERT INTO templates (name, body) VALUES (?, ?)`, name, body)
 		return err
 	}
-	if err := tmpl(strings.Repeat("n", core.MaxTemplateNameLen), strings.Repeat("é", core.MaxTemplateBodyLen)); err != nil {
+	if err := tmpl(strings.Repeat("n", notification.MaxTemplateNameLen), strings.Repeat("é", notification.MaxTemplateBodyLen)); err != nil {
 		t.Errorf("template at both limits refused by the database: %v", err)
 	}
-	if err := tmpl(strings.Repeat("m", core.MaxTemplateNameLen+1), "x"); err == nil {
-		t.Errorf("template name of %d characters accepted by the database", core.MaxTemplateNameLen+1)
+	if err := tmpl(strings.Repeat("m", notification.MaxTemplateNameLen+1), "x"); err == nil {
+		t.Errorf("template name of %d characters accepted by the database", notification.MaxTemplateNameLen+1)
 	}
-	if err := tmpl("too-long-body", strings.Repeat("é", core.MaxTemplateBodyLen+1)); err == nil {
-		t.Errorf("template body of %d characters accepted by the database", core.MaxTemplateBodyLen+1)
+	if err := tmpl("too-long-body", strings.Repeat("é", notification.MaxTemplateBodyLen+1)); err == nil {
+		t.Errorf("template body of %d characters accepted by the database", notification.MaxTemplateBodyLen+1)
 	}
 	if err := tmpl("Bad Name", "x"); err == nil {
 		t.Error("template name outside the pattern accepted by the database")

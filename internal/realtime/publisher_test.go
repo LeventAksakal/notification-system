@@ -16,7 +16,7 @@ import (
 	"github.com/valkey-io/valkey-go"
 	"go.uber.org/goleak"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // How the fake server answers PUBLISH.
@@ -184,8 +184,8 @@ func newTestPublisher(t *testing.T, f *fakeValkey) *Publisher {
 	return p
 }
 
-func event(i int) core.Event {
-	return core.Event{NotificationID: fmt.Sprintf("n%d", i), Status: core.StatusProcessing, At: time.Now()}
+func event(i int) notification.Event {
+	return notification.Event{NotificationID: fmt.Sprintf("n%d", i), Status: notification.StatusProcessing, At: time.Now()}
 }
 
 func TestPublisherErrorReplyDoesNotHoldOffTheNextPublish(t *testing.T) {
@@ -248,7 +248,7 @@ func TestPublisherLargeBatchToAHungServerReturnsWithinOneDeadline(t *testing.T) 
 	f := newFakeValkey(t)
 	p := newTestPublisher(t, f)
 	f.setMode(replyHang)
-	es := make([]core.Event, 1000)
+	es := make([]notification.Event, 1000)
 	for i := range es {
 		es[i] = event(i)
 	}

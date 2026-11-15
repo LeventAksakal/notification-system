@@ -293,7 +293,7 @@ func TestGapOutageBatchAcceptedPromptlyWithValkeyDown(t *testing.T) {
 
 			r, took = s.timedDo(t, http.MethodPost, "/v1/notifications", msg("sms", "outage single"), 30*time.Second)
 			within(t, "POST /v1/notifications", r, took, http.StatusCreated, 5*time.Second)
-			var n notification
+			var n apiNotification
 			r.decode(t, &n)
 			if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE id = ?", n.ID); got != 1 {
 				t.Fatalf("row of %s: want 1, got %d", n.ID, got)
@@ -316,12 +316,12 @@ func TestGapOutageAPIServesWithValkeyDown(t *testing.T) {
 
 			r, took := s.timedDo(t, http.MethodPost, "/v1/notifications", msg("email", "outage r1"), clientTimeout)
 			within(t, "POST /v1/notifications", r, took, http.StatusCreated, limit)
-			var n notification
+			var n apiNotification
 			r.decode(t, &n)
 
 			r, took = s.timedDo(t, http.MethodGet, "/v1/notifications/"+n.ID, nil, clientTimeout)
 			within(t, "GET /v1/notifications/{id}", r, took, http.StatusOK, limit)
-			var got notification
+			var got apiNotification
 			r.decode(t, &got)
 			if got.ID != n.ID || got.Status != "pending" || got.Channel != "email" || got.To != emailTo {
 				t.Errorf("GET %s: want the pending email just created, got %+v", n.ID, got)

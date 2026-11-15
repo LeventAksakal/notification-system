@@ -13,10 +13,10 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
-	"github.com/LeventAksakal/notification-system/internal/obs"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/store"
 	"github.com/LeventAksakal/notification-system/internal/store/sqlc"
+	"github.com/LeventAksakal/notification-system/internal/telemetry"
 )
 
 // Service is the intake side of the system. It is safe for concurrent use.
@@ -28,12 +28,12 @@ type Service struct {
 	now       func() time.Time
 }
 
-// BatchPublisher is a core.Publisher that also sends many events as one call
+// BatchPublisher is a notification.Publisher that also sends many events as one call
 // with one bounded wait (realtime.Publisher), so a batch's announcement never
 // costs one wait per item.
 type BatchPublisher interface {
-	core.Publisher
-	PublishAll(ctx context.Context, es []core.Event) error
+	notification.Publisher
+	PublishAll(ctx context.Context, es []notification.Event) error
 }
 
 // PublishBudget bounds the time a request spends announcing its changes when
@@ -43,7 +43,7 @@ const PublishBudget = time.Second
 // New returns a Service storing in db and announcing every committed status
 // change through pub. An Idempotency-Key is remembered for retention. A pub
 // without PublishAll is wrapped so a request still waits at most PublishBudget.
-func New(db *sql.DB, pub core.Publisher, retention time.Duration) *Service {
+func New(db *sql.DB, pub notification.Publisher, retention time.Duration) *Service {
 	bp, ok := pub.(BatchPublisher)
 	if !ok {
 		bp = sequential{pub}
@@ -51,11 +51,11 @@ func New(db *sql.DB, pub core.Publisher, retention time.Duration) *Service {
 	return &Service{db: db, q: sqlc.New(db), pub: bp, retention: retention, now: time.Now}
 }
 
-// sequential gives a plain core.Publisher a batch form: one event after the
+// sequential gives a plain notification.Publisher a batch form: one event after the
 // other under one shared deadline, stopping at the first error.
-type sequential struct{ core.Publisher }
+type sequential struct{ notification.Publisher }
 
-func (p sequential) PublishAll(ctx context.Context, es []core.Event) error {
+func (p sequential) PublishAll(ctx context.Context, es []notification.Event) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), PublishBudget)
 	defer cancel()
 	for i, e := range es {
@@ -112,7 +112,7 @@ type Batch struct {
 // Filter narrows a notification list. Status is an API status.
 type Filter struct {
 	Status      string
-	Channel     core.Channel
+	Channel     notification.Channel
 	BatchID     string
 	CreatedFrom *time.Time
 	CreatedTo   *time.Time
@@ -182,7 +182,7 @@ func (s *Service) Create(ctx context.Context, r Request, m Meta) (n Notification
 	if err != nil {
 		return Notification{}, false, err
 	}
-	lctx := obs.WithNotification(ctx, n.ID, n.CorrelationID)
+	lctx := telemetry.WithNotification(ctx, n.ID, n.CorrelationID)
 	slog.InfoContext(lctx, "notification accepted", "channel", a.Channel, "priority", a.Priority, "scheduled", n.Scheduled)
 	s.publish(lctx, n.Notification)
 	return n, false, nil
@@ -191,8 +191,8 @@ func (s *Service) Create(ctx context.Context, r Request, m Meta) (n Notification
 // CreateBatch validates every item, then stores the batch and all of its
 // notifications in one transaction, or nothing (decision 0011).
 func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b BatchCreated, replayed bool, err error) {
-	if len(rs) == 0 || len(rs) > core.MaxBatchSize {
-		return BatchCreated{}, false, invalid("notifications", fmt.Sprintf("must hold 1 to %d notifications", core.MaxBatchSize))
+	if len(rs) == 0 || len(rs) > notification.MaxBatchSize {
+		return BatchCreated{}, false, invalid("notifications", fmt.Sprintf("must hold 1 to %d notifications", notification.MaxBatchSize))
 	}
 	if err := checkIdempotencyKey(m.IdempotencyKey); err != nil {
 		return BatchCreated{}, false, err
@@ -250,10 +250,10 @@ func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b Batc
 	}
 
 	slog.InfoContext(ctx, "batch accepted", "batch_id", b.ID, "total", b.Total)
-	events := make([]core.Event, len(items))
+	events := make([]notification.Event, len(items))
 	for i, it := range items {
-		events[i] = core.Event{
-			NotificationID: it.ID, BatchID: b.ID, Status: core.StatusPending, At: b.CreatedAt, CorrelationID: m.CorrelationID,
+		events[i] = notification.Event{
+			NotificationID: it.ID, BatchID: b.ID, Status: notification.StatusPending, At: b.CreatedAt, CorrelationID: m.CorrelationID,
 		}
 	}
 	// One pipelined publish with one deadline, whatever the batch size.
@@ -326,8 +326,8 @@ func (s *Service) replayed(ctx context.Context, id string) (Notification, bool, 
 	if err != nil {
 		return Notification{}, false, err
 	}
-	slog.InfoContext(obs.WithNotification(ctx, n.ID, n.CorrelationID), "notification create replayed",
-		"request_correlation_id", obs.CorrelationID(ctx))
+	slog.InfoContext(telemetry.WithNotification(ctx, n.ID, n.CorrelationID), "notification create replayed",
+		"request_correlation_id", telemetry.CorrelationID(ctx))
 	return n, true, nil
 }
 
@@ -338,8 +338,8 @@ func checkIdempotencyKey(key string) error {
 	if key == "" {
 		return nil
 	}
-	if len(key) > core.MaxIdempotencyKeyLen {
-		return invalid(idempotencyKeyField, fmt.Sprintf("at most %d characters", core.MaxIdempotencyKeyLen))
+	if len(key) > notification.MaxIdempotencyKeyLen {
+		return invalid(idempotencyKeyField, fmt.Sprintf("at most %d characters", notification.MaxIdempotencyKeyLen))
 	}
 	for i := range len(key) {
 		if key[i] < '!' || key[i] > '~' {
@@ -430,11 +430,11 @@ func (s *Service) List(ctx context.Context, f Filter) (Page, error) {
 	switch f.Status {
 	case "":
 	case "scheduled", "pending":
-		lf.Status = string(core.StatusPending)
+		lf.Status = string(notification.StatusPending)
 		only := f.Status == "scheduled"
 		lf.Scheduled = &only
 	default:
-		if !core.Status(f.Status).Valid() {
+		if !notification.Status(f.Status).Valid() {
 			return Page{}, invalid("status", "unknown status")
 		}
 		lf.Status = f.Status
@@ -463,19 +463,19 @@ func (s *Service) List(ctx context.Context, f Filter) (Page, error) {
 
 // Cancel moves a pending notification to cancelled (decision 0005).
 func (s *Service) Cancel(ctx context.Context, id string) (Notification, error) {
-	return s.transition(ctx, id, core.StatusPending, core.StatusCancelled, s.q.CancelNotification, ErrNotCancellable, "notification cancelled")
+	return s.transition(ctx, id, notification.StatusPending, notification.StatusCancelled, s.q.CancelNotification, ErrNotCancellable, "notification cancelled")
 }
 
 // Retry replays a failed notification: pending again, fresh attempt budget,
 // due now; its attempt history is kept.
 func (s *Service) Retry(ctx context.Context, id string) (Notification, error) {
-	return s.transition(ctx, id, core.StatusFailed, core.StatusPending, s.q.ReplayNotification, ErrNotRetryable, "notification replayed")
+	return s.transition(ctx, id, notification.StatusFailed, notification.StatusPending, s.q.ReplayNotification, ErrNotRetryable, "notification replayed")
 }
 
-func (s *Service) transition(ctx context.Context, id string, from, to core.Status,
+func (s *Service) transition(ctx context.Context, id string, from, to notification.Status,
 	update func(context.Context, string) (int64, error), refused error, msg string,
 ) (Notification, error) {
-	if err := core.Transition(from, to); err != nil {
+	if err := notification.Transition(from, to); err != nil {
 		return Notification{}, err
 	}
 	changed, err := update(ctx, id)
@@ -494,9 +494,9 @@ func (s *Service) transition(ctx context.Context, id string, from, to core.Statu
 	}
 	// Lines about a notification carry its stored correlation id; the
 	// request's own id stays on the access line and is added here.
-	lctx := obs.WithNotification(ctx, id, n.CorrelationID)
-	slog.InfoContext(lctx, msg, "from", from, "to", to, "request_correlation_id", obs.CorrelationID(ctx))
-	s.publishEvent(lctx, core.Event{
+	lctx := telemetry.WithNotification(ctx, id, n.CorrelationID)
+	slog.InfoContext(lctx, msg, "from", from, "to", to, "request_correlation_id", telemetry.CorrelationID(ctx))
+	s.publishEvent(lctx, notification.Event{
 		NotificationID: n.ID, BatchID: n.BatchID.String, Status: to, Attempts: int(n.Attempts),
 		Error: n.LastError.String, At: n.UpdatedAt, CorrelationID: n.CorrelationID,
 	})
@@ -586,14 +586,14 @@ func (s *Service) loadTemplates(ctx context.Context, rs []Request) (map[string]s
 }
 
 func (s *Service) publish(ctx context.Context, n sqlc.Notification) {
-	s.publishEvent(ctx, core.Event{
-		NotificationID: n.ID, BatchID: n.BatchID.String, Status: core.Status(n.Status), Attempts: int(n.Attempts),
+	s.publishEvent(ctx, notification.Event{
+		NotificationID: n.ID, BatchID: n.BatchID.String, Status: notification.Status(n.Status), Attempts: int(n.Attempts),
 		At: n.UpdatedAt, CorrelationID: n.CorrelationID,
 	})
 }
 
 // publishEvent is best effort: an error is logged, never returned.
-func (s *Service) publishEvent(ctx context.Context, e core.Event) {
+func (s *Service) publishEvent(ctx context.Context, e notification.Event) {
 	if err := s.pub.Publish(ctx, e); err != nil {
 		slog.WarnContext(ctx, "publish status change", "status", e.Status, "err", err)
 	}
@@ -605,7 +605,7 @@ func (s *Service) publishEvent(ctx context.Context, e core.Event) {
 func requestHash(kind string, v any) []byte {
 	canon := func(r Request) Request {
 		if r.Priority == "" {
-			r.Priority = core.PriorityNormal
+			r.Priority = notification.PriorityNormal
 		}
 		if r.ScheduledAt != nil {
 			t := r.ScheduledAt.UTC()
@@ -651,9 +651,9 @@ func nullTime(t *time.Time) sql.NullTime {
 func pageSize(limit int) int {
 	switch {
 	case limit <= 0:
-		return core.DefaultPageSize
-	case limit > core.MaxPageSize:
-		return core.MaxPageSize
+		return notification.DefaultPageSize
+	case limit > notification.MaxPageSize:
+		return notification.MaxPageSize
 	}
 	return limit
 }

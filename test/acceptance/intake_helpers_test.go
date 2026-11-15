@@ -13,7 +13,7 @@ import (
 )
 
 // notification is the API's Notification schema.
-type notification struct {
+type apiNotification struct {
 	ID               string            `json:"id"`
 	BatchID          string            `json:"batchId"`
 	To               string            `json:"to"`
@@ -33,8 +33,8 @@ type notification struct {
 }
 
 type notificationPage struct {
-	Items      []notification `json:"items"`
-	NextCursor string         `json:"nextCursor"`
+	Items      []apiNotification `json:"items"`
+	NextCursor string            `json:"nextCursor"`
 }
 
 type batchCreated struct {
@@ -54,12 +54,12 @@ type statusCounts struct {
 }
 
 type batchStatus struct {
-	ID         string         `json:"id"`
-	Total      int            `json:"total"`
-	Counts     statusCounts   `json:"counts"`
-	Items      []notification `json:"items"`
-	NextCursor string         `json:"nextCursor"`
-	CreatedAt  time.Time      `json:"createdAt"`
+	ID         string            `json:"id"`
+	Total      int               `json:"total"`
+	Counts     statusCounts      `json:"counts"`
+	Items      []apiNotification `json:"items"`
+	NextCursor string            `json:"nextCursor"`
+	CreatedAt  time.Time         `json:"createdAt"`
 }
 
 type template struct {
@@ -106,13 +106,13 @@ func msg(channel, content string) map[string]any {
 }
 
 // create posts one notification, requires 201 and returns it.
-func (s *stack) create(t *testing.T, body map[string]any, kv ...string) notification {
+func (s *stack) create(t *testing.T, body map[string]any, kv ...string) apiNotification {
 	t.Helper()
 	r := s.postJSON(t, "/v1/notifications", body, kv...)
 	if r.Status != http.StatusCreated {
 		t.Fatalf("POST /v1/notifications %v: want 201, got %s", body, r)
 	}
-	var n notification
+	var n apiNotification
 	r.decode(t, &n)
 	if n.ID == "" {
 		t.Fatalf("POST /v1/notifications: 201 without an id: %s", r)
@@ -133,25 +133,25 @@ func (s *stack) createBatch(t *testing.T, items []map[string]any, kv ...string) 
 }
 
 // get fetches one notification, requires 200.
-func (s *stack) get(t *testing.T, id string) notification {
+func (s *stack) get(t *testing.T, id string) apiNotification {
 	t.Helper()
 	r := s.getJSON(t, "/v1/notifications/"+id)
 	if r.Status != http.StatusOK {
 		t.Fatalf("GET /v1/notifications/%s: want 200, got %s", id, r)
 	}
-	var n notification
+	var n apiNotification
 	r.decode(t, &n)
 	return n
 }
 
 // cancel cancels one notification, requires 200 and returns it.
-func (s *stack) cancel(t *testing.T, id string) notification {
+func (s *stack) cancel(t *testing.T, id string) apiNotification {
 	t.Helper()
 	r := s.postJSON(t, "/v1/notifications/"+id+"/cancel", nil)
 	if r.Status != http.StatusOK {
 		t.Fatalf("cancel %s: want 200, got %s", id, r)
 	}
-	var n notification
+	var n apiNotification
 	r.decode(t, &n)
 	return n
 }
@@ -215,14 +215,14 @@ func requireIntake(t *testing.T, s *stack) {
 
 // newerFirst reports whether a comes strictly before b in "newest first"
 // order: createdAt descending, then id descending.
-func newerFirst(a, b notification) bool {
+func newerFirst(a, b apiNotification) bool {
 	if !a.CreatedAt.Equal(b.CreatedAt) {
 		return a.CreatedAt.After(b.CreatedAt)
 	}
 	return strings.Compare(a.ID, b.ID) > 0
 }
 
-func ids(ns []notification) []string {
+func ids(ns []apiNotification) []string {
 	out := make([]string, len(ns))
 	for i, n := range ns {
 		out[i] = n.ID

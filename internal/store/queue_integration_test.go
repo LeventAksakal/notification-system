@@ -14,15 +14,15 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/store"
 	"github.com/LeventAksakal/notification-system/test/support"
 )
 
 // insertDue inserts n pending notifications due now.
-func insertDue(t *testing.T, db *sql.DB, n int, ch core.Channel, p core.Priority) []string {
+func insertDue(t *testing.T, db *sql.DB, n int, ch notification.Channel, p notification.Priority) []string {
 	t.Helper()
-	to := map[core.Channel]string{core.ChannelSMS: "+905551234567", core.ChannelEmail: "a@example.com", core.ChannelPush: "device-1"}[ch]
+	to := map[notification.Channel]string{notification.ChannelSMS: "+905551234567", notification.ChannelEmail: "a@example.com", notification.ChannelPush: "device-1"}[ch]
 	ids := make([]string, n)
 	for i := range n {
 		ids[i] = uuid.Must(uuid.NewV7()).String()
@@ -40,8 +40,8 @@ func TestQueue(t *testing.T) {
 	q := store.NewQueue(db)
 
 	t.Run("the claim query uses claim_idx without a sort or a full scan", func(t *testing.T) {
-		insertDue(t, db, 50, core.ChannelPush, core.PriorityLow)
-		insertDue(t, db, 50, core.ChannelPush, core.PriorityHigh)
+		insertDue(t, db, 50, notification.ChannelPush, notification.PriorityLow)
+		insertDue(t, db, 50, notification.ChannelPush, notification.PriorityHigh)
 		rows, err := db.QueryContext(t.Context(), `EXPLAIN SELECT id, batch_id, recipient, content, attempts, claim_version, due_at, correlation_id, traceparent
 			FROM notifications
 			WHERE status = 'pending' AND channel = 'push' AND priority = 'high' AND due_at <= NOW(3)
@@ -82,7 +82,7 @@ func TestQueue(t *testing.T) {
 
 	t.Run("concurrent claimers never get the same row", func(t *testing.T) {
 		const total, claimers = 300, 8
-		want := insertDue(t, db, total, core.ChannelSMS, core.PriorityNormal)
+		want := insertDue(t, db, total, notification.ChannelSMS, notification.PriorityNormal)
 		var mu sync.Mutex
 		seen := map[string]int{}
 		var wg sync.WaitGroup
@@ -90,7 +90,7 @@ func TestQueue(t *testing.T) {
 		for range claimers {
 			wg.Go(func() {
 				for {
-					jobs, err := q.Claim(t.Context(), core.ChannelSMS, core.PriorityNormal, 3, time.Minute)
+					jobs, err := q.Claim(t.Context(), notification.ChannelSMS, notification.PriorityNormal, 3, time.Minute)
 					if err != nil {
 						errs <- err
 						return
@@ -124,25 +124,25 @@ func TestQueue(t *testing.T) {
 	})
 
 	t.Run("results are fenced by claim_version and recorded with the attempt", func(t *testing.T) {
-		ids := insertDue(t, db, 1, core.ChannelEmail, core.PriorityHigh)
-		jobs, err := q.Claim(t.Context(), core.ChannelEmail, core.PriorityHigh, 5, 100*time.Millisecond)
+		ids := insertDue(t, db, 1, notification.ChannelEmail, notification.PriorityHigh)
+		jobs, err := q.Claim(t.Context(), notification.ChannelEmail, notification.PriorityHigh, 5, 100*time.Millisecond)
 		if err != nil || len(jobs) != 1 || jobs[0].ID != ids[0] {
 			t.Fatalf("claim: %v %+v", err, jobs)
 		}
 		stale := jobs[0]
 		waitReaped(t, q, db, stale.ID)
-		again, err := q.Claim(t.Context(), core.ChannelEmail, core.PriorityHigh, 5, time.Minute)
+		again, err := q.Claim(t.Context(), notification.ChannelEmail, notification.PriorityHigh, 5, time.Minute)
 		if err != nil || len(again) != 1 || again[0].ClaimVersion != stale.ClaimVersion+1 {
 			t.Fatalf("reclaim: %v %+v", err, again)
 		}
-		a := core.Attempt{StartedAt: time.Now(), Duration: 12 * time.Millisecond, Outcome: core.OutcomeAccepted, HTTPStatus: 202, ProviderMessageID: "m-1"}
-		if err := q.MarkSent(t.Context(), stale, a); !errors.Is(err, core.ErrLeaseLost) {
+		a := notification.Attempt{StartedAt: time.Now(), Duration: 12 * time.Millisecond, Outcome: notification.OutcomeAccepted, HTTPStatus: 202, ProviderMessageID: "m-1"}
+		if err := q.MarkSent(t.Context(), stale, a); !errors.Is(err, notification.ErrLeaseLost) {
 			t.Fatalf("stale MarkSent: want ErrLeaseLost, got %v", err)
 		}
-		if err := q.Reschedule(t.Context(), again[0], core.Attempt{StartedAt: time.Now(), Outcome: core.OutcomeTransient, HTTPStatus: 503, Error: "HTTP 503"}, time.Now()); err != nil {
+		if err := q.Reschedule(t.Context(), again[0], notification.Attempt{StartedAt: time.Now(), Outcome: notification.OutcomeTransient, HTTPStatus: 503, Error: "HTTP 503"}, time.Now()); err != nil {
 			t.Fatalf("reschedule: %v", err)
 		}
-		third, err := q.Claim(t.Context(), core.ChannelEmail, core.PriorityHigh, 5, time.Minute)
+		third, err := q.Claim(t.Context(), notification.ChannelEmail, notification.PriorityHigh, 5, time.Minute)
 		if err != nil || len(third) != 1 || third[0].Attempts != 1 {
 			t.Fatalf("claim after retry: %v %+v", err, third)
 		}
@@ -163,8 +163,8 @@ func TestQueue(t *testing.T) {
 	})
 
 	t.Run("release returns the row without an attempt", func(t *testing.T) {
-		ids := insertDue(t, db, 1, core.ChannelPush, core.PriorityNormal)
-		jobs, err := q.Claim(t.Context(), core.ChannelPush, core.PriorityNormal, 1, time.Minute)
+		ids := insertDue(t, db, 1, notification.ChannelPush, notification.PriorityNormal)
+		jobs, err := q.Claim(t.Context(), notification.ChannelPush, notification.PriorityNormal, 1, time.Minute)
 		if err != nil || len(jobs) != 1 {
 			t.Fatalf("claim: %v %+v", err, jobs)
 		}

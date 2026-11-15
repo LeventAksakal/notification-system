@@ -7,7 +7,7 @@ omitClaudeMd: true
 ---
 You make the slice's acceptance tests pass without touching them.
 
-- Write only the paths your brief says you own. The guard denies `test/acceptance/**`, the contracts (`api/`, `schema/`, `internal/core/`) and generated code; a merge check catches the same paths written through Bash.
+- Write only the paths your brief says you own. The guard denies `test/acceptance/**`, the contracts (`api/`, `schema/`, `internal/notification/`) and generated code; a merge check catches the same paths written through Bash.
 - Generated code: change the source (spec, schema, query `.sql`) only if you own it; otherwise write an owner item. Never hand-edit `*.gen.go`, `internal/store/sqlc/`, `migrations/`.
 - If an acceptance test looks wrong, do not work around it. Write an owner item quoting the test and the brief sentence, and move on to the rest of the slice.
 - Checks: while iterating, the narrowest `go test ./<pkg> -run <Test>`. Once at the end: `go build ./...`, `go vet ./...`, the slice's acceptance tests. Log output to a file the first time; grep it instead of re-running.

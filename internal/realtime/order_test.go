@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
-func msg(st core.Status, attempts int, origin Origin, at time.Time) Message {
-	return Message{Origin: origin, Event: core.Event{NotificationID: "n1", Status: st, Attempts: attempts, At: at}}
+func msg(st notification.Status, attempts int, origin Origin, at time.Time) Message {
+	return Message{Origin: origin, Event: notification.Event{NotificationID: "n1", Status: st, Attempts: attempts, At: at}}
 }
 
 func labels(ms []Message) []string {
@@ -24,7 +24,7 @@ func labels(ms []Message) []string {
 func TestSequencerRestoresCommitOrderPerNotification(t *testing.T) {
 	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 	ms := func(d int) time.Time { return t0.Add(time.Duration(d) * time.Millisecond) }
-	pending, processing, sent := core.StatusPending, core.StatusProcessing, core.StatusSent
+	pending, processing, sent := notification.StatusPending, notification.StatusProcessing, notification.StatusSent
 	cases := []struct {
 		name string
 		in   []Message
@@ -71,7 +71,7 @@ func (m Message) withError(e string) Message { m.Error = e; return m }
 func TestSequencerHoldsOnlyUntilTheDeadline(t *testing.T) {
 	t0 := time.Now()
 	s := newSequencer(holdFor, rememberFor)
-	if out := s.push(msg(core.StatusProcessing, 0, OriginWorker, t0), t0); len(out) != 0 {
+	if out := s.push(msg(notification.StatusProcessing, 0, OriginWorker, t0), t0); len(out) != 0 {
 		t.Fatalf("delivered before its predecessor: %v", labels(out))
 	}
 	if out := s.expire(t0.Add(holdFor - time.Millisecond)); len(out) != 0 {
@@ -85,10 +85,10 @@ func TestSequencerHoldsOnlyUntilTheDeadline(t *testing.T) {
 func TestSequencerForgetsFinishedAndIdleNotifications(t *testing.T) {
 	t0 := time.Now()
 	s := newSequencer(holdFor, time.Minute)
-	s.push(msg(core.StatusPending, 0, OriginAPI, t0), t0)
-	s.push(Message{Event: core.Event{NotificationID: "n2", Status: core.StatusPending}}, t0)
-	s.push(msg(core.StatusProcessing, 0, OriginWorker, t0), t0)
-	s.push(msg(core.StatusSent, 1, OriginWorker, t0), t0)
+	s.push(msg(notification.StatusPending, 0, OriginAPI, t0), t0)
+	s.push(Message{Event: notification.Event{NotificationID: "n2", Status: notification.StatusPending}}, t0)
+	s.push(msg(notification.StatusProcessing, 0, OriginWorker, t0), t0)
+	s.push(msg(notification.StatusSent, 1, OriginWorker, t0), t0)
 	if _, ok := s.last["n1"]; ok {
 		t.Fatal("a finished notification is still remembered")
 	}
@@ -99,20 +99,22 @@ func TestSequencerForgetsFinishedAndIdleNotifications(t *testing.T) {
 }
 
 func TestCoveredDropsOnlyWhatTheSnapshotAlreadyShows(t *testing.T) {
-	ev := func(st core.Status, a int) core.Event { return core.Event{Status: st, Attempts: a} }
+	ev := func(st notification.Status, a int) notification.Event {
+		return notification.Event{Status: st, Attempts: a}
+	}
 	cases := []struct {
 		name      string
-		snap, evt core.Event
+		snap, evt notification.Event
 		want      bool
 	}{
-		{"the change the snapshot shows", ev(core.StatusPending, 0), ev(core.StatusPending, 0), true},
-		{"an earlier phase", ev(core.StatusProcessing, 0), ev(core.StatusPending, 0), true},
-		{"an earlier attempt", ev(core.StatusSent, 1), ev(core.StatusProcessing, 0), true},
-		{"a reschedule before the next claim", ev(core.StatusProcessing, 1), ev(core.StatusPending, 1), true},
-		{"the next claim", ev(core.StatusPending, 0), ev(core.StatusProcessing, 0), false},
-		{"the result", ev(core.StatusProcessing, 0), ev(core.StatusSent, 1), false},
-		{"a cancel", ev(core.StatusPending, 0), ev(core.StatusCancelled, 0), false},
-		{"a replay after failure", ev(core.StatusFailed, 5), ev(core.StatusPending, 0), false},
+		{"the change the snapshot shows", ev(notification.StatusPending, 0), ev(notification.StatusPending, 0), true},
+		{"an earlier phase", ev(notification.StatusProcessing, 0), ev(notification.StatusPending, 0), true},
+		{"an earlier attempt", ev(notification.StatusSent, 1), ev(notification.StatusProcessing, 0), true},
+		{"a reschedule before the next claim", ev(notification.StatusProcessing, 1), ev(notification.StatusPending, 1), true},
+		{"the next claim", ev(notification.StatusPending, 0), ev(notification.StatusProcessing, 0), false},
+		{"the result", ev(notification.StatusProcessing, 0), ev(notification.StatusSent, 1), false},
+		{"a cancel", ev(notification.StatusPending, 0), ev(notification.StatusCancelled, 0), false},
+		{"a replay after failure", ev(notification.StatusFailed, 5), ev(notification.StatusPending, 0), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -125,25 +127,25 @@ func TestCoveredDropsOnlyWhatTheSnapshotAlreadyShows(t *testing.T) {
 
 func TestSequencerStaysWithinItsCap(t *testing.T) {
 	t0 := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
-	ev := func(id string, st core.Status, origin Origin) Message {
-		return Message{Origin: origin, Event: core.Event{NotificationID: id, Status: st, At: t0}}
+	ev := func(id string, st notification.Status, origin Origin) Message {
+		return Message{Origin: origin, Event: notification.Event{NotificationID: id, Status: st, At: t0}}
 	}
 	id := func(i int) string { return "n" + strconv.Itoa(i) }
 
 	t.Run("the oldest remembered notification is forgotten past the cap", func(t *testing.T) {
 		s := newCappedSequencer(holdFor, rememberFor, 3)
 		for i := range 5 {
-			s.push(ev(id(i), core.StatusPending, OriginAPI), t0.Add(time.Duration(i)*time.Millisecond))
+			s.push(ev(id(i), notification.StatusPending, OriginAPI), t0.Add(time.Duration(i)*time.Millisecond))
 		}
 		if len(s.last) != 3 {
 			t.Fatalf("remembered: want 3, got %d", len(s.last))
 		}
 		// The newest is still known: its claim goes straight out.
-		if out := s.push(ev(id(4), core.StatusProcessing, OriginWorker), t0); len(out) != 1 {
+		if out := s.push(ev(id(4), notification.StatusProcessing, OriginWorker), t0); len(out) != 1 {
 			t.Fatalf("claim of a remembered pending: want it delivered at once, got %v", labels(out))
 		}
 		// The oldest was forgotten: its claim is held, then released.
-		if out := s.push(ev(id(0), core.StatusProcessing, OriginWorker), t0); len(out) != 0 {
+		if out := s.push(ev(id(0), notification.StatusProcessing, OriginWorker), t0); len(out) != 0 {
 			t.Fatalf("claim of a forgotten notification: want it held, got %v", labels(out))
 		}
 		if out := s.expire(t0.Add(holdFor)); !slices.Equal(labels(out), []string{"processing"}) {
@@ -154,11 +156,11 @@ func TestSequencerStaysWithinItsCap(t *testing.T) {
 	t.Run("at the cap of holds a claim is forwarded without hold-back", func(t *testing.T) {
 		s := newCappedSequencer(holdFor, rememberFor, 2)
 		for i := range 2 {
-			if out := s.push(ev(id(i), core.StatusProcessing, OriginWorker), t0); len(out) != 0 {
+			if out := s.push(ev(id(i), notification.StatusProcessing, OriginWorker), t0); len(out) != 0 {
 				t.Fatalf("claim %d: want held, got %v", i, labels(out))
 			}
 		}
-		if out := s.push(ev(id(2), core.StatusProcessing, OriginWorker), t0); !slices.Equal(labels(out), []string{"processing"}) {
+		if out := s.push(ev(id(2), notification.StatusProcessing, OriginWorker), t0); !slices.Equal(labels(out), []string{"processing"}) {
 			t.Fatalf("claim past the cap: want delivered at once, got %v", labels(out))
 		}
 		if len(s.held) != 2 || len(s.last) > 2 {
@@ -169,7 +171,7 @@ func TestSequencerStaysWithinItsCap(t *testing.T) {
 	t.Run("expiry of many notifications leaves nothing behind", func(t *testing.T) {
 		s := newCappedSequencer(holdFor, time.Minute, 1000)
 		for i := range 5000 {
-			s.push(Message{Origin: OriginAPI, Event: core.Event{NotificationID: "x" + strconv.Itoa(i), Status: core.StatusPending}}, t0)
+			s.push(Message{Origin: OriginAPI, Event: notification.Event{NotificationID: "x" + strconv.Itoa(i), Status: notification.StatusPending}}, t0)
 		}
 		if len(s.last) != 1000 || s.lru.Len() != 1000 {
 			t.Fatalf("remembered: map %d, list %d, want 1000 each", len(s.last), s.lru.Len())

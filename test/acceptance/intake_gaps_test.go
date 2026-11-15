@@ -21,19 +21,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // gapWalk walks a filtered list page by page at the given limit. It fails on
 // a page larger than limit or a row seen twice, and returns the rows in the
 // order the pages gave them.
-func (s *stack) gapWalk(t *testing.T, q url.Values, limit int) []notification {
+func (s *stack) gapWalk(t *testing.T, q url.Values, limit int) []apiNotification {
 	t.Helper()
 	q = cloneValues(q)
 	q.Set("limit", strconv.Itoa(limit))
 	seen := map[string]bool{}
-	var out []notification
+	var out []apiNotification
 	for page := 1; ; page++ {
 		if page > 200 {
 			t.Fatalf("%s: pagination does not end", q.Encode())
@@ -57,14 +57,14 @@ func (s *stack) gapWalk(t *testing.T, q url.Values, limit int) []notification {
 }
 
 // gapNewestFirst returns the ids of ns sorted newest first (createdAt desc, id desc).
-func gapNewestFirst(ns []notification) []string {
+func gapNewestFirst(ns []apiNotification) []string {
 	c := slices.Clone(ns)
 	sort.SliceStable(c, func(i, j int) bool { return newerFirst(c[i], c[j]) })
 	return ids(c)
 }
 
-func gapFilter(ns []notification, keep func(notification) bool) []notification {
-	var out []notification
+func gapFilter(ns []apiNotification, keep func(apiNotification) bool) []apiNotification {
+	var out []apiNotification
 	for _, n := range ns {
 		if keep(n) {
 			out = append(out, n)
@@ -82,7 +82,7 @@ func TestGapR6FilterWithCursor(t *testing.T) {
 	// 27 rows: channels rotate sms/email/push; i%5==2 is scheduled 3 h ahead;
 	// i%4==3 (when not scheduled) is cancelled. Expected status per row.
 	chans := []string{"sms", "email", "push"}
-	var all []notification
+	var all []apiNotification
 	want := map[string]string{} // id -> expected API status
 	for i := range 27 {
 		body := msg(chans[i%3], fmt.Sprintf("gap r6 row %d", i))
@@ -100,7 +100,7 @@ func TestGapR6FilterWithCursor(t *testing.T) {
 		want[n.ID] = status
 	}
 
-	check := func(t *testing.T, q url.Values, keep func(notification) bool) {
+	check := func(t *testing.T, q url.Values, keep func(apiNotification) bool) {
 		t.Helper()
 		exp := gapNewestFirst(gapFilter(all, keep))
 		if len(exp) <= 4 {
@@ -113,18 +113,18 @@ func TestGapR6FilterWithCursor(t *testing.T) {
 	}
 
 	t.Run("channel=email", func(t *testing.T) {
-		check(t, url.Values{"channel": {"email"}}, func(n notification) bool { return n.Channel == "email" })
+		check(t, url.Values{"channel": {"email"}}, func(n apiNotification) bool { return n.Channel == "email" })
 	})
 
 	for _, st := range []string{"pending", "scheduled", "cancelled"} {
 		t.Run("status="+st, func(t *testing.T) {
-			check(t, url.Values{"status": {st}}, func(n notification) bool { return want[n.ID] == st })
+			check(t, url.Values{"status": {st}}, func(n apiNotification) bool { return want[n.ID] == st })
 		})
 	}
 
 	t.Run("channel and status together", func(t *testing.T) {
 		// sms rows that are pending: enough for two pages.
-		check(t, url.Values{"channel": {"sms"}, "status": {"pending"}}, func(n notification) bool {
+		check(t, url.Values{"channel": {"sms"}, "status": {"pending"}}, func(n apiNotification) bool {
 			return n.Channel == "sms" && want[n.ID] == "pending"
 		})
 	})
@@ -134,7 +134,7 @@ func TestGapR6FilterWithCursor(t *testing.T) {
 		if !from.Before(to) {
 			t.Fatalf("test setup: createdAt of rows 4 and 22 are not ordered: %s, %s", from, to)
 		}
-		in := func(n notification) bool { return !n.CreatedAt.Before(from) && n.CreatedAt.Before(to) }
+		in := func(n apiNotification) bool { return !n.CreatedAt.Before(from) && n.CreatedAt.Before(to) }
 		q := url.Values{
 			"createdFrom": {from.UTC().Format(time.RFC3339Nano)},
 			"createdTo":   {to.UTC().Format(time.RFC3339Nano)},
@@ -144,7 +144,7 @@ func TestGapR6FilterWithCursor(t *testing.T) {
 		qe := cloneValues(q)
 		qe.Set("channel", "email")
 		// email rows in the window may be few; walk at limit 2 so it still spans pages.
-		exp := gapNewestFirst(gapFilter(all, func(n notification) bool { return in(n) && n.Channel == "email" }))
+		exp := gapNewestFirst(gapFilter(all, func(n apiNotification) bool { return in(n) && n.Channel == "email" }))
 		if got := ids(s.gapWalk(t, qe, 2)); !slices.Equal(got, exp) {
 			t.Errorf("%s at limit 2:\n want %v\n  got %v", qe.Encode(), exp, got)
 		}
@@ -245,7 +245,7 @@ func TestGapR11Idempotency(t *testing.T) {
 		if first.Status != http.StatusCreated {
 			t.Fatalf("first create: want 201, got %s", first)
 		}
-		var orig notification
+		var orig apiNotification
 		first.decode(t, &orig)
 
 		if r := s.do(t, http.MethodDelete, "/v1/templates/gap-r11", nil); r.Status != http.StatusNoContent {
@@ -257,7 +257,7 @@ func TestGapR11Idempotency(t *testing.T) {
 			if r.Status != http.StatusCreated {
 				t.Fatalf("replay %s: want 201 with the first response, got %s", when, r)
 			}
-			var got notification
+			var got apiNotification
 			r.decode(t, &got)
 			if got.ID != orig.ID {
 				t.Errorf("replay %s: id %q, first was %q", when, got.ID, orig.ID)
@@ -339,19 +339,19 @@ func gapEmailBody(t *testing.T, size int) string {
 }
 
 // R10: Content validation (character limits, required fields)
-// (a request body is at most core.MaxRequestBodyBytes, 8 MiB: a larger one is
+// (a request body is at most notification.MaxRequestBodyBytes, 8 MiB: a larger one is
 // 413 request_too_large in the Error shape; a large batch under it is accepted).
 func TestGapR10RequestBodyLimit(t *testing.T) {
 	s := startStack(t, stackOptions{})
 
 	t.Run("one byte over the limit: 413 request_too_large", func(t *testing.T) {
-		single := gapEmailBody(t, core.MaxRequestBodyBytes+1)
+		single := gapEmailBody(t, notification.MaxRequestBodyBytes+1)
 		wantError(t, s.postJSON(t, "/v1/notifications", single), http.StatusRequestEntityTooLarge, "request_too_large")
 
 		// A batch envelope of the same size.
-		inner := gapEmailBody(t, core.MaxRequestBodyBytes+1-len(`{"notifications":[]}`))
+		inner := gapEmailBody(t, notification.MaxRequestBodyBytes+1-len(`{"notifications":[]}`))
 		batch := `{"notifications":[` + inner + `]}`
-		if len(batch) != core.MaxRequestBodyBytes+1 {
+		if len(batch) != notification.MaxRequestBodyBytes+1 {
 			t.Fatalf("test setup: batch body %d bytes", len(batch))
 		}
 		wantError(t, s.postJSON(t, "/v1/notifications/batch", batch), http.StatusRequestEntityTooLarge, "request_too_large")

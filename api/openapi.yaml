@@ -22,7 +22,7 @@ info:
       to the provider.
     - `Idempotency-Key` on a create request stores the request once. A repeat with the same key
       and the same payload returns the first response (same ids) with `Idempotent-Replayed: true`.
-    - Limits (single source: `internal/core/limits.go`): sms `to` is E.164, content 1..1600
+    - Limits (single source: `internal/notification/limits.go`): sms `to` is E.164, content 1..1600
       characters; email `to` is an address of at most 254 characters, content 1..100000; push
       `to` is a device token of 1..255 characters, content 1..1024. Length is counted in
       characters, not bytes. A batch holds 1..1000 notifications. A request body is at most

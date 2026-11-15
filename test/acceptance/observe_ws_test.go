@@ -14,7 +14,7 @@ const wsWait = 60 * time.Second
 
 // wantLifecycle checks that id's events read pending, processing, sent in that
 // order, with non-decreasing `at` and the StatusEvent required fields.
-func wantLifecycle(t *testing.T, evs []statusEvent, n notification) {
+func wantLifecycle(t *testing.T, evs []statusEvent, n apiNotification) {
 	t.Helper()
 	mine := eventsFor(evs, n.ID)
 	if got, want := statuses(mine), []string{"pending", "processing", "sent"}; !slices.Equal(got, want) {

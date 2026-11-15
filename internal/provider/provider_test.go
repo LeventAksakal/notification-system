@@ -13,7 +13,7 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 func TestClassify(t *testing.T) {
@@ -24,29 +24,29 @@ func TestClassify(t *testing.T) {
 		status     int
 		err        error
 		h          http.Header
-		want       core.AttemptOutcome
+		want       notification.AttemptOutcome
 		retryAfter time.Duration
 		fault      bool
 	}{
-		{"202 is accepted", 202, nil, nil, core.OutcomeAccepted, 0, false},
-		{"200 is accepted", 200, nil, nil, core.OutcomeAccepted, 0, false},
-		{"network error is transient", 0, errors.New("connection refused"), nil, core.OutcomeTransient, 0, true},
-		{"timeout is transient", 0, ErrTimeout, nil, core.OutcomeTransient, 0, true},
-		{"408 is transient", 408, nil, nil, core.OutcomeTransient, 0, true},
-		{"425 is transient", 425, nil, nil, core.OutcomeTransient, 0, true},
-		{"429 with seconds", 429, nil, hdr("2"), core.OutcomeTransient, 2 * time.Second, true},
-		{"503 with an HTTP date", 503, nil, hdr(now.Add(90 * time.Second).Format(http.TimeFormat)), core.OutcomeTransient, 90 * time.Second, true},
-		{"503 with a past date waits nothing extra", 503, nil, hdr(now.Add(-time.Minute).Format(http.TimeFormat)), core.OutcomeTransient, 0, true},
-		{"503 with garbage Retry-After", 503, nil, hdr("soon"), core.OutcomeTransient, 0, true},
-		{"500 is transient", 500, nil, nil, core.OutcomeTransient, 0, true},
-		{"599 is transient", 599, nil, nil, core.OutcomeTransient, 0, true},
-		{"huge Retry-After is capped", 429, nil, hdr("99999999999"), core.OutcomeTransient, maxRetryAfter, true},
-		{"400 is permanent", 400, nil, nil, core.OutcomePermanent, 0, false},
-		{"401 is permanent", 401, nil, nil, core.OutcomePermanent, 0, false},
-		{"404 is permanent", 404, nil, nil, core.OutcomePermanent, 0, false},
-		{"422 is permanent", 422, nil, nil, core.OutcomePermanent, 0, false},
-		{"Retry-After on a 400 is ignored", 400, nil, hdr("5"), core.OutcomePermanent, 0, false},
-		{"a redirect is permanent", 302, nil, nil, core.OutcomePermanent, 0, false},
+		{"202 is accepted", 202, nil, nil, notification.OutcomeAccepted, 0, false},
+		{"200 is accepted", 200, nil, nil, notification.OutcomeAccepted, 0, false},
+		{"network error is transient", 0, errors.New("connection refused"), nil, notification.OutcomeTransient, 0, true},
+		{"timeout is transient", 0, ErrTimeout, nil, notification.OutcomeTransient, 0, true},
+		{"408 is transient", 408, nil, nil, notification.OutcomeTransient, 0, true},
+		{"425 is transient", 425, nil, nil, notification.OutcomeTransient, 0, true},
+		{"429 with seconds", 429, nil, hdr("2"), notification.OutcomeTransient, 2 * time.Second, true},
+		{"503 with an HTTP date", 503, nil, hdr(now.Add(90 * time.Second).Format(http.TimeFormat)), notification.OutcomeTransient, 90 * time.Second, true},
+		{"503 with a past date waits nothing extra", 503, nil, hdr(now.Add(-time.Minute).Format(http.TimeFormat)), notification.OutcomeTransient, 0, true},
+		{"503 with garbage Retry-After", 503, nil, hdr("soon"), notification.OutcomeTransient, 0, true},
+		{"500 is transient", 500, nil, nil, notification.OutcomeTransient, 0, true},
+		{"599 is transient", 599, nil, nil, notification.OutcomeTransient, 0, true},
+		{"huge Retry-After is capped", 429, nil, hdr("99999999999"), notification.OutcomeTransient, maxRetryAfter, true},
+		{"400 is permanent", 400, nil, nil, notification.OutcomePermanent, 0, false},
+		{"401 is permanent", 401, nil, nil, notification.OutcomePermanent, 0, false},
+		{"404 is permanent", 404, nil, nil, notification.OutcomePermanent, 0, false},
+		{"422 is permanent", 422, nil, nil, notification.OutcomePermanent, 0, false},
+		{"Retry-After on a 400 is ignored", 400, nil, hdr("5"), notification.OutcomePermanent, 0, false},
+		{"a redirect is permanent", 302, nil, nil, notification.OutcomePermanent, 0, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -54,7 +54,7 @@ func TestClassify(t *testing.T) {
 			if v.Outcome != c.want || v.RetryAfter != c.retryAfter || v.ProviderFault != c.fault {
 				t.Errorf("got %+v, want outcome %s retryAfter %s fault %v", v, c.want, c.retryAfter, c.fault)
 			}
-			if (v.Outcome == core.OutcomeAccepted) != (v.Error == "") {
+			if (v.Outcome == notification.OutcomeAccepted) != (v.Error == "") {
 				t.Errorf("error text %q for outcome %s", v.Error, v.Outcome)
 			}
 		})
@@ -74,12 +74,12 @@ func TestSendWireFormat(t *testing.T) {
 		_, _ = w.Write([]byte(`{"messageId":"m-42","status":"accepted","timestamp":"2026-11-13T12:00:00Z"}`))
 	}))
 	defer srv.Close()
-	c := New(map[core.Channel]string{core.ChannelSMS: srv.URL + "/send"}, time.Second, 4)
+	c := New(map[notification.Channel]string{notification.ChannelSMS: srv.URL + "/send"}, time.Second, 4)
 
 	tid, _ := trace.TraceIDFromHex("0af7651916cd43dd8448eb211c80319c")
 	sid, _ := trace.SpanIDFromHex("b7ad6b7169203331")
 	ctx := trace.ContextWithSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid, TraceFlags: trace.FlagsSampled}))
-	res, err := c.Send(ctx, Message{Channel: core.ChannelSMS, To: "+905551234567", Content: "hi ✓", Key: "id-1", CorrelationID: "corr-1"})
+	res, err := c.Send(ctx, Message{Channel: notification.ChannelSMS, To: "+905551234567", Content: "hi ✓", Key: "id-1", CorrelationID: "corr-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,12 +107,12 @@ func TestSendTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 	defer close(release)
-	c := New(map[core.Channel]string{core.ChannelPush: srv.URL}, 50*time.Millisecond, 1)
-	_, err := c.Send(context.Background(), Message{Channel: core.ChannelPush, Key: "k"})
+	c := New(map[notification.Channel]string{notification.ChannelPush: srv.URL}, 50*time.Millisecond, 1)
+	_, err := c.Send(context.Background(), Message{Channel: notification.ChannelPush, Key: "k"})
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("want ErrTimeout, got %v", err)
 	}
-	if v := Classify(0, err, nil); v.Outcome != core.OutcomeTransient {
+	if v := Classify(0, err, nil); v.Outcome != notification.OutcomeTransient {
 		t.Errorf("timeout classified %s", v.Outcome)
 	}
 }
@@ -134,11 +134,11 @@ func TestSendIsNotReplayedByTheTransport(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	c := New(map[core.Channel]string{core.ChannelEmail: srv.URL}, time.Second, 1)
-	if _, err := c.Send(context.Background(), Message{Channel: core.ChannelEmail, Key: "k"}); err != nil {
+	c := New(map[notification.Channel]string{notification.ChannelEmail: srv.URL}, time.Second, 1)
+	if _, err := c.Send(context.Background(), Message{Channel: notification.ChannelEmail, Key: "k"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Send(context.Background(), Message{Channel: core.ChannelEmail, Key: "k"}); err == nil {
+	if _, err := c.Send(context.Background(), Message{Channel: notification.ChannelEmail, Key: "k"}); err == nil {
 		t.Fatal("second call: want an error, got a response")
 	}
 	if got := n.Load(); got != 2 {

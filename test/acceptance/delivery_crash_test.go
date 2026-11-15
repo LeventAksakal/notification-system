@@ -144,7 +144,7 @@ func TestDeliveryR5CancelRacesClaim(t *testing.T) {
 				results[i].err = fmt.Errorf("create: %v", r)
 				return
 			}
-			var created notification
+			var created apiNotification
 			if err := json.Unmarshal(r.Body, &created); err != nil {
 				results[i].err = err
 				return

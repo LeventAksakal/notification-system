@@ -1,5 +1,5 @@
 -- Desired state. Edit this, then `task migrate:diff -- <name>`; never hand-write migrations/.
--- Limits repeat internal/core/limits.go; a test asserts they agree (decision 0017).
+-- Limits repeat internal/notification/limits.go; a test asserts they agree (decision 0017).
 
 -- One row per accepted batch request (decision 0011).
 CREATE TABLE batches (

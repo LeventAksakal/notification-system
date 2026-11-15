@@ -7,7 +7,7 @@ revisit: when a real provider's limits are known
 # Each content limit is one constant, enforced in the spec, the service and the schema (0017)
 
 ## Rule
-Every limit is declared once in `internal/core/limits.go`. A test fails if the OpenAPI spec, the validator or a database `CHECK` disagrees with it.
+Every limit is declared once in `internal/notification/limits.go`. A test fails if the OpenAPI spec, the validator or a database `CHECK` disagrees with it.
 
 ## Context
 The brief: "content validation (character limits, required fields)". The provider request has three fields: `to`, `channel`, `content`. Limits are per channel and the brief gives no numbers, so they are ours to choose and state.

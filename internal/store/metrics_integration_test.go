@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/core"
+	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/store"
 	"github.com/LeventAksakal/notification-system/test/support"
 )
@@ -42,9 +42,9 @@ func metricsQueries(t *testing.T) map[string]string {
 // scan notifications or delivery_attempts in full.
 func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 	db, _ := support.MySQL(t)
-	for _, ch := range core.Channels {
-		insertListed(t, db, 3, ch, core.StatusPending)
-		insertListed(t, db, 2, ch, core.StatusSent)
+	for _, ch := range notification.Channels {
+		insertListed(t, db, 3, ch, notification.StatusPending)
+		insertListed(t, db, 2, ch, notification.StatusSent)
 	}
 	if _, err := db.ExecContext(t.Context(), `UPDATE notifications SET finished_at = NOW(3) WHERE status = 'sent'`); err != nil {
 		t.Fatal(err)
@@ -119,13 +119,13 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 			t.Fatalf("%s: %v", q, err)
 		}
 	}
-	insertListed(t, db, 2, core.ChannelSMS, core.StatusPending) // due now
-	later := insertListed(t, db, 1, core.ChannelSMS, core.StatusPending)
+	insertListed(t, db, 2, notification.ChannelSMS, notification.StatusPending) // due now
+	later := insertListed(t, db, 1, notification.ChannelSMS, notification.StatusPending)
 	exec(`UPDATE notifications SET due_at = NOW(3) + INTERVAL 1 HOUR WHERE id = ?`, later[0])
-	retry := insertListed(t, db, 1, core.ChannelSMS, core.StatusPending) // backing off: scheduled in the queue, pending in totals
+	retry := insertListed(t, db, 1, notification.ChannelSMS, notification.StatusPending) // backing off: scheduled in the queue, pending in totals
 	exec(`UPDATE notifications SET due_at = NOW(3) + INTERVAL 1 HOUR, attempts = 1 WHERE id = ?`, retry[0])
-	insertListed(t, db, 1, core.ChannelEmail, core.StatusProcessing)
-	sent := insertListed(t, db, 4, core.ChannelPush, core.StatusSent)
+	insertListed(t, db, 1, notification.ChannelEmail, notification.StatusProcessing)
+	sent := insertListed(t, db, 4, notification.ChannelPush, notification.StatusSent)
 	// Latency runs from the first due time: the creation, or the schedule when
 	// later. due_at, moved by retries and releases, does not count.
 	firstDue := []struct{ createdAgoUs, scheduledAgoUs any }{
@@ -141,11 +141,11 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 		exec(`INSERT INTO delivery_attempts (notification_id, attempt_no, channel, started_at, duration_ms, outcome)
 			VALUES (?, 1, 'push', NOW(3), 5, 'accepted')`, id)
 	}
-	failed := insertListed(t, db, 1, core.ChannelEmail, core.StatusFailed)
+	failed := insertListed(t, db, 1, notification.ChannelEmail, notification.StatusFailed)
 	exec(`UPDATE notifications SET finished_at = NOW(3) WHERE id = ?`, failed[0])
 	exec(`INSERT INTO delivery_attempts (notification_id, attempt_no, channel, started_at, duration_ms, outcome)
 		VALUES (?, 1, 'email', NOW(3), 5, 'permanent')`, failed[0])
-	old := insertListed(t, db, 1, core.ChannelEmail, core.StatusSent) // outside the window
+	old := insertListed(t, db, 1, notification.ChannelEmail, notification.StatusSent) // outside the window
 	exec(`UPDATE notifications SET finished_at = NOW(3) - INTERVAL 2 HOUR WHERE id = ?`, old[0])
 
 	m, err := store.NewMetricsReader(db).Read(t.Context(), time.Minute)
@@ -153,9 +153,9 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []store.QueueDepth{
-		{Channel: core.ChannelSMS, Pending: 2, Scheduled: 2},
-		{Channel: core.ChannelEmail, Processing: 1},
-		{Channel: core.ChannelPush},
+		{Channel: notification.ChannelSMS, Pending: 2, Scheduled: 2},
+		{Channel: notification.ChannelEmail, Processing: 1},
+		{Channel: notification.ChannelPush},
 	}
 	for i, q := range m.Queue {
 		age := q.OldestPendingAgeMs
