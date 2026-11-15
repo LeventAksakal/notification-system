@@ -32,3 +32,9 @@ Don't route around the guard. Write the tests you would add to `.agents/pr/<lane
 - AsyncAPI contract for the WebSocket, generated from the Go types: starts after realtime-seq lands.
 - Renaming files by responsibility: after every lane has landed.
 - public-polish: lands last.
+
+## Coordinator follow-ups (for the morning brief)
+- provider-health changed `APP_MAX_ATTEMPTS` from 12 to 10. Outages no longer spend the budget (0026), so 10 is the smallest budget that reaches the 5-minute cap. Tell the owner, since they approved 12 in 0007.
+- After realtime-seq lands, update the R15 row in `docs/REQUIREMENTS.md`: `/readyz` checks MySQL only, and while Valkey is down `/v1/ws` answers 503 and open streams close with 1012.
+- Flaky on a loaded host, to re-run on a quiet one: `TestWorkersAcrossSmallLimiterClockSteps` (also on main under `-race`), and the delivery rate floor `TestWorkersHoldTheRateAtTheProvider`.
+- Realtime commit `46aefb6` doesn't build on its own; squashing covers it.
