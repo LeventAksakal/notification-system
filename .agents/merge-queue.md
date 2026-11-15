@@ -8,6 +8,7 @@ Integration branch: `refs/heads/integration/decision-review`, checked out in `C:
 | 2376699 | Coordinator's walkthrough: no default role, 12 retry attempts plus `RetrySpan`, records 0002 to 0019 |
 | 1b74a74 | wake-hint (0003) |
 | d580c4e | huma-code-first (0004 → 0024): Huma owns the HTTP contract, `task gen` writes `api/openapi.yaml` and `test/apiclient` |
+| 6873097 | provider-health (0008 → 0026): shared outage state; `APP_MAX_ATTEMPTS` 10 |
 
 ## Protocol for every lane
 1. Finish your work and your verifier on your own branch, as briefed. Do not merge other lanes into your branch.
