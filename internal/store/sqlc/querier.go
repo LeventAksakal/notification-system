@@ -78,6 +78,14 @@ type Querier interface {
 	// Stored status counts over the whole table, from list_status_idx alone (an
 	// index scan, no table reads).
 	MetricsStatusCounts(ctx context.Context) ([]MetricsStatusCountsRow, error)
+	// How long until each priority's earliest pending notification of a channel
+	// is due, in microseconds on the database's clock (<= 0: due now), and
+	// whether it has any pending at all. An idle worker asks this instead of
+	// claiming. Each arm is MIN over a constant prefix of claim_idx (status,
+	// channel, priority, due_at): one index dive ("Select tables optimized
+	// away"), whatever the backlog. A GROUP BY priority form reads every pending
+	// entry of the channel instead.
+	NextDue(ctx context.Context, arg NextDueParams) ([]NextDueRow, error)
 	// sqlc needs at least one query; the readiness probe can use it.
 	Ping(ctx context.Context) (int32, error)
 	// Runs inside a READ COMMITTED transaction: the expired leases (lease_idx),

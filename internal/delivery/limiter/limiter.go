@@ -25,17 +25,29 @@ import (
 // window holds at most ceil(1s/interval) of them. There is no slack: a taker
 // that comes late finds the grid restarted, never compressed.
 //
-// KEYS[1] channel key; ARGV[1] interval us; ARGV[2] horizon us; ARGV[3] n.
+// KEYS[1] channel key; ARGV[1] interval us; ARGV[2] horizon us; ARGV[3] n;
+// ARGV[4] keyLinger us.
 // Returns {reserved, us from now to the first slot, us until asking again
 // can reserve something (0 when all n were reserved), now in us since the
-// Unix epoch on Valkey's clock}.
+// Unix epoch on Valkey's clock, us the grid had been free (now minus the
+// stored TAT when that is past, else 0; a missing key counts as free for
+// keyLinger, the least its absence proves)}. The last value is read before the reservation and changes
+// nothing in it.
 const gcra = `
 local interval = tonumber(ARGV[1])
 local horizon = tonumber(ARGV[2])
 local want = tonumber(ARGV[3])
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000000 + tonumber(t[2])
-local tat = tonumber(redis.call('GET', KEYS[1]) or '0')
+local stored = redis.call('GET', KEYS[1])
+local tat = tonumber(stored or '0')
+local linger = tonumber(ARGV[4])
+local idle = linger
+if stored and tat < now then
+  idle = now - tat
+elseif stored then
+  idle = 0
+end
 if tat < now then
   tat = now
 end
@@ -49,16 +61,23 @@ if first <= horizon then
 end
 if n > 0 then
   tat = tat + n * interval
-  redis.call('SET', KEYS[1], string.format('%.0f', tat), 'PX', math.ceil((tat - now) / 1000) + 1000)
+  redis.call('SET', KEYS[1], string.format('%.0f', tat), 'PX', math.ceil((tat - now + linger) / 1000))
 end
 local wait = 0
 if n < want then
   wait = math.max(tat - now - horizon, 0)
 end
-return {n, first, wait, now}
+return {n, first, wait, now, idle}
 `
 
 var script = valkey.NewLuaScript(gcra)
+
+// keyLinger is how long a channel's key outlives its TAT. A missing key so
+// proves only that the grid has been free that long, and that is the
+// Grant.Idle reported for it: a caller comparing Idle with a longer bound
+// (SendAlign plus an interval at a rate under one per second) must not read
+// an expired key as idle enough.
+const keyLinger = time.Second
 
 // Limiter is the Valkey notification.Limiter.
 type Limiter struct {
@@ -95,11 +114,11 @@ func (l *Limiter) Interval() time.Duration { return l.interval }
 func (l *Limiter) Take(ctx context.Context, channel notification.Channel, n int) (notification.Grant, error) {
 	n = max(n, 0)
 	vals, err := script.Exec(ctx, l.client, []string{l.prefix + string(channel)},
-		[]string{fmt.Sprint(l.interval.Microseconds()), fmt.Sprint(l.horizon.Microseconds()), fmt.Sprint(n)}).AsIntSlice()
+		[]string{fmt.Sprint(l.interval.Microseconds()), fmt.Sprint(l.horizon.Microseconds()), fmt.Sprint(n), fmt.Sprint(keyLinger.Microseconds())}).AsIntSlice()
 	if err != nil {
 		return notification.Grant{}, fmt.Errorf("rate limiter: %w", err)
 	}
-	if len(vals) != 4 {
+	if len(vals) != 5 {
 		return notification.Grant{}, fmt.Errorf("rate limiter: unexpected reply %v", vals)
 	}
 	return notification.Grant{
@@ -108,5 +127,6 @@ func (l *Limiter) Take(ctx context.Context, channel notification.Channel, n int)
 		First:    time.Duration(vals[1]) * time.Microsecond,
 		Interval: l.interval,
 		Wait:     time.Duration(vals[2]) * time.Microsecond,
+		Idle:     time.Duration(vals[4]) * time.Microsecond,
 	}, nil
 }

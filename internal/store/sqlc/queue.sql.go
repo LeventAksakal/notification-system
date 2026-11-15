@@ -225,6 +225,57 @@ func (q *Queries) LeaseNotifications(ctx context.Context, arg LeaseNotifications
 	return result.RowsAffected()
 }
 
+const nextDue = `-- name: NextDue :many
+SELECT 'high' AS priority, MIN(h.due_at) IS NOT NULL AS pending, CAST(COALESCE(TIMESTAMPDIFF(MICROSECOND, NOW(3), MIN(h.due_at)), 0) AS SIGNED) AS wait_us
+FROM notifications h WHERE h.status = 'pending' AND h.channel = ? AND h.priority = 'high'
+UNION ALL
+SELECT 'normal', MIN(n.due_at) IS NOT NULL, CAST(COALESCE(TIMESTAMPDIFF(MICROSECOND, NOW(3), MIN(n.due_at)), 0) AS SIGNED)
+FROM notifications n WHERE n.status = 'pending' AND n.channel = ? AND n.priority = 'normal'
+UNION ALL
+SELECT 'low', MIN(l.due_at) IS NOT NULL, CAST(COALESCE(TIMESTAMPDIFF(MICROSECOND, NOW(3), MIN(l.due_at)), 0) AS SIGNED)
+FROM notifications l WHERE l.status = 'pending' AND l.channel = ? AND l.priority = 'low'
+`
+
+type NextDueParams struct {
+	Channel NotificationsChannel
+}
+
+type NextDueRow struct {
+	Priority string
+	Pending  bool
+	WaitUs   int64
+}
+
+// How long until each priority's earliest pending notification of a channel
+// is due, in microseconds on the database's clock (<= 0: due now), and
+// whether it has any pending at all. An idle worker asks this instead of
+// claiming. Each arm is MIN over a constant prefix of claim_idx (status,
+// channel, priority, due_at): one index dive ("Select tables optimized
+// away"), whatever the backlog. A GROUP BY priority form reads every pending
+// entry of the channel instead.
+func (q *Queries) NextDue(ctx context.Context, arg NextDueParams) ([]NextDueRow, error) {
+	rows, err := q.db.QueryContext(ctx, nextDue, arg.Channel, arg.Channel, arg.Channel)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []NextDueRow
+	for rows.Next() {
+		var i NextDueRow
+		if err := rows.Scan(&i.Priority, &i.Pending, &i.WaitUs); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const reapCandidates = `-- name: ReapCandidates :many
 SELECT id, batch_id, channel, attempts, correlation_id
 FROM notifications

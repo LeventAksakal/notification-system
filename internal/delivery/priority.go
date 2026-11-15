@@ -12,24 +12,37 @@ import (
 // the next priority down, then up. A priority found empty is not asked again
 // until its emptyUntil passes, so borrowing costs no extra claim query.
 //
+// A priority found empty sleeps until its next due time, until a wake hint
+// says work arrived, or for at most the safety poll (wake.SafetyPoll). A hint
+// that arrives while a round is in flight (a claim that may have started
+// before the hinted row was committed) survives that round: see beginRound
+// and settle.
+//
 // A selector is guarded by its channel's mutex.
 type selector struct {
 	weights [3]int
 	total   int
 	current [3]int
-	// emptyUntil[i]: priority i had nothing (more) due when last asked.
+	// emptyUntil[i]: priority i had nothing (more) due when last asked, and
+	// is not asked again before this time. Zero: ask it.
 	emptyUntil [3]time.Time
-	// idle[i] is priority i's current idle poll.
-	idle [3]time.Duration
-	// hadRows[i] is when priority i last returned rows.
-	hadRows [3]time.Time
+	// check[i]: emptyUntil[i] is only the safety poll, not a due time or a
+	// hint; when it passes the channel asks Queue.NextDue before it claims.
+	check [3]bool
+	// hintSeq[i] counts the hints received for priority i; hintDue[i] is the
+	// earliest due time among those received since the current round began
+	// (valid while hinted[i]).
+	hintSeq [3]uint64
+	hintDue [3]time.Time
+	hinted  [3]bool
+	// raced[i]: priority i had a row due that its last round did not get
+	// (another claimer held it); its short wait is a busy channel's, not
+	// an idle one's.
+	raced [3]bool
 }
 
-// recentRows is how long after it last returned rows a priority found empty
-// is still asked again after the shortest idle poll: rows released unsent
-// (a missed slot) come back at once, and a long back-off would leave them
-// waiting while the channel's slots go unused.
-const recentRows = time.Second
+// round is the hint state when a round (a claim, or a NextDue read) began.
+type round struct{ seq [3]uint64 }
 
 func newSelector(weights [3]int) *selector {
 	s := &selector{weights: weights}
@@ -93,26 +106,44 @@ func lendOrder(p int) []int {
 
 func (s *selector) empty(i int, now time.Time) bool { return now.Before(s.emptyUntil[i]) }
 
-// markEmpty records at now that priority i had nothing more due; it is
-// skipped for its idle poll: lo while it had rows within recentRows,
-// doubling up to hi while it keeps having none.
-func (s *selector) markEmpty(i int, now time.Time, hadRows bool, lo, hi time.Duration) {
-	if hadRows {
-		s.hadRows[i] = now
-	}
-	switch {
-	case now.Sub(s.hadRows[i]) < recentRows || s.idle[i] < lo:
-		s.idle[i] = lo
-	default:
-		s.idle[i] = min(s.idle[i]*2, hi)
-	}
-	s.emptyUntil[i] = now.Add(s.idle[i])
+// beginRound starts a round that may settle priorities as empty: hints
+// received from now on are kept for its settle. Rounds of one channel never
+// overlap (channelRun.claiming).
+func (s *selector) beginRound() round {
+	s.hinted = [3]bool{}
+	return round{seq: s.hintSeq}
 }
 
-// markBusy records at now that priority i returned every row asked for.
-func (s *selector) markBusy(i int, now time.Time) {
-	s.emptyUntil[i], s.idle[i], s.hadRows[i] = time.Time{}, 0, now
+// settle records that priority i is not asked again before until; check says
+// until is only the safety poll. A hint received since r began wins when it
+// is earlier: the round may not have seen the row it announces.
+func (s *selector) settle(i int, until time.Time, check bool, r round) {
+	s.emptyUntil[i], s.check[i], s.raced[i] = until, check, false
+	if s.hintSeq[i] != r.seq[i] && s.hinted[i] && s.hintDue[i].Before(until) {
+		s.emptyUntil[i], s.check[i] = s.hintDue[i], false
+	}
 }
+
+// hint records that priority i has work due at due: it is asked again by
+// then (at once when due has passed).
+func (s *selector) hint(i int, due time.Time) {
+	s.hintSeq[i]++
+	if !s.hinted[i] || due.Before(s.hintDue[i]) {
+		s.hintDue[i], s.hinted[i] = due, true
+	}
+	if s.emptyUntil[i].After(due) {
+		s.emptyUntil[i], s.check[i] = due, false
+	}
+}
+
+// markBusy records that priority i returned every row asked for.
+func (s *selector) markBusy(i int) {
+	s.emptyUntil[i], s.check[i], s.raced[i] = time.Time{}, false, false
+}
+
+// contended reports whether a priority is waiting for rows another claimer
+// held when it was last asked.
+func (s *selector) contended() bool { return s.raced[0] || s.raced[1] || s.raced[2] }
 
 // nextCheck is the earliest time a priority known to be empty is asked again;
 // the zero time when one is not known to be empty at now.
@@ -127,6 +158,32 @@ func (s *selector) nextCheck(now time.Time) time.Time {
 		}
 	}
 	return earliest
+}
+
+// due reports, at now, whether some priority is to be claimed (never found
+// empty, or its due time or a hint has come), and which ones only reached
+// their safety poll: those are asked Queue.NextDue first.
+func (s *selector) due(now time.Time) (claim bool, peek []int) {
+	for i, u := range s.emptyUntil {
+		switch {
+		case now.Before(u):
+		case s.check[i]:
+			peek = append(peek, i)
+		default:
+			claim = true
+		}
+	}
+	return claim, peek
+}
+
+// priorityIndex is the index of p in notification.Priorities; -1 if none.
+func priorityIndex(p notification.Priority) int {
+	for i, q := range notification.Priorities {
+		if q == p {
+			return i
+		}
+	}
+	return -1
 }
 
 // priorityName is the priority at index i (high, normal, low).

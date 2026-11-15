@@ -31,6 +31,9 @@ type memQueue struct {
 	results  map[string][]notification.AttemptOutcome
 	released int
 	lost     int // result writes refused because the lease had run out
+	peeks    int // NextDue calls
+	// claimCalls counts Claim calls, empty ones included.
+	claimCalls int
 }
 
 type memRow struct {
@@ -57,6 +60,7 @@ func (q *memQueue) add(n int, ch notification.Channel, p notification.Priority) 
 func (q *memQueue) Claim(_ context.Context, ch notification.Channel, p notification.Priority, n int, lease time.Duration) ([]notification.Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.claimCalls++
 	var out []notification.Job
 	for _, id := range q.order {
 		r := q.rows[id]
@@ -123,6 +127,24 @@ func (q *memQueue) ReapExpired(context.Context) ([]notification.Job, error) {
 	return out, nil
 }
 
+func (q *memQueue) NextDue(_ context.Context, ch notification.Channel) (map[notification.Priority]time.Duration, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.peeks++
+	out := map[notification.Priority]time.Duration{}
+	now := time.Now()
+	for _, r := range q.rows {
+		if r.status != notification.StatusPending || r.job.Channel != ch {
+			continue
+		}
+		w := r.due.Sub(now)
+		if cur, ok := out[r.job.Priority]; !ok || w < cur {
+			out[r.job.Priority] = w
+		}
+	}
+	return out, nil
+}
+
 func (q *memQueue) count(st notification.Status) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -149,6 +171,7 @@ type gridLimiter struct {
 	mu       sync.Mutex
 	err      error
 	takes    int
+	reserves int // Takes that asked for slots (n > 0)
 	interval time.Duration
 	horizon  time.Duration
 	next     map[notification.Channel]time.Time
@@ -175,8 +198,18 @@ func (l *gridLimiter) Take(_ context.Context, ch notification.Channel, n int) (n
 	if l.err != nil {
 		return notification.Grant{}, l.err
 	}
+	if n > 0 {
+		l.reserves++
+	}
 	now := time.Now()
 	tat := l.next[ch]
+	idle := time.Duration(0) // as the Valkey limiter reports it
+	switch {
+	case tat.IsZero():
+		idle = time.Second // the least a missing key proves (limiter.keyLinger)
+	case tat.Before(now):
+		idle = now.Sub(tat)
+	}
 	if tat.Before(now) {
 		tat = now
 	}
@@ -186,12 +219,14 @@ func (l *gridLimiter) Take(_ context.Context, ch notification.Channel, n int) (n
 		k = min(int((l.horizon-first)/l.interval)+1, n)
 	}
 	tat = tat.Add(time.Duration(k) * l.interval)
-	l.next[ch] = tat
+	if k > 0 { // as the Valkey script: a Take that reserves nothing writes nothing
+		l.next[ch] = tat
+	}
 	var wait time.Duration
 	if k < n {
 		wait = max(tat.Sub(now)-l.horizon, 0)
 	}
-	return notification.Grant{N: k, At: l.remote(now), First: first, Interval: l.interval, Wait: wait}, nil
+	return notification.Grant{N: k, At: l.remote(now), First: first, Interval: l.interval, Wait: wait, Idle: idle}, nil
 }
 
 func testLimiter() *gridLimiter { return newGridLimiter(5*time.Millisecond, 20*time.Millisecond) }
@@ -414,12 +449,12 @@ func TestSelectorPlan(t *testing.T) {
 		t.Errorf("100 slots: got %v, want exactly 70/20/10", got)
 	}
 	s = newSelector([3]int{70, 20, 10})
-	s.markEmpty(1, now, false, time.Second, time.Second)
+	s.settle(1, now.Add(time.Second), true, s.beginRound())
 	if got := s.plan(100, now); got != [3]int{70, 0, 30} {
 		t.Errorf("normal empty: got %v, want its share lent down to low", got)
 	}
 	s = newSelector([3]int{70, 20, 10})
-	s.markEmpty(2, now, false, time.Second, time.Second)
+	s.settle(2, now.Add(time.Second), true, s.beginRound())
 	if got := s.plan(100, now); got != [3]int{70, 30, 0} {
 		t.Errorf("low empty: got %v, want its share lent up to normal", got)
 	}

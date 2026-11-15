@@ -24,6 +24,7 @@ type Service struct {
 	db        *sql.DB
 	q         *sqlc.Queries
 	pub       BatchPublisher
+	waker     notification.Waker // nil: no wake hints
 	retention time.Duration
 	now       func() time.Time
 }
@@ -49,6 +50,30 @@ func New(db *sql.DB, pub notification.Publisher, retention time.Duration) *Servi
 		bp = sequential{pub}
 	}
 	return &Service{db: db, q: sqlc.New(db), pub: bp, retention: retention, now: time.Now}
+}
+
+// WithWaker makes s send a wake hint after every commit that makes a
+// notification pending (create, batch, replay), so an idle worker claims it
+// at once instead of on its safety poll. Call it before s is used.
+func (s *Service) WithWaker(w notification.Waker) *Service {
+	s.waker = w
+	return s
+}
+
+// wake sends hints, best effort: an error is logged, never returned. It runs
+// after the commit, so a worker it wakes finds the rows.
+func (s *Service) wake(ctx context.Context, hints ...notification.Wake) {
+	if s.waker == nil || len(hints) == 0 {
+		return
+	}
+	if err := s.waker.Wake(ctx, hints...); err != nil {
+		slog.WarnContext(ctx, "wake hint", "count", len(hints), "err", err)
+	}
+}
+
+// hintFor is the wake hint for a stored pending notification.
+func hintFor(n sqlc.Notification) notification.Wake {
+	return notification.Wake{Channel: notification.Channel(n.Channel), Priority: notification.Priority(n.Priority), Due: n.DueAt}
 }
 
 // sequential gives a plain notification.Publisher a batch form: one event after the
@@ -185,6 +210,7 @@ func (s *Service) Create(ctx context.Context, r Request, m Meta) (n Notification
 	lctx := telemetry.WithNotification(ctx, n.ID, n.CorrelationID)
 	slog.InfoContext(lctx, "notification accepted", "channel", a.Channel, "priority", a.Priority, "scheduled", n.Scheduled)
 	s.publish(lctx, n.Notification)
+	s.wake(lctx, hintFor(n.Notification))
 	return n, false, nil
 }
 
@@ -260,6 +286,17 @@ func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b Batc
 	if err := s.pub.PublishAll(ctx, events); err != nil {
 		slog.WarnContext(ctx, "publish batch status changes", "batch_id", b.ID, "count", len(events), "err", err)
 	}
+	// One pipelined hint per channel and priority (the waker keeps the
+	// earliest due time of each).
+	hints := make([]notification.Wake, len(items))
+	for i, it := range items {
+		due := b.CreatedAt // due now: any time not after the commit
+		if it.ScheduledAt != nil {
+			due = *it.ScheduledAt
+		}
+		hints[i] = notification.Wake{Channel: notification.Channel(it.Channel), Priority: notification.Priority(it.Priority), Due: due}
+	}
+	s.wake(ctx, hints...)
 	return b, false, nil
 }
 
@@ -500,6 +537,9 @@ func (s *Service) transition(ctx context.Context, id string, from, to notificati
 		NotificationID: n.ID, BatchID: n.BatchID.String, Status: to, Attempts: int(n.Attempts),
 		Error: n.LastError.String, At: n.UpdatedAt, CorrelationID: n.CorrelationID,
 	})
+	if to == notification.StatusPending { // a replay: claimable again
+		s.wake(lctx, hintFor(n.Notification))
+	}
 	return n, nil
 }
 

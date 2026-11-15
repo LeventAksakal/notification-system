@@ -213,3 +213,85 @@ func waitReaped(t *testing.T, q *store.Queue, db *sql.DB, id string) {
 		}
 	}
 }
+
+func TestQueueNextDue(t *testing.T) {
+	db, _ := support.MySQL(t)
+	q := store.NewQueue(db)
+	ch := notification.ChannelEmail
+	insert := func(p notification.Priority, status string, dueIn time.Duration) {
+		t.Helper()
+		_, err := db.ExecContext(t.Context(), `INSERT INTO notifications (id, recipient, channel, priority, content, status, due_at, correlation_id)
+			VALUES (?, 'a@example.com', ?, ?, 'hello', ?, NOW(3) + INTERVAL ? MICROSECOND, 'corr')`,
+			uuid.Must(uuid.NewV7()).String(), ch, p, status, dueIn.Microseconds())
+		if err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	t.Run("nothing pending reports no priority", func(t *testing.T) {
+		got, err := q.NextDue(t.Context(), ch)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("want empty, got %v, %v", got, err)
+		}
+	})
+
+	t.Run("each priority reports its earliest pending due time", func(t *testing.T) {
+		insert(notification.PriorityHigh, "pending", -time.Second)
+		insert(notification.PriorityHigh, "pending", time.Hour)
+		insert(notification.PriorityNormal, "pending", 3*time.Second)
+		insert(notification.PriorityNormal, "pending", 9*time.Second)
+		insert(notification.PriorityLow, "sent", -time.Second) // not pending: absent
+		got, err := q.NextDue(t.Context(), ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w, ok := got[notification.PriorityHigh]; !ok || w > 0 {
+			t.Errorf("high: want due now (<= 0), got %v (present %v)", w, ok)
+		}
+		if w := got[notification.PriorityNormal]; w < 2500*time.Millisecond || w > 3*time.Second {
+			t.Errorf("normal: want about 3 s, got %v", w)
+		}
+		if _, ok := got[notification.PriorityLow]; ok {
+			t.Errorf("low: want absent (nothing pending), got %v", got)
+		}
+	})
+
+	t.Run("each priority costs one claim_idx dive, whatever the backlog", func(t *testing.T) {
+		for range 200 {
+			insert(notification.PriorityLow, "pending", time.Minute)
+		}
+		// The arm of NextDue for one priority; the other two are the same shape.
+		rows, err := db.QueryContext(t.Context(), `EXPLAIN SELECT MIN(due_at) IS NOT NULL, CAST(COALESCE(TIMESTAMPDIFF(MICROSECOND, NOW(3), MIN(due_at)), 0) AS SIGNED)
+			FROM notifications WHERE status = 'pending' AND channel = 'email' AND priority = 'low'`)
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		defer func() { _ = rows.Close() }()
+		cols, _ := rows.Columns()
+		n := 0
+		for rows.Next() {
+			n++
+			vals := make([]sql.NullString, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				t.Fatalf("scan explain: %v", err)
+			}
+			got := map[string]string{}
+			for i, c := range cols {
+				got[c] = vals[i].String
+			}
+			t.Logf("EXPLAIN next due: type=%s key=%s rows=%s extra=%s", got["type"], got["key"], got["rows"], got["Extra"])
+			// MIN over a constant index prefix is resolved from the index
+			// while planning: no rows are read at execution.
+			if got["Extra"] != "Select tables optimized away" {
+				t.Errorf("want one index dive (Select tables optimized away), got %v", got)
+			}
+		}
+		if err := rows.Err(); err != nil || n == 0 {
+			t.Fatalf("read explain: %v (%d rows)", err, n)
+		}
+	})
+}

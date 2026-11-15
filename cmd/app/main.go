@@ -39,6 +39,7 @@ import (
 	"github.com/LeventAksakal/notification-system/internal/realtime"
 	"github.com/LeventAksakal/notification-system/internal/store"
 	"github.com/LeventAksakal/notification-system/internal/telemetry"
+	"github.com/LeventAksakal/notification-system/internal/wake"
 )
 
 func main() {
@@ -177,6 +178,8 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		Publisher: realtime.NewPublisher(vk, realtime.OriginWorker),
 		Breakers:  breakers,
 		Tracer:    otel.Tracer("notifier/worker"),
+		Waker:     wake.NewPublisher(vk),
+		Wakes:     wake.NewListener(vk),
 	})
 	retryWorst, retryMean := delivery.RetrySpan(cfg.MaxAttempts, cfg.RetryBase, cfg.RetryCap)
 	slog.InfoContext(ctx, "worker started", "concurrency", cfg.WorkerConcurrency, "weights", cfg.PriorityWeights,
@@ -197,7 +200,7 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 
 	// One Valkey subscription per process feeds every WebSocket (decision 0013).
 	hub := realtime.NewHub(vk)
-	svc := intake.New(db, realtime.NewPublisher(vk, realtime.OriginAPI), cfg.IdempotencyRetention)
+	svc := intake.New(db, realtime.NewPublisher(vk, realtime.OriginAPI), cfg.IdempotencyRetention).WithWaker(wake.NewPublisher(vk))
 	srv := httpapi.NewServer(svc, map[string]httpapi.Check{
 		"mysql": db.PingContext,
 		// Ready only while events reach this instance: a subscriber accepted

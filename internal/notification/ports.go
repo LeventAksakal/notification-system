@@ -62,6 +62,12 @@ type Queue interface {
 	// reports them, so the caller can publish the change (decision 0018). Of
 	// each Job only ID, BatchID, Channel, Attempts and CorrelationID are set.
 	ReapExpired(ctx context.Context) ([]Job, error)
+	// NextDue reports, for each priority of the channel that has pending
+	// notifications, how long until the earliest of them is due, measured on
+	// the database's clock (zero or negative: one is due now). A priority with
+	// nothing pending is absent. It reads the claim index only, so an idle
+	// worker can ask it instead of claiming.
+	NextDue(ctx context.Context, channel Channel) (map[Priority]time.Duration, error)
 }
 
 // Grant is a reservation of consecutive send slots on one channel.
@@ -83,6 +89,14 @@ type Grant struct {
 	// Wait is how long until asking again can reserve something; set when N
 	// is less than what was asked for.
 	Wait time.Duration
+	// Idle is how long the channel's slot grid had been free when this
+	// reservation was made: its next free slot, one interval after the last
+	// slot reserved before, had passed Idle before At. Zero while that slot
+	// was still ahead (the grid was busy). After the grid's state expired it
+	// is the least time that proves, never more.
+	// A caller that knows how late a request may leave after its slot can
+	// tell from it that no earlier request is still waiting to leave.
+	Idle time.Duration
 }
 
 // Limiter is the send-rate limit shared by every worker (decision 0009). Its
@@ -117,4 +131,22 @@ type Event struct {
 // source of truth.
 type Publisher interface {
 	Publish(ctx context.Context, e Event) error
+}
+
+// Wake is a hint that notifications of one channel and priority became
+// pending (created, replayed, released, rescheduled or reaped), the earliest
+// of them due at Due.
+type Wake struct {
+	Channel  Channel
+	Priority Priority
+	Due      time.Time
+}
+
+// Waker tells idle workers that work became pending. It is called after the
+// change is committed, never before: a worker woken by it must find the row.
+// Best effort: a lost hint delays a send by at most the workers' safety poll
+// and never loses it; an error is logged and never undoes or blocks the
+// change.
+type Waker interface {
+	Wake(ctx context.Context, hints ...Wake) error
 }

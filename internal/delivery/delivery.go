@@ -38,6 +38,7 @@ import (
 	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/provider"
 	"github.com/LeventAksakal/notification-system/internal/telemetry"
+	"github.com/LeventAksakal/notification-system/internal/wake"
 )
 
 // Sender makes one provider call (provider.Client). It must end the call when
@@ -72,9 +73,18 @@ type Config struct {
 	// most first slots. Every request is shifted by the same amount, so the
 	// spacing at the provider stays the limiter's.
 	SendAlign time.Duration
-	// IdleMin and IdleMax bound the idle poll of a channel with nothing due:
-	// it starts at IdleMin and doubles up to IdleMax. Defaults 50ms and 250ms.
+	// IdleMin and IdleMax bound the retry waits of a channel that cannot
+	// reserve now: IdleMin while all its provider calls are in flight (a call
+	// place frees within a call's time), and the clock probe's back-off from
+	// IdleMin doubling to IdleMax; IdleMax after the limiter or a claim failed
+	// and as the cap of a breaker's wait. Defaults 50ms and 250ms. A channel
+	// with nothing due does not poll: it sleeps until its next due time, a
+	// wake hint, or SafetyPoll.
 	IdleMin, IdleMax time.Duration
+	// SafetyPoll is the longest an empty priority sleeps without asking the
+	// database (Queue.NextDue): it bounds the delay a lost wake hint can
+	// cause. Default wake.SafetyPoll; not an operator dial (tests shorten it).
+	SafetyPoll time.Duration
 }
 
 // DefaultSendAlign is SendAlign's default: above the claim's start-up p99.
@@ -96,6 +106,20 @@ type Deps struct {
 	Now func() time.Time
 	// Meter provides the delivery metrics; default the global provider.
 	Meter metric.MeterProvider
+	// Waker tells the other workers (and this one) that a job went back to
+	// pending: released, rescheduled or reaped. Optional.
+	Waker notification.Waker
+	// Wakes delivers the hints published for the worker's channels
+	// (wake.Listener). Optional: without it an empty priority is asked again
+	// after its due time or SafetyPoll only.
+	Wakes Wakes
+}
+
+// Wakes is a source of wake hints (wake.Listener). Run holds a subscription
+// until ctx ends, calling onHint for each hint and onSubscribed after every
+// (re)subscribe; both must not block.
+type Wakes interface {
+	Run(ctx context.Context, channels []notification.Channel, onHint func(notification.Wake), onSubscribed func()) error
 }
 
 // Worker runs the delivery loop; Run once.
@@ -104,6 +128,8 @@ type Worker struct {
 	deps  Deps
 	clock *clockMap // Valkey's clock to the local one, for every channel
 	m     metrics
+	// runs is set by Run before anything that reads it starts.
+	runs map[notification.Channel]*channelRun
 }
 
 // New returns a worker; zero dials get their defaults.
@@ -131,6 +157,9 @@ func New(cfg Config, deps Deps) *Worker {
 	}
 	if cfg.ReapInterval <= 0 {
 		cfg.ReapInterval = 5 * time.Second
+	}
+	if cfg.SafetyPoll <= 0 {
+		cfg.SafetyPoll = wake.SafetyPoll
 	}
 	if deps.Rand == nil {
 		deps.Rand = func(n int64) int64 { return rand.Int64N(n + 1) } //nolint:gosec // jitter, not security
@@ -182,11 +211,19 @@ func (w *Worker) Run(ctx context.Context) error {
 	own := max(1, w.cfg.Concurrency/(2*n))
 	shared := make(chan struct{}, max(0, w.cfg.Concurrency-own*n))
 	g, gctx := errgroup.WithContext(ctx)
+	w.runs = make(map[notification.Channel]*channelRun, n)
 	for _, ch := range w.cfg.Channels {
-		cr := w.newChannelRun(ch, callPlaces{own: make(chan struct{}, own), shared: shared})
+		w.runs[ch] = w.newChannelRun(ch, callPlaces{own: make(chan struct{}, own), shared: shared})
+	}
+	for _, cr := range w.runs {
 		g.Go(func() error {
 			w.channelLoop(gctx, sendCtx, cr, &inflight)
 			return nil
+		})
+	}
+	if w.deps.Wakes != nil {
+		g.Go(func() error {
+			return w.deps.Wakes.Run(gctx, w.cfg.Channels, w.onHint, w.onSubscribed)
 		})
 	}
 	g.Go(func() error {
@@ -228,6 +265,8 @@ type channelRun struct {
 	// backlog would hand the last rows to later slots and leave earlier ones
 	// empty.
 	claiming chan struct{}
+	// wake cuts the channel loop's idle wait short when a hint arrives.
+	wake chan struct{}
 
 	mu  sync.Mutex
 	sel *selector
@@ -236,7 +275,7 @@ type channelRun struct {
 func (w *Worker) newChannelRun(ch notification.Channel, calling callPlaces) *channelRun {
 	return &channelRun{
 		ch: ch, br: w.deps.Breakers[ch],
-		calling: calling, claiming: make(chan struct{}, 1),
+		calling: calling, claiming: make(chan struct{}, 1), wake: make(chan struct{}, 1),
 		sel: newSelector(w.cfg.Weights),
 	}
 }
@@ -295,6 +334,14 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 	clockUncertain := false
 	probeWait := w.cfg.IdleMin
 	interval := time.Millisecond // until the first grant says
+	// woke: the channel was woken from idle by a hint or a due time, as every
+	// other worker may have been at the same moment (see group.deferClaim).
+	// Not when it only waited for rows another claimer held, nor when its
+	// safety poll found rows: both mean other workers are draining a backlog,
+	// and a deferred claim there takes the rows after later slots, leaving
+	// the earlier ones unused (measured: R8's whole drain fell from 90.3 to
+	// 88.4 requests per second, the tail's gaps from ~180 to ~480 ms).
+	woke := false
 	unreachable := func(err error) {
 		if !limiterDown {
 			slog.ErrorContext(ctx, "rate limiter unreachable; channel sends nothing", "channel", cr.ch, "err", err)
@@ -311,9 +358,19 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		now := time.Now()
 		cr.mu.Lock()
 		at := cr.sel.nextCheck(now)
+		claim, peek := cr.sel.due(now)
+		contended := cr.sel.contended()
 		cr.mu.Unlock()
 		if !at.IsZero() {
-			sleep(ctx, at.Sub(now))
+			w.idleWait(ctx, cr, at.Sub(now))
+			woke = !contended
+			continue
+		}
+		if !claim {
+			// Only safety polls came due: ask the database whether anything
+			// is due before reserving slots and claiming.
+			w.peek(ctx, cr, peek)
+			woke = false
 			continue
 		}
 		if cr.calling.full() {
@@ -472,11 +529,17 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			slots[i] = base.Add(time.Duration(i) * g.Interval)
 		}
 		tolerance := g.Interval - uncertainty // > 0: checked above
+		// The grid was free for SendAlign plus an interval: every request
+		// of an earlier slot left more than an interval before this group's
+		// first slot, lateness and clock offset included (see group.flex).
+		flex := g.Idle >= w.cfg.SendAlign+g.Interval
+		deferClaim := woke && !flex
+		woke = false
 		inflight.Add(1)
 		go func() { // owned by Run through inflight
 			defer inflight.Done()
 			defer func() { <-cr.claiming }()
-			w.claimGroup(ctx, sendCtx, cr, group{slots: slots, tickets: tickets, tolerance: tolerance, gen: gen}, inflight)
+			w.claimGroup(ctx, sendCtx, cr, group{slots: slots, tickets: tickets, tolerance: tolerance, gen: gen, flex: flex, deferClaim: deferClaim}, inflight)
 		}()
 		sleep(ctx, time.Until(got.Add(pause)))
 	}
@@ -506,6 +569,54 @@ type group struct {
 	tickets   []breaker.Ticket
 	tolerance time.Duration
 	gen       uint64
+	// flex: the limiter's grid had been free for at least SendAlign plus one
+	// interval before this grant (Grant.Idle), so the group may leave as soon
+	// as it is claimed instead of SendAlign after its slots, never before
+	// them. It does so only when its claim found fewer rows than slots: the
+	// backlog ended within the group, and the slots after its rows go unused
+	// either way. A full group keeps its moments, because the next grant
+	// (Idle 0) keeps SendAlign, and moving the full group earlier would leave
+	// a hole of up to SendAlign between the two on a channel with a backlog
+	// (measured: R9 low alone fell to 91.6/s against its floor of 93). Why the
+	// cap holds, all times on Valkey's clock (V), I the
+	// interval, A SendAlign, T the TAT before this grant:
+	//  - Allowed lateness and clock offset. A worker places a slot with the
+	//    upper bound of its offset to V (clockMap), so on V it is never early
+	//    and at most that worker's uncertainty u late; the send then leaves
+	//    within its tolerance, I - u. So a request of slot s leaves in
+	//    [s+A, s+A+I) on V, whichever worker sends it and whatever its
+	//    offset, as long as the offset lies in the bounds clockMap keeps
+	//    (a step outside them voids the generation, as before). The offset
+	//    is inside the margin by construction.
+	//  - Earlier grants: their last slot is at most T-I, so every request of
+	//    theirs has left before T+A on V, the latest one included.
+	//  - Idle is now-T, both read by the limiter on V: no worker clock in it.
+	//    Idle >= A+I puts this group's first slot at T+A+I or later on V, and
+	//    the group never leaves before its slots: the first flex send comes
+	//    more than I after the last earlier send. The unbroken grid only
+	//    guarantees a gap above 0 between neighbours (a late send, then its
+	//    successor on time); the seam is sparser than the grid, so no second
+	//    holds more than on a busy channel. A threshold of A+2I would buy a
+	//    gap above 2I that nothing needs.
+	//  - Within the group the slots move together, I apart, and each still
+	//    leaves in [slot, slot+I) on V. Later grants' slots start I after
+	//    this group's last unmoved slot; this group only left earlier, so
+	//    the gap grows, and a later flex grant repeats this argument with
+	//    this group as the earlier one (its sends end before its unmoved
+	//    slots + A + I, the same bound).
+	flex bool
+	// deferClaim: the group is not flex but its worker has just woken from
+	// idle, so another worker woken by the same hint holds the flex group
+	// just ahead of it (19 slots of 10.5 ms end 10 us past the 200 ms
+	// horizon, so the next taker gets one slot right after them). Both would
+	// claim at once and SKIP LOCKED gives the row to whichever locks first:
+	// measured on the harness, the hinted row then left with this group
+	// SendAlign later (~400 ms) in about half the samples. Its claim waits
+	// until its first slot, which still leaves SendAlign (the time a claim
+	// may take) before its first send, so the flex worker claims first. Its
+	// own sends keep their moments; a busy channel never defers (woke is
+	// false).
+	deferClaim bool
 }
 
 // claimGroup claims rows for a group of slots and starts one send per row,
@@ -526,6 +637,9 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr gro
 		}
 		return true
 	}
+	if gr.deferClaim {
+		sleep(ctx, time.Until(slots[0].Add(-w.cfg.SendAlign)))
+	}
 	if stepped() {
 		return
 	}
@@ -538,12 +652,27 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr gro
 		w.m.gaveUp(ctx, cr.ch, giveUpSlotMissed, i-from)
 	}
 	skipMissed(time.Now())
-	jobs, err := w.claim(ctx, cr, len(slots)-i)
+	jobs, drained, r, err := w.claim(ctx, cr, len(slots)-i)
 	if err != nil && ctx.Err() == nil {
 		slog.ErrorContext(ctx, "claim failed", "channel", cr.ch, "err", err)
 		cr.pause(time.Now().Add(w.cfg.IdleMax))
 	}
+	if gr.flex && len(jobs) > 0 && len(jobs) < len(slots)-i {
+		// The backlog ended within this group: leave right after the
+		// claim, never before the slot (group.flex).
+		now := time.Now()
+		if d := slots[i].Sub(later(slots[i].Add(-w.cfg.SendAlign), now)); d > 0 {
+			for k := i; k < len(slots); k++ {
+				slots[k] = slots[k].Add(-d)
+			}
+		}
+	}
 	skipMissed(time.Now())
+	if len(drained) > 0 && err == nil {
+		// After the sends are started, so the database read costs them
+		// nothing; still inside the round (claiming is held).
+		defer w.settleEmpty(ctx, cr, drained, r, w.refill())
+	}
 	voided := stepped() // the claimed rows then all go back below
 	// The group's claims are announced in one publish, beside the sends: a
 	// slow Valkey costs no slot. Each job's result event waits for it, so a
@@ -666,22 +795,23 @@ func (cr *channelRun) pause(until time.Time) {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 	for i := range notification.Priorities {
-		cr.sel.emptyUntil[i] = until
+		cr.sel.emptyUntil[i], cr.sel.check[i] = until, false
 	}
 }
 
 // claim claims up to n due notifications of the channel: the selector splits
 // n by weight, then each priority is asked once, high to low, for its share
 // plus what the priorities above it could not use. What is still unused after
-// low goes up to the priorities that may have more. A priority that returned
-// fewer rows than asked is skipped for its idle poll: IdleMin after it had
-// rows, doubling up to IdleMax while it keeps having none.
-func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]notification.Job, error) {
+// low goes up to the priorities that may have more. It returns the priorities
+// that returned fewer rows than asked (drained) and the round they belong to:
+// the caller settles them with settleEmpty once the sends are started.
+func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]notification.Job, []int, round, error) {
 	if n <= 0 {
-		return nil, nil
+		return nil, nil, round{}, nil
 	}
 	now := time.Now()
 	cr.mu.Lock()
+	r := cr.sel.beginRound()
 	counts := cr.sel.plan(n, now)
 	var empty [3]bool
 	for i := range empty {
@@ -697,14 +827,13 @@ func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]notificati
 			return 0, err
 		}
 		jobs = append(jobs, got...)
-		cr.mu.Lock()
 		if len(got) < k {
 			drained[i] = true
-			cr.sel.markEmpty(i, now, len(got) > 0, w.cfg.IdleMin, w.cfg.IdleMax)
 		} else {
-			cr.sel.markBusy(i, now)
+			cr.mu.Lock()
+			cr.sel.markBusy(i)
+			cr.mu.Unlock()
 		}
-		cr.mu.Unlock()
 		return len(got), nil
 	}
 	carry := 0
@@ -735,7 +864,125 @@ func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]notificati
 		}
 		carry -= got
 	}
-	return jobs, err
+	var short []int
+	for i, d := range drained {
+		if d {
+			short = append(short, i)
+		}
+	}
+	return jobs, short, r, err
+}
+
+// settleEmpty asks the database when the channel's next notification of each
+// priority in idx is due and sleeps each until then: nothing pending, or due
+// later than SafetyPoll, sleeps SafetyPoll as a safety check (a lost hint
+// costs at most that); due within it sleeps exactly until it (the wait is on
+// the database's clock, so skew does not matter); due now sleeps dueNow (a
+// row this round did not get: another claimer holds it, or it was committed
+// after the claim began, in which case its hint wakes the channel anyway).
+// It runs inside round r, holding the channel's claiming place.
+func (w *Worker) settleEmpty(ctx context.Context, cr *channelRun, idx []int, r round, dueNow time.Duration) {
+	next, err := w.deps.Queue.NextDue(ctx, cr.ch)
+	now := time.Now()
+	if err != nil && ctx.Err() == nil {
+		slog.ErrorContext(ctx, "reading the next due time failed", "channel", cr.ch, "err", err)
+	}
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	for _, i := range idx {
+		wait, pending := next[priorityName(i)]
+		switch {
+		case err != nil:
+			cr.sel.settle(i, now.Add(w.cfg.IdleMax), true, r) // ask again after the claim-failure pause
+		case !pending || wait >= w.cfg.SafetyPoll:
+			cr.sel.settle(i, now.Add(w.cfg.SafetyPoll), true, r)
+		case wait > 0:
+			cr.sel.settle(i, now.Add(wait), false, r)
+		default:
+			cr.sel.settle(i, now.Add(dueNow), false, r)
+			cr.sel.raced[i] = dueNow > 0
+		}
+	}
+}
+
+// peek runs a round of NextDue alone for the priorities whose safety poll
+// came due; one due now is claimed at once.
+func (w *Worker) peek(ctx context.Context, cr *channelRun, idx []int) {
+	select {
+	case cr.claiming <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+	defer func() { <-cr.claiming }()
+	cr.mu.Lock()
+	r := cr.sel.beginRound()
+	cr.mu.Unlock()
+	w.settleEmpty(ctx, cr, idx, r, 0)
+}
+
+// idleWait sleeps for d, until ctx ends, or until a wake hint for the channel.
+func (w *Worker) idleWait(ctx context.Context, cr *channelRun, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	case <-cr.wake:
+	}
+}
+
+// onHint applies a wake hint: its priority is asked again by its due time.
+func (w *Worker) onHint(h notification.Wake) {
+	if cr := w.runs[h.Channel]; cr != nil {
+		cr.hint(h.Priority, h.Due)
+	}
+}
+
+// onSubscribed asks every priority of every channel at once: hints published
+// while the subscription was down are lost, the rows they announced are not.
+func (w *Worker) onSubscribed() {
+	for _, cr := range w.runs {
+		for _, p := range notification.Priorities {
+			cr.hint(p, time.Time{})
+		}
+	}
+}
+
+// hint lowers priority p's sleep to due and wakes the channel loop.
+func (cr *channelRun) hint(p notification.Priority, due time.Time) {
+	i := priorityIndex(p)
+	if i < 0 {
+		return
+	}
+	cr.mu.Lock()
+	cr.sel.hint(i, due)
+	cr.mu.Unlock()
+	select {
+	case cr.wake <- struct{}{}:
+	default: // a wake is already pending
+	}
+}
+
+// wakeAll hints that jobs became pending: to this worker at once and, through
+// Deps.Waker, to the others. Best effort.
+func (w *Worker) wakeAll(ctx context.Context, hints ...notification.Wake) {
+	for _, h := range hints {
+		w.onHint(h)
+	}
+	if w.deps.Waker == nil || len(hints) == 0 {
+		return
+	}
+	if err := w.deps.Waker.Wake(ctx, hints...); err != nil {
+		slog.WarnContext(ctx, "wake hint", "count", len(hints), "err", err)
+	}
+}
+
+// later returns the later of a and b.
+func later(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 // jobContext carries the ids every log line about the job needs.
@@ -815,6 +1062,7 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 		"http_status", res.Status, "outcome", v.Outcome, "duration_ms", elapsed.Milliseconds()}
 
 	var status notification.Status
+	var retryAt time.Time // set when the job is rescheduled
 	var werr error
 	switch {
 	case v.Outcome == notification.OutcomeAccepted:
@@ -835,7 +1083,8 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 		status = notification.StatusPending
 		delay := Backoff(attempts, w.cfg.RetryBase, w.cfg.RetryCap, v.RetryAfter, w.deps.Rand)
 		log = append(log, "retry_in_ms", delay.Milliseconds(), "error", v.Error)
-		werr = w.deps.Queue.Reschedule(wctx, job, a, time.Now().Add(delay))
+		retryAt = time.Now().Add(delay)
+		werr = w.deps.Queue.Reschedule(wctx, job, a, retryAt)
 	}
 	switch {
 	case errors.Is(werr, notification.ErrLeaseLost):
@@ -847,6 +1096,9 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 		return
 	}
 	slog.InfoContext(ctx, "delivery attempt", append(log, "status", status)...)
+	if status == notification.StatusPending {
+		w.wakeAll(ctx, notification.Wake{Channel: job.Channel, Priority: job.Priority, Due: retryAt})
+	}
 	errText := ""
 	if status != notification.StatusSent {
 		errText = v.Error
@@ -864,6 +1116,7 @@ func (w *Worker) release(ctx context.Context, job notification.Job, announced <-
 		return
 	}
 	slog.DebugContext(ctx, "released unsent notification", "channel", job.Channel, "reason", reason)
+	w.wakeAll(ctx, notification.Wake{Channel: job.Channel, Priority: job.Priority, Due: time.Now()})
 	w.publish(ctx, job, announced, notification.StatusPending, job.Attempts, "")
 }
 
@@ -932,7 +1185,21 @@ func (w *Worker) reaper(ctx context.Context) {
 		if len(jobs) > 0 {
 			slog.InfoContext(ctx, "returned expired leases to pending", "count", len(jobs))
 		}
-		// What was reaped is committed even when a later batch failed.
+		// What was reaped is committed even when a later batch failed. A
+		// reaped job carries no priority: every priority of its channel is
+		// hinted.
+		var hints []notification.Wake
+		seen := map[notification.Channel]bool{}
+		now := time.Now()
+		for _, job := range jobs {
+			if !seen[job.Channel] {
+				seen[job.Channel] = true
+				for _, p := range notification.Priorities {
+					hints = append(hints, notification.Wake{Channel: job.Channel, Priority: p, Due: now})
+				}
+			}
+		}
+		w.wakeAll(ctx, hints...)
 		w.publishAll(ctx, jobs, notification.StatusPending)
 	}
 }

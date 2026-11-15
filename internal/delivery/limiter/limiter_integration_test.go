@@ -202,3 +202,47 @@ func TestLimiterFailsClosed(t *testing.T) {
 		t.Fatalf("unreachable Valkey: want an error and no slot, got %+v, %v", g, err)
 	}
 }
+
+// TestLimiterReportsHowLongTheGridWasFree: Idle tells a taker how long ago the
+// last slot reserved before its grant was due, so it can tell whether any
+// earlier request can still be waiting to leave. It reserves nothing itself.
+func TestLimiterReportsHowLongTheGridWasFree(t *testing.T) {
+	addr := support.Valkey(t)
+	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}, DisableCache: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	l := limiter.New(client, 100, 0, 50*time.Millisecond, "test:idle:")
+	ch := notification.ChannelSMS
+
+	g, err := l.Take(t.Context(), ch, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.N != 2 || g.Idle != time.Second {
+		t.Fatalf("first take on a fresh key: want 2 slots and Idle of exactly the 1 s a missing key proves, got %+v", g)
+	}
+	g, err = l.Take(t.Context(), ch, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Idle != 0 {
+		t.Fatalf("take while earlier slots are still ahead: want Idle 0, got %+v", g)
+	}
+	last := g.At.Add(g.First + time.Duration(g.N-1)*g.Interval) // the last slot reserved so far
+	time.Sleep(150 * time.Millisecond)                          // let the grid fall idle
+	g0, err := l.Take(t.Context(), ch, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err = l.Take(t.Context(), ch, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The TAT is one interval past the last slot.
+	want := g.At.Sub(last.Add(g.Interval))
+	if g.N != 1 || g.First != 0 || g.Idle != want || g0.Idle <= 0 || g0.Idle > g.Idle {
+		t.Fatalf("take after an idle gap: want 1 slot now and Idle %s (a Take of 0 before it: 0 < %s <= that), got %+v", want, g0.Idle, g)
+	}
+}
