@@ -1,7 +1,7 @@
 version: "2"
 sql:
   - engine: mysql
-    schema: migrations # the goose files Atlas generates; sqlc skips the Down sections
+    schema: migrations # the goose files generated from schema/ (tools/schemadiff); sqlc skips the Down sections
     queries: internal/store/queries
     gen:
       go:

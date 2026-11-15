@@ -13,7 +13,7 @@
       "problemMatcher": "$go"
     },
     {
-      "label": "migrate:diff (Atlas)",
+      "label": "migrate:diff (sqldef)",
       "type": "process",
       "command": "go",
       "args": ["tool", "-modfile=tools.mod", "task", "migrate:diff", "--", "${input:migrationName}"],

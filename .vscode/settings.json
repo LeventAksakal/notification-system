@@ -15,8 +15,7 @@
   "files.readonlyInclude": {
     "**/*.gen.go": true,
     "internal/store/sqlc/**": true,
-    "migrations/*.sql": true,
-    "migrations/atlas.sum": true
+    "migrations/*.sql": true
   },
 
   "yaml.schemas": {

@@ -1,4 +1,4 @@
-// Package migrations embeds the goose files Atlas generates from schema/, so
+// Package migrations embeds the goose files sqldef generates from schema/ (task migrate:diff), so
 // the binary migrates itself (`app migrate`) with no extra tool at runtime.
 package migrations
 
