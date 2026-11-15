@@ -41,7 +41,7 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 | `APP_VALKEY_ADDR` | `localhost:6379` | exists |
 | `APP_PROVIDER_URL_SMS`, `_EMAIL`, `_PUSH` | `http://localhost:8090/send` | provider URL per channel |
 | `APP_PROVIDER_TIMEOUT` | `5s` | one provider call |
-| `APP_MAX_ATTEMPTS` | `5` | provider calls before `exhausted` |
+| `APP_MAX_ATTEMPTS` | `12` | provider calls before `exhausted`; with base 1 s and cap 5 min a message retries for about 12 min on average, 23.5 at most (owner, 15 Nov 2026) |
 | `APP_RETRY_BASE` | `1s` | backoff base |
 | `APP_RETRY_CAP` | `5m` | backoff cap |
 | `APP_RATE_LIMIT_PER_SECOND` | `100` | provider's limit per channel |

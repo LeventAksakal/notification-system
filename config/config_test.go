@@ -46,7 +46,7 @@ func TestDeliveryDialsDefaultToTheContractTable(t *testing.T) {
 			t.Errorf("provider URL for %s: %q", ch, c.ProviderURL(ch))
 		}
 	}
-	if c.PriorityWeights != [3]int{70, 20, 10} || c.BreakerFailureRatio != 0.5 || c.MaxAttempts != 5 ||
+	if c.PriorityWeights != [3]int{70, 20, 10} || c.BreakerFailureRatio != 0.5 || c.MaxAttempts != 12 ||
 		c.RetryCap != 5*time.Minute || c.IdempotencyRetention != 24*time.Hour || c.WSSendBuffer != 256 ||
 		c.RateLimitHorizon != 200*time.Millisecond || c.RateLimitHeadroomPct != 5 {
 		t.Fatalf("defaults not applied: %+v", c)
