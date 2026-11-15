@@ -1,8 +1,6 @@
 # Notification system
 
-Accepts notification requests for SMS, email and push, queues them, and delivers them to an external provider at no more than 100 messages per second per channel, with priorities, retries, a circuit breaker, scheduling, templates, status tracking and live status events.
-
-Go 1.27, MySQL 8.4 (the record and the queue), Valkey 9 (the shared rate limit and event fan-out), OpenTelemetry.
+Accepts SMS, email and push notifications over HTTP, queues them in MySQL and delivers them to an external provider at no more than 100 messages per second per channel, with priorities, retries, a circuit breaker, scheduling, templates, status tracking and a WebSocket stream of status changes. Go, MySQL 8.4, Valkey 9, OpenTelemetry.
 
 ## Run it (needs only Docker)
 
@@ -10,245 +8,99 @@ Go 1.27, MySQL 8.4 (the record and the queue), Valkey 9 (the shared rate limit a
 docker compose up --build --wait
 ```
 
-That starts MySQL, Valkey, the API, three delivery workers, a local stand-in for the provider, and Grafana. Nothing else to install or configure.
-
-| What | Where |
-|---|---|
-| API reference (rendered OpenAPI; the viewer script loads from a CDN, so it needs internet) | http://localhost:8080/docs |
-| OpenAPI document | http://localhost:8080/openapi.json (source: [`api/openapi.yaml`](api/openapi.yaml)) |
-| Readiness | http://localhost:8080/readyz |
-| Metrics | http://localhost:8080/v1/metrics |
-| Provider stand-in: what it received | http://localhost:8090/_control/stats |
-| Grafana: traces, logs, metrics | http://localhost:3000 |
-
-`docker compose down` stops it; add `-v` to drop the database volume. If a port is taken, set `APP_PORT`, `PROVIDER_PORT`, `GRAFANA_PORT` or `MYSQL_PORT` before `docker compose up` (compose variables, listed under Settings).
+MySQL, Valkey, the API, three delivery workers, a stand-in for the provider and Grafana. Host ports and every variable compose reads are in [`docker-compose.yml`](docker-compose.yml); defaults: API on 8080 (reference at http://localhost:8080/docs), provider stand-in on 8090 (`/_control/stats`), Grafana on 3000, MySQL on 3306 (database, user and local password in the compose file). `docker compose down` stops it.
 
 ## Try it
 
-Send one notification and read its status:
+One line each; double quotes only, so they run unchanged in bash, zsh, PowerShell 7 and Windows `cmd` (in Windows PowerShell 5.1 type `curl.exe`). Request bodies are in [`examples/`](examples); `--json` needs curl 7.82 or later.
 
 ```bash
-curl -s -X POST localhost:8080/v1/notifications \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: order-1001-sms' \
-  -H 'X-Correlation-ID: demo-1' \
-  -d '{"to":"+905551234567","channel":"sms","content":"Your code is 4821","priority":"high"}'
-```
-
-```json
-{"id":"<uuid>","to":"+905551234567","channel":"sms","priority":"high","status":"pending","attempts":0,"correlationId":"demo-1","…":"…"}
+curl -s --json "@examples/sms.json" -H "Idempotency-Key: order-1001-sms" localhost:8080/v1/notifications
 ```
 
 ```bash
 curl -s localhost:8080/v1/notifications/<id>
 ```
 
-A moment later the status is `sent`, with the provider's message id and one entry in `deliveryAttempts`.
-
-A batch of up to 1000, stored all or nothing:
-
 ```bash
-curl -s -X POST localhost:8080/v1/notifications/batch \
-  -H 'Content-Type: application/json' \
-  -d '{"notifications":[
-        {"to":"ada@example.com","channel":"email","content":"Welcome"},
-        {"to":"device-token-1","channel":"push","content":"Sale starts now","priority":"low"}]}'
-curl -s localhost:8080/v1/batches/<batchId>
+curl -s --json "@examples/batch.json" localhost:8080/v1/notifications/batch
 ```
 
-A template, and a notification that uses it, scheduled for one hour from now (`scheduledAt` may be up to 30 days ahead; on macOS use `date -u -v+1H`):
-
 ```bash
-curl -s -X PUT localhost:8080/v1/templates/welcome \
-  -H 'Content-Type: application/json' -d '{"body":"Hello {{name}}, welcome aboard."}'
-curl -s -X POST localhost:8080/v1/notifications \
-  -H 'Content-Type: application/json' \
-  -d '{"to":"ada@example.com","channel":"email","template":{"name":"welcome","variables":{"name":"Ada"}},"scheduledAt":"'"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"'"}'
+curl -s -X PUT --json "@examples/template.json" localhost:8080/v1/templates/welcome
 ```
 
-Its status is `scheduled`. Cancel it while it waits, list with filters, read the numbers:
-
 ```bash
-curl -s -X POST localhost:8080/v1/notifications/<id>/cancel
-curl -s 'localhost:8080/v1/notifications?status=cancelled&channel=email&limit=20'
-curl -s 'localhost:8080/v1/metrics?windowSeconds=60'
+curl -s --json "@examples/templated.json" localhost:8080/v1/notifications
 ```
 
-A notification that used up its attempts is `failed`: the dead letter. List them and replay one (a cancelled or sent notification answers 409):
-
 ```bash
-curl -s 'localhost:8080/v1/notifications?status=failed'
-curl -s -X POST localhost:8080/v1/notifications/<failed id>/retry
+curl -s -X PUT --json "@examples/fault.json" localhost:8090/_control/faults
 ```
 
-Live status events over WebSocket (every change, or one notification, or one batch):
-
 ```bash
-npx wscat -c 'ws://localhost:8080/v1/ws?notificationId=<id>'
+curl -s "localhost:8080/v1/notifications?status=failed"
 ```
 
-Make the provider fail and watch retries and the breaker (the stand-in's control API):
+Every endpoint, field, limit and error is in the API reference at `/docs`. Live status: `npx wscat -c "ws://localhost:8080/v1/ws?notificationId=<id>"`.
 
-```bash
-curl -s -X PUT localhost:8090/_control/faults -H 'Content-Type: application/json' \
-  -d '{"rules":[{"channel":"sms","mode":"status","status":503,"count":50}]}'
-curl -s -X DELETE localhost:8090/_control/faults
-```
+## Where each thing is defined
 
-### Endpoints
-
-| Method and path | What it does |
+| What | Source of truth |
 |---|---|
-| `POST /v1/notifications` | Queue one notification (`to`, `channel`, `content` or `template`, `priority`, `scheduledAt`) |
-| `POST /v1/notifications/batch` | Queue 1 to 1000 atomically |
-| `GET /v1/notifications/{id}` | Status, attempt count, last error, attempt history |
-| `GET /v1/notifications` | List, newest first; filters `status`, `channel`, `batchId`, `createdFrom`, `createdTo`; `limit` and `cursor` |
-| `POST /v1/notifications/{id}/cancel` | Cancel while pending (including scheduled or waiting to retry) |
-| `POST /v1/notifications/{id}/retry` | Replay a failed notification (dead letter) |
-| `GET /v1/batches/{id}` | Counts per status and the batch's items |
-| `PUT`, `GET`, `DELETE /v1/templates/{name}`, `GET /v1/templates` | Templates with `{{variable}}` placeholders |
-| `GET /v1/metrics` | Queue depth, success and failure rates, latency percentiles |
-| `GET /v1/ws` | WebSocket stream of status changes |
-| `GET /healthz`, `GET /readyz` | Liveness; readiness of MySQL and Valkey |
-
-Refusals share one body: `{"code","message","details":[{"index","field","reason"}]}`. 400 names each offending field or parameter (and the item index in a batch); 409 means the notification is not in a state that allows the action; 413 is a body over 8 MiB; 422 is an `Idempotency-Key` reused with a different payload; 503 with `Retry-After` means the database cannot be reached and nothing was stored.
-
-Limits, defined once in [`internal/notification/limits.go`](internal/notification/limits.go) and enforced by the spec, the service and database `CHECK`s: SMS `to` is E.164 and content is 1 to 1600 characters; email `to` is at most 254 characters and content 1 to 100,000; push `to` is a device token of 1 to 255 characters and content 1 to 1024.
+| HTTP and WebSocket contract | [`api/openapi.yaml`](api/openapi.yaml), rendered at `/docs`; server types are generated from it |
+| Database | [`schema/`](schema), one file per aggregate; [`migrations/`](migrations) are generated from it |
+| Settings and secrets | [`config/`](config); `go run ./cmd/app env` prints every setting with its default and bounds, `app env check` validates an environment |
+| Limits (lengths, batch size) | [`internal/notification/limits.go`](internal/notification/limits.go); the spec and the schema repeat them and a test asserts they agree |
+| Why it is built this way | [`docs/decisions/`](docs/decisions) |
+| Requirements, the test that proves each, measured numbers | [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md) |
+| Dev commands | `go tool -modfile=tools.mod task --list` |
 
 ## How it works
 
 ```mermaid
 flowchart LR
-  client([API client]) -->|REST, WebSocket| api["app serve<br/>(any number)"]
+  client([API client]) -->|REST, WebSocket| api["app serve"]
   api -->|one transaction per request| db[(MySQL<br/>record and queue)]
-  w["app worker × 3<br/>(any number)"] -->|claim: FOR UPDATE SKIP LOCKED,<br/>lease + claim_version| db
+  w["app worker × N"] -->|claim: FOR UPDATE SKIP LOCKED, lease| db
   w -->|reserve send slots| vk[(Valkey<br/>rate limit, events)]
-  w -->|"POST {to, channel, content}<br/>Idempotency-Key = notification id"| provider([Provider])
-  w -->|status events| vk
+  w -->|"POST, Idempotency-Key = notification id"| provider([Provider])
   api -->|subscribe| vk
   api & w -->|traces, logs, metrics| otel[OpenTelemetry → Grafana]
 ```
 
-One binary, three roles: `app migrate`, `app serve`, `app worker` (plus two helpers: `app healthcheck` for the container health probe and `app env`, which prints every setting). No process assumes it is the only one.
+One binary, three roles (`app migrate`, `app serve`, `app worker`); no process assumes it is the only one.
 
-- **Accepting.** A request is validated (spec, then service rules), templates are rendered, and the notification is stored in one transaction; a batch and its items are one transaction. The API answers `201` before anything is sent. An `Idempotency-Key` is stored in the same transaction, so the primary key decides the race between two identical requests.
-- **The queue is the table.** A notification is `pending` with a due time. Workers claim due rows with `SELECT … FOR UPDATE SKIP LOCKED` under READ COMMITTED through an index that matches the query's order, so claimers never wait for each other. A scheduled notification is simply a row whose due time is in the future; a retry is the same row with a later due time. Nothing sleeps holding a message.
-- **One state machine.** `pending → processing → sent | failed`, `pending → cancelled`, `processing → pending` (retry or expired lease), `failed → pending` (replay). Every change is a conditional `UPDATE … WHERE status = <from>`, so a cancel racing a worker has exactly one winner. Each provider call is one row in `delivery_attempts`.
-- **Rate limit.** A GCRA limiter in Valkey, on Valkey's clock, hands out send slots spaced one interval apart across all workers. A worker reserves the next slots, claims that many rows in one query, and sends each at its slot, placed on its own clock through an offset it learns from every call to Valkey, so a slow reply cannot shift a group of sends. Slots are reserved before rows are claimed, and a job that misses its slot is released, never sent late. The limiter paces 5% under the limit (95 per second) so requests that arrive in a clump do not show the provider 101 in a second; at 3% a two-core machine reached 100, and 101 once. If Valkey is unreachable the workers send nothing and readiness says so. The limit is the hard rule and throughput is what gives: a slot is given up when its claim takes longer than 200 ms or its timer wakes more than one interval (10 ms) late, so a starved machine or a slow database sends fewer than 95 per second rather than more than 100. Every run on the compose stack stayed at or under 100; one test run showed 106 in a second after the machine stalled for several seconds, a case the worker now guards against but which has not been re-measured on a real stack (measured numbers: [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md), row R8).
-- **Priority.** Each channel's slots are split between high, normal and low by weights (70 / 20 / 10). A priority that has nothing due lends its slots to the next one, so high traffic gets everything when alone and low traffic always moves.
-- **Retries.** One classifier decides: network errors, timeouts, 408, 425, 429 and 5xx are retried with full-jitter exponential backoff, never sooner than `Retry-After`; any other 4xx fails at once. After five calls a notification is `failed` (`exhausted`): the dead letter, listed with `status=failed` and replayable.
-- **Circuit breaker.** Per channel, in each worker. While it is open the worker does not claim that channel's rows, so an outage burns no attempts and other channels keep their rate.
-- **Crashes.** A claim is a lease with a version. A worker that dies leaves rows that a reaper returns to `pending`; a worker that was paused past its lease does not send (each call is capped by the lease's remaining time) and its late write changes nothing (`WHERE claim_version = ?`).
-- **Events.** Every committed status change is published once through Valkey; `GET /v1/ws` streams them from any API instance. REST stays the source of truth.
-- **Observability.** JSON logs carry the notification's correlation id in the API and the workers, and it is sent to the provider. The delivery span continues the accepting request's trace, so one trace covers the request, the queue wait and the provider call. `GET /v1/metrics` is computed from MySQL, so every instance gives the same numbers; the workers also export delivery attempts, provider call duration and slots given up (`notifier.*`) through OpenTelemetry, visible in Grafana.
+- The queue is the notifications table: workers claim due rows with `SKIP LOCKED` under a lease, so a crashed worker's rows come back ([0003](docs/decisions/0003-mysql-is-record-and-queue.md), [0018](docs/decisions/0018-many-instances-one-database.md)).
+- One state machine; every change is a conditional update, so a cancel racing a worker has one winner ([0005](docs/decisions/0005-one-state-machine-attempts-recorded.md)).
+- The rate limit is shared by all workers through Valkey and paced 5% under the limit; a slot that cannot be kept is given up, never sent late ([0009](docs/decisions/0009-global-rate-limit-in-valkey.md)).
+- Retries are classified and jittered, the breaker stops claiming a failing channel, the dead letter is the `failed` status ([0007](docs/decisions/0007-retries-classified-jittered-stored.md), [0008](docs/decisions/0008-breaker-pauses-claiming.md)).
+- Delivery is at least once; the provider receives the notification id as `Idempotency-Key` ([0006](docs/decisions/0006-at-least-once-with-provider-key.md)).
+- One correlation id and one trace cover the request, the queue wait and the provider call ([0019](docs/decisions/0019-one-correlation-id-one-trace.md)).
 
-### What "sent once" means here
+Operating notes: the API has no authentication of its own and belongs behind a gateway; with MySQL down it answers 503 with `Retry-After` (repeat with the same `Idempotency-Key`); with Valkey down it keeps accepting while workers stop sending. `/healthz` is liveness, `/readyz` checks MySQL and Valkey.
 
-Delivery is at-least-once. Duplicates are prevented on our side: client retries by `Idempotency-Key`, concurrent workers by the row lock and the lease version. A send whose outcome is unknown (a timeout after the provider accepted) is retried with the same `Idempotency-Key`, so it is delivered once only if the provider honours that key. The provider stand-in implements key dedupe as a switch (`PUT /_control/dedupe`), and the tests measure both cases.
+## Code layout
 
-### Operating notes
-
-- `GET /v1/metrics` is computed from MySQL on every call and is not cached, so it always agrees with what a client just did; put it behind the same authentication and rate limiting as the rest of the API before exposing it.
-- The API has no authentication of its own; it is meant to sit behind a gateway.
-- If MySQL is down, or accepts connections and does not answer within `APP_REQUEST_TIMEOUT`, the API answers 503 with `Retry-After` and readiness is 503; a create that got a 503 may still have been stored, so repeat it with the same `Idempotency-Key`; workers keep running and resume by themselves. A send whose result could not be written is sent again when its lease ends: in a kill of MySQL mid-drain, about 100 of 9,000 were requested twice (same `Idempotency-Key`).
-- If Valkey is down the API keeps accepting and answering, workers stop sending (they cannot see the shared rate limit), `/readyz` is 503, and WebSocket streams are closed rather than left with holes. Delivery resumes by itself when Valkey is back.
-
-### What comes next at larger scale
-
-One MySQL node carries this design to the low thousands of messages per second. Beyond that: shard by recipient hash, partition the tables by day and drop old partitions, and share breaker state between workers. The queue sits behind `core.Queue`, so a broker can replace the table without touching the workers' logic.
-
-## Settings
-
-Every application setting is an `APP_*` environment variable declared once in [`config`](config/config.go) with a default, bounds and a doc line. `go run ./cmd/app env` prints all of them as an env file, bounds included; a test fails if this table misses one.
-
-That declaration is the one shape every environment fits: local, test, stage, production. Values may differ between them; names, types and bounds may not. The binary refuses to start on a value that does not fit, and `app env check` runs the same validation without starting anything (it also reports an `APP_*` variable the service does not know, which is how a typo in a deploy manifest is caught, and never prints a secret):
-
-```bash
-docker compose run --rm --no-deps app env check
+```
+api/  schema/  migrations/  config/   contracts and settings
+cmd/app  cmd/fakeprovider             entry points; cmd/app wires the packages
+internal/notification                 vocabulary, state machine, limits, ports
+internal/intake                       accept, read, cancel, retry
+internal/delivery (limiter, breaker)  the worker loop and its policies
+internal/httpapi                      HTTP and WebSocket handlers, generated server, /docs
+internal/store                        SQL queries (sqlc) and the queue
+internal/provider  internal/realtime  provider client; status events over Valkey
+internal/telemetry                    logs, traces, metrics
+internal/fakeprovider                 the provider stand-in
+test/acceptance                       black-box tests, one per requirement
+tools/                                repo tooling (schema diff, commit check, agent guards, QA scripts)
 ```
 
-Secrets (today only `APP_DATABASE_DSN`) have no default and are never committed. Where the service is deployed, the platform's secrets manager supplies them, either as the environment variable or as a mounted file named by `APP_DATABASE_DSN_FILE`. Locally nothing needs setting up: compose builds the DSN from the development-only database passwords below ([decision 0020](docs/decisions/0020-one-settings-schema-secrets-from-the-platform.md)).
+## Test and develop
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `APP_DATABASE_DSN` | required | MySQL DSN |
-| `APP_DB_MAX_OPEN_CONNS` | `10` | MySQL pool size per process |
-| `APP_VALKEY_ADDR` | `localhost:6379` | Valkey address |
-| `APP_HTTP_ADDR` | `:8080` | Listen address of `app serve` |
-| `APP_READ_HEADER_TIMEOUT` | `5s` | Time a client has to send its request headers |
-| `APP_REQUEST_TIMEOUT` | `15s` | Longest a request may take before it is answered 503 (not the WebSocket stream) |
-| `APP_SHUTDOWN_TIMEOUT` | `10s` | Grace on SIGTERM for in-flight requests (serve) and sends (worker) |
-| `APP_PROVIDER_URL_SMS`, `APP_PROVIDER_URL_EMAIL`, `APP_PROVIDER_URL_PUSH` | `http://localhost:8090/send` | Provider URL per channel |
-| `APP_PROVIDER_TIMEOUT` | `5s` | One provider call |
-| `APP_MAX_ATTEMPTS` | `5` | Provider calls before a notification is `exhausted` |
-| `APP_RETRY_BASE`, `APP_RETRY_CAP` | `1s`, `5m` | Backoff base and cap |
-| `APP_RATE_LIMIT_PER_SECOND` | `100` | The provider's limit per channel |
-| `APP_RATE_LIMIT_HEADROOM_PERCENT` | `5` | How far under the limit the limiter paces |
-| `APP_RATE_LIMIT_HORIZON` | `200ms` | How far ahead send slots are reserved |
-| `APP_PRIORITY_WEIGHTS` | `70,20,10` | Shares of high, normal, low |
-| `APP_LEASE_DURATION`, `APP_REAP_INTERVAL` | `30s`, `5s` | Claim lease; how often expired leases are returned |
-| `APP_WORKER_CONCURRENCY` | `32` | Provider calls in flight per worker |
-| `APP_BREAKER_WINDOW`, `APP_BREAKER_MIN_REQUESTS`, `APP_BREAKER_FAILURE_RATIO`, `APP_BREAKER_COOLDOWN` | `10s`, `10`, `0.5`, `5s` | Circuit breaker: opens when at least that many calls in the window failed at that ratio; one probe after the cool-down |
-| `APP_IDEMPOTENCY_RETENTION`, `APP_IDEMPOTENCY_SWEEP_INTERVAL` | `24h`, `1m` | How long a key is remembered; how often expired keys are deleted |
-| `APP_WS_SEND_BUFFER` | `256` | Events buffered per WebSocket subscriber before it is dropped |
-| `APP_OTLP_ENDPOINT` | empty | OTLP/HTTP endpoint; empty disables export |
-| `APP_SERVICE_NAME` | `notifier` | `service.name` on every span, metric and log |
-| `APP_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
-
-`docker compose` sets the application's settings itself and reads only these from your shell or from a `.env` file beside `docker-compose.yml`:
-
-| Compose variable | Default | Meaning |
-|---|---|---|
-| `APP_PORT`, `PROVIDER_PORT`, `GRAFANA_PORT`, `MYSQL_PORT` | `8080`, `8090`, `3000`, `3306` | Host ports (loopback only) of the API, the provider stand-in, Grafana and MySQL (database `app`, user `app`) |
-| `MYSQL_PASSWORD`, `MYSQL_ROOT_PASSWORD` | `local-dev`, `local-dev-root` | Local database passwords |
-| `PROVIDER_URL_SMS`, `PROVIDER_URL_EMAIL`, `PROVIDER_URL_PUSH` | the stand-in | Where each channel's messages are sent |
-| `PROVIDER_DEDUPE` | `true` | Whether the stand-in honours `Idempotency-Key` |
-
-To send to a real endpoint instead of the stand-in, export `PROVIDER_URL_SMS`, `PROVIDER_URL_EMAIL` or `PROVIDER_URL_PUSH` before `docker compose up`. A free webhook.site URL accepts about 100 requests in total, which this system sends in one second, so the stand-in is the default.
-
-## Test
-
-```bash
-go tool -modfile=tools.mod task test:all
-```
-
-Unit tests, then the integration tests: the packages' own tests against real MySQL and Valkey (queries served by their indexes, the limiter, the worker loop) and the acceptance tests in [`test/acceptance`](test/acceptance). Those build the binary, run `serve` and several `worker` processes against real MySQL and Valkey (containers) and the provider stand-in, and assert on what an API client and the provider observe. Each test names the requirement it proves; the map is [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md). Needs Go and Docker.
-
-`go tool -modfile=tools.mod task check` is the full local gate (build, vet, lint, unit tests, vulnerabilities). CI runs a superset on every pull request and on `main`: race tests, the integration tests, the migration drift check, the image scan and a compose bring-up.
-
-The rate tests assert the cap (at most 100 in any second) everywhere, and the throughput floors (88 per second over a drain, 91 in steady state) on a machine that can keep time. CI's two-core runner cannot, so the workflow sets `ACCEPTANCE_RATE_FLOOR=40` there; the floors run in full with the command above. A loaded laptop can miss them for the same reason while the cap still holds; set `ACCEPTANCE_RATE_FLOOR=40` in the environment to run everything with the lower floors.
-
-## Where things are
-
-| Path | What |
-|---|---|
-| `api/openapi.yaml` | HTTP contract; the server interface is generated from it and requests are validated against it at runtime |
-| `schema/*.sql` | Desired database state; `migrations/` is generated from it by Atlas (versioned, goose format) |
-| `internal/notification` | Vocabulary, the state machine, the limits, and the ports between the parts |
-| `internal/intake`, `internal/httpapi` | Accepting, validating, reading, cancelling; HTTP handlers, WebSocket |
-| `internal/delivery`, `internal/delivery/limiter`, `internal/delivery/breaker`, `internal/provider` | Delivery loop, rate limit, circuit breaker, provider client and retry classifier |
-| `internal/store`, `migrations/` | SQL queries (sqlc), the queue; the versioned migrations, embedded in the binary |
-| `internal/realtime` | Status events over Valkey |
-| `internal/telemetry`, `config` | Logs, traces, metrics; every setting |
-| `internal/fakeprovider`, `cmd/fakeprovider` | The provider stand-in: faults, dedupe switch, exact counts |
-| `docs/decisions` | Why things are the way they are, one record per decision |
-| `docs/AI-WORKFLOW.md`, `.agents/` | How AI agents built this: roles, briefs, reviews, mistakes and how each was caught |
-
-## Develop
-
-Only Go and Docker are needed. Go tools are pinned in `tools.mod`; Atlas and Trivy run from Docker images pinned by digest. The commit hooks are optional: install [lefthook](https://github.com/evilmartians/lefthook) and run `lefthook install`. They format, vet and scan staged files and hold the commit subject to [Conventional Commits](https://www.conventionalcommits.org) (`type(scope): description`); CI checks the subjects of every pull request too.
-
-```bash
-go tool -modfile=tools.mod task --list
-```
+Needs Go and Docker. `go tool -modfile=tools.mod task test:all` runs unit, integration and acceptance tests; `task check` is the local gate. The rate tests assert the cap (100 in any second) everywhere and throughput floors on a machine that keeps time; set `ACCEPTANCE_RATE_FLOOR=40` on a loaded machine. Commit hooks are optional: `lefthook install`. How AI agents built this: [`docs/AI-WORKFLOW.md`](docs/AI-WORKFLOW.md).
 
 ## Release
 
-`main` moves by fast-forward, so it holds exactly the commits CI tested ([decision 0021](docs/decisions/0021-fast-forward-main-releases-cut-by-hand.md)). Releases are cut by hand from a commit on `main` whose CI run is green:
-
-```bash
-gh workflow run release -f version=v1.0.0-rc.1   # a release candidate
-gh workflow run release -f version=v1.0.0        # a release; also tags the image `latest`
-```
-
-The workflow builds the service image, scans it, pushes it to the repository's package registry and creates the tag and the release notes from the commit subjects. Nothing is deployed by a push.
+`main` moves by fast-forward, so it holds the commits CI tested; a release is cut by hand from a green commit: `gh workflow run release -f version=v1.0.0` ([0021](docs/decisions/0021-fast-forward-main-releases-cut-by-hand.md)).

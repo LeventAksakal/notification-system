@@ -1,0 +1,4 @@
+{"notifications": [
+  {"to": "ada@example.com", "channel": "email", "content": "Welcome"},
+  {"to": "device-token-1", "channel": "push", "content": "Sale starts now", "priority": "low"}
+]}
