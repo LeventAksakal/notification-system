@@ -1,10 +1,13 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-13
-decision-makers: owner (pending); proposed by the coordinator
+decision-makers: owner (in chat, 15 Nov 2026); proposed by the coordinator
 revisit: when a channel's delivery limit goes well above 100 per second, or a second service must consume the same events
 ---
 # MySQL 8.4 is the system of record and the queue (0003)
+
+## Question
+Where do notifications wait between "accepted" and "sent", and what hands them to the workers?
 
 ## Rule
 Workers claim rows with `SELECT … FOR UPDATE SKIP LOCKED` in a READ COMMITTED transaction, through an index whose order matches the query's `ORDER BY`. No message broker.
@@ -19,9 +22,12 @@ The brief is titled "event-driven" and requires status lookup, cancel before sen
 4. PostgreSQL instead of MySQL. Same `SKIP LOCKED` design; no difference that matters here.
 
 ## Decision
-Pending. Recommended: option 1 behind the `core.Queue` interface, so a broker can replace it when the revisit trigger fires. "Event-driven" is met by the state change events the workers publish (0013), not by adding a broker the load does not need.
+Option 1, behind the `notification.Queue` interface (`internal/notification/ports.go`), so a broker can replace it when the revisit trigger fires. "Event-driven" is met by the state change events the workers publish (0013), not by adding a broker the load does not need.
 
 ## Confirmation
 - A test runs `EXPLAIN` on the claim query and fails on `Using filesort` or a full scan (InnoDB locks every row it scans; MySQL bug 115246).
 - A concurrency test with several claimers asserts no row is claimed twice.
 - Facts and sources: `.agents/research/2026-11-13-design-facts.md`.
+
+## Follow-up (15 Nov 2026)
+The owner accepted the queue design but not its idle poll: workers poll an empty channel every 50 ms doubling to 250 ms, numbers no stated bound produced, so the first notification after a quiet period waits up to 250 ms. Rejected for the fix: a direct API-to-worker call (gRPC or IPC), because carrying the payload re-creates the dual write, the API would need to discover workers, and API availability would hang on theirs (0002). Being built on its own branch: a best-effort wake hint over Valkey after commit, workers sleeping until the next due time or the hint, and a slow safety poll derived from a stated bound; target 30 ms median and 100 ms p99 from 201 to provider for a message after a quiet period. Lands only if before/after measurements show the win; this record gets its result then.

@@ -25,6 +25,10 @@ Router, not a manual. Every line is something you could not work out from the co
 - Go-specific traps live in `.claude/rules/go-code.md` (loaded with `.go` files).
 - MySQL readiness must be checked over TCP (`--protocol=tcp`); the first-boot server answers socket pings with networking off.
 
+## Numbers and names (owner, 15 Nov 2026)
+- No unexplained number. Every dial, constant, timeout, window, ratio or test floor says where it comes from: derived from a stated target, measured, or a named industry default. If it is arbitrary, say so and say how to tune it (a stress test, a measured percentile, an optimisation metric). Put the reason in the dial's doc line or beside the constant, and in the decision record's Numbers table.
+- Files are named for what they do (`claim_loop.go`, `retry_budget.go`), never for the package's topic (`delivery.go`, `service.go`, `handlers.go`).
+
 ## Pushing
 - CI minutes are billed (private repository). Batch commits locally, run the gate locally (`task check`, then `task test:integration`; pin a test to two cores to imitate the runner), and push once per change set. Never push to see what CI says.
 

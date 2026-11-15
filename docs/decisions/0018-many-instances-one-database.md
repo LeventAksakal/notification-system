@@ -1,10 +1,13 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-13
-decision-makers: owner (pending); proposed by the coordinator
+decision-makers: owner (in chat, 15 Nov 2026); proposed by the coordinator
 revisit: when one MySQL primary can no longer hold the write load
 ---
 # Built for many instances on one database: claims are leases with a fencing token (0018)
+
+## Question
+The brief asks for millions of notifications a day with reliable delivery: how do many workers share the work safely when any of them can crash, pause or restart while holding messages?
 
 ## Rule
 A claim sets `lease_until` and increments `claim_version`. Every later write by that worker carries `WHERE claim_version = ?`; zero rows affected means the lease was lost and the result is discarded.
@@ -22,3 +25,9 @@ Pending. Recommended: option 2, with option 3 written up in the README as the ne
 
 ## Confirmation
 Fault tests: kill a worker mid-send, and pause a worker container past its lease then resume it. Assert every notification ends `sent`, none stays `processing`, and the paused worker's late write changed nothing.
+
+## Owner review (15 Nov 2026)
+- Accepted. One primary is enough: the provider ceiling is 3 channels × 95/s = 285/s (24.6 M a day), at about 5 writes per notification, about 1,400 writes/s. The rate limit binds before the database does.
+- Every dial (lease, reap interval, the lease cut, worker concurrency, pool size, and every other runtime setting) gets a derivation: Little's law for concurrency, measured write times for the pool and the cut, lease ≥ provider timeout + horizon + margin. `config.Load` refuses impossible combinations, such as a lease shorter than the provider timeout.
+- Next step at scale, written up and not built: daily partitions, so retention is `DROP PARTITION` instead of `DELETE`. The primary key would become `(id, created_at)`.
+- Built in session dials-derived (branch `feat-derived-dials`), merged with the rest.

@@ -18,3 +18,9 @@ Seen in the run: the `notification cancelled` line carries the cancel request's 
 ## 5. WebSocket subscription liveness
 Question: the spec does not say when a subscription is live.
 Assumption taken: once the handshake completes, every later committed change is delivered (tests create right after `Dial` returns). The creation of a notification publishes a `pending` event; cancel publishes `cancelled`. Events with `batchId` subscription carry `batchId`.
+
+## Answer (owner, in chat, 15 Nov 2026)
+1. (a) Continue the trace: decision 0019 is now option 2.
+2. and 3. The assumptions taken stand.
+4. (a) The stored id goes on lines about the notification; the request's id stays on its access line. Built in session trace-correlation, with cancel added to R14.
+5. Covered by decision 0013 and session realtime-seq (exact event order).

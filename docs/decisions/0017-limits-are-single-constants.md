@@ -1,10 +1,13 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-13
-decision-makers: owner (pending); proposed by the coordinator
+decision-makers: owner (in chat, 15 Nov 2026); proposed by the coordinator
 revisit: when a real provider's limits are known
 ---
 # Each content limit is one constant, enforced in the spec, the service and the schema (0017)
+
+## Question
+The brief asks for content validation (character limits, required fields) without numbers: what are the limits, and how does every layer enforce the same ones?
 
 ## Rule
 Every limit is declared once in `internal/notification/limits.go`. A test fails if the OpenAPI spec, the validator or a database `CHECK` disagrees with it.
@@ -18,7 +21,7 @@ The brief: "content validation (character limits, required fields)". The provide
 3. Limits as runtime configuration. Changeable without a release; a database `CHECK` cannot follow a dial, so the last line of defence is lost.
 
 ## Decision
-Pending. Recommended: option 1. The numbers are the owner's call; proposed:
+Option 1. The numbers are the owner's call; proposed:
 
 | Channel | `to` | `content` |
 |---|---|---|
@@ -30,3 +33,10 @@ Required on every notification: `to`, `channel`, `content` (or a template, 0015)
 
 ## Confirmation
 The agreement test above, and one acceptance test per channel at the limit (accepted) and one past it (refused, field named).
+
+## Owner review (15 Nov 2026)
+- Every limit stands on a standard or a provider's documented limit, or is derived from one; no arbitrary numbers. The sources go into this record's Numbers table and beside each constant.
+- Correction: 1600 is Twilio's maximum message body, not "10 segments". A segment holds 160 GSM-7 characters (153 when concatenated) or 70 UCS-2 characters (67), so 1600 characters is 11 to 24 billed segments.
+- Content and recipients that are blank after trimming are refused at every layer (spec, validator, CHECK).
+- Push providers limit payload bytes (APNs and FCM: 4096); the session decides between counting bytes and the worst-case character derivation, and states why.
+- Built in session limits-standards (branch `feat-limits-from-standards`, on top of the code-first API branch), merged with the rest.

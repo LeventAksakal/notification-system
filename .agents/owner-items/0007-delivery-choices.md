@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-14
 tags: [delivery, rate-limit, tracing]
 ---
@@ -19,3 +19,4 @@ Four choices were made while building the worker. Does the owner keep them?
 Also: the MySQL driver now interpolates parameters client-side (`InterpolateParams`), because a prepared-statement round trip made an empty claim take 48 ms against 1.7 ms.
 
 ## Answer
+Owner, in chat, 15 Nov 2026: all four kept, each now settled by a record. 1a: decision 0009, with adaptive send alignment in session adaptive-align. 2a: decision 0006. 3a: decision 0019, option 2. 4a: decision 0008. The client-side parameter interpolation stays.
