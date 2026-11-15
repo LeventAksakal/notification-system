@@ -1,0 +1,2 @@
+# Vendored third-party bundle: keep bytes exact so its recorded SHA-256 holds.
+*.js -text
