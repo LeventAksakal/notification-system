@@ -27,5 +27,5 @@ FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266
 COPY --from=build /out/app /app
 USER nonroot:nonroot
 EXPOSE 8080
+# No CMD: every container names its role (serve, worker, migrate); none is assumed.
 ENTRYPOINT ["/app"]
-CMD ["serve"]

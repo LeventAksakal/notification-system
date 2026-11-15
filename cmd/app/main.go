@@ -42,7 +42,7 @@ import (
 )
 
 func main() {
-	cmd := "serve"
+	cmd := "" // no default role: a container started without one fails at once
 	if len(os.Args) > 1 {
 		cmd = os.Args[1]
 	}
@@ -62,6 +62,10 @@ func run(ctx context.Context, cmd string) error {
 	case "env":
 		// No config, no connections, no telemetry.
 		return env(os.Stdout, os.Args[2:], os.Environ()) //nolint:forbidigo // app env check validates the whole environment against config
+	case "migrate", "serve", "worker":
+	default:
+		// Refused before config and connections: a typo is not a database error.
+		return fmt.Errorf("%w, got %q", errUsage, cmd)
 	}
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -92,12 +96,13 @@ func run(ctx context.Context, cmd string) error {
 		return store.Migrate(ctx, db)
 	case "serve":
 		return serve(ctx, cfg, db)
-	case "worker":
+	default: // "worker"; anything else was refused above
 		return worker(ctx, cfg, db)
-	default:
-		return fmt.Errorf("unknown command %q (serve, worker, migrate, healthcheck, env)", cmd)
 	}
 }
+
+// errUsage is the exit of a missing or unknown role.
+var errUsage = errors.New("usage: app serve|worker|migrate|healthcheck|env [check]")
 
 // errEnvCheck is the exit of an `app env check` that found problems; they
 // are on stdout already.
@@ -173,7 +178,9 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		Breakers:  breakers,
 		Tracer:    otel.Tracer("notifier/worker"),
 	})
+	retryWorst, retryMean := delivery.RetrySpan(cfg.MaxAttempts, cfg.RetryBase, cfg.RetryCap)
 	slog.InfoContext(ctx, "worker started", "concurrency", cfg.WorkerConcurrency, "weights", cfg.PriorityWeights,
+		"max_attempts", cfg.MaxAttempts, "retry_span_mean", retryMean.String(), "retry_span_worst", retryWorst.String(),
 		"rate_per_second", cfg.RateLimitPerSecond, "headroom_percent", cfg.RateLimitHeadroomPct,
 		"horizon", cfg.RateLimitHorizon.String())
 	err = w.Run(ctx)
