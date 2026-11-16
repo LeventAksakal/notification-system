@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-13
 tags: [decisions, process]
 ---
@@ -30,3 +30,4 @@ Option 1. The contracts (`api/openapi.yaml`, `schema/notifications.sql`, `intern
 - The example `app_meta` table and `GET /v1/meta/{key}` were removed.
 
 ## Answer
+Answered by the walkthrough (15 to 16 Nov 2026): the owner discussed every record 0001 to 0019 one by one and each ended accepted, accepted with a change, or replaced (0004 by 0024, 0008 by 0026). Closed by the coordinator, 16 Nov.

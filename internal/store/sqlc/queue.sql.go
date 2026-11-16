@@ -14,7 +14,7 @@ import (
 
 const claimCandidates = `-- name: ClaimCandidates :many
 
-SELECT id, batch_id, recipient, content, attempts, claim_version, due_at, correlation_id, traceparent
+SELECT id, batch_id, recipient, content, attempts, budget_spent, claim_version, status_seq, due_at, correlation_id, traceparent
 FROM notifications
 WHERE status = 'pending' AND channel = ? AND priority = ? AND due_at <= NOW(3)
 ORDER BY due_at
@@ -34,7 +34,9 @@ type ClaimCandidatesRow struct {
 	Recipient     string
 	Content       string
 	Attempts      uint32
+	BudgetSpent   uint32
 	ClaimVersion  uint64
+	StatusSeq     uint64
 	DueAt         time.Time
 	CorrelationID string
 	Traceparent   sql.NullString
@@ -62,7 +64,9 @@ func (q *Queries) ClaimCandidates(ctx context.Context, arg ClaimCandidatesParams
 			&i.Recipient,
 			&i.Content,
 			&i.Attempts,
+			&i.BudgetSpent,
 			&i.ClaimVersion,
+			&i.StatusSeq,
 			&i.DueAt,
 			&i.CorrelationID,
 			&i.Traceparent,
@@ -82,7 +86,7 @@ func (q *Queries) ClaimCandidates(ctx context.Context, arg ClaimCandidatesParams
 
 const finishFailed = `-- name: FinishFailed :execrows
 UPDATE notifications
-SET status = 'failed', attempts = attempts + 1, last_error = ?,
+SET status = 'failed', attempts = attempts + 1, budget_spent = budget_spent + 1, last_error = ?,
     failure_kind = ?, lease_until = NULL, finished_at = NOW(3)
 WHERE id = ? AND status = 'processing' AND claim_version = ?
 `
@@ -94,7 +98,7 @@ type FinishFailedParams struct {
 	ClaimVersion uint64
 }
 
-// processing -> failed (permanent refusal or an exhausted budget).
+// processing -> failed (permanent refusal or an exhausted budget); both count.
 func (q *Queries) FinishFailed(ctx context.Context, arg FinishFailedParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, finishFailed,
 		arg.LastError,
@@ -110,12 +114,13 @@ func (q *Queries) FinishFailed(ctx context.Context, arg FinishFailedParams) (int
 
 const finishRetry = `-- name: FinishRetry :execrows
 UPDATE notifications
-SET status = 'pending', attempts = attempts + 1, last_error = ?,
+SET status = 'pending', attempts = attempts + 1, budget_spent = budget_spent + ?, last_error = ?,
     due_at = NOW(3) + INTERVAL ? MICROSECOND, lease_until = NULL
 WHERE id = ? AND status = 'processing' AND claim_version = ?
 `
 
 type FinishRetryParams struct {
+	Counted      uint32
 	LastError    sql.NullString
 	DelayUs      interface{}
 	ID           string
@@ -123,8 +128,11 @@ type FinishRetryParams struct {
 }
 
 // processing -> pending, due again after delay_us (a retry is a stored due time, decision 0007).
+// counted is 1 when the failure counts against the budget, 0 when it belongs
+// to a declared provider outage (decision 0026).
 func (q *Queries) FinishRetry(ctx context.Context, arg FinishRetryParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, finishRetry,
+		arg.Counted,
 		arg.LastError,
 		arg.DelayUs,
 		arg.ID,
@@ -149,7 +157,10 @@ type FinishSentParams struct {
 	ClaimVersion      uint64
 }
 
-// processing -> sent.
+// processing -> sent. Every write below is fenced by claim_version, and only a
+// claim moves a row into processing (bumping claim_version), so when it
+// matches no status change happened since the claim: the new status_seq (the
+// trigger raises it) is the claim's plus one, known without reading it back.
 func (q *Queries) FinishSent(ctx context.Context, arg FinishSentParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, finishSent, arg.ProviderMessageID, arg.ID, arg.ClaimVersion)
 	if err != nil {
@@ -205,7 +216,9 @@ type LeaseNotificationsParams struct {
 }
 
 // pending -> processing for the rows locked by ClaimCandidates in the same
-// transaction, in one statement (one round trip, however many rows).
+// transaction, in one statement (one round trip, however many rows). The
+// trigger raises status_seq; each row's new value is the one ClaimCandidates
+// read plus one, since the row lock is held from that SELECT to the commit.
 func (q *Queries) LeaseNotifications(ctx context.Context, arg LeaseNotificationsParams) (int64, error) {
 	query := leaseNotifications
 	var queryParams []interface{}
@@ -225,8 +238,59 @@ func (q *Queries) LeaseNotifications(ctx context.Context, arg LeaseNotifications
 	return result.RowsAffected()
 }
 
+const nextDue = `-- name: NextDue :many
+SELECT 'high' AS priority, MIN(h.due_at) IS NOT NULL AS pending, CAST(COALESCE(TIMESTAMPDIFF(MICROSECOND, NOW(3), MIN(h.due_at)), 0) AS SIGNED) AS wait_us
+FROM notifications h WHERE h.status = 'pending' AND h.channel = ? AND h.priority = 'high'
+UNION ALL
+SELECT 'normal', MIN(n.due_at) IS NOT NULL, CAST(COALESCE(TIMESTAMPDIFF(MICROSECOND, NOW(3), MIN(n.due_at)), 0) AS SIGNED)
+FROM notifications n WHERE n.status = 'pending' AND n.channel = ? AND n.priority = 'normal'
+UNION ALL
+SELECT 'low', MIN(l.due_at) IS NOT NULL, CAST(COALESCE(TIMESTAMPDIFF(MICROSECOND, NOW(3), MIN(l.due_at)), 0) AS SIGNED)
+FROM notifications l WHERE l.status = 'pending' AND l.channel = ? AND l.priority = 'low'
+`
+
+type NextDueParams struct {
+	Channel NotificationsChannel
+}
+
+type NextDueRow struct {
+	Priority string
+	Pending  bool
+	WaitUs   int64
+}
+
+// How long until each priority's earliest pending notification of a channel
+// is due, in microseconds on the database's clock (<= 0: due now), and
+// whether it has any pending at all. An idle worker asks this instead of
+// claiming. Each arm is MIN over a constant prefix of claim_idx (status,
+// channel, priority, due_at): one index dive ("Select tables optimized
+// away"), whatever the backlog. A GROUP BY priority form reads every pending
+// entry of the channel instead.
+func (q *Queries) NextDue(ctx context.Context, arg NextDueParams) ([]NextDueRow, error) {
+	rows, err := q.db.QueryContext(ctx, nextDue, arg.Channel, arg.Channel, arg.Channel)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []NextDueRow
+	for rows.Next() {
+		var i NextDueRow
+		if err := rows.Scan(&i.Priority, &i.Pending, &i.WaitUs); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const reapCandidates = `-- name: ReapCandidates :many
-SELECT id, batch_id, channel, attempts, correlation_id
+SELECT id, batch_id, channel, attempts, status_seq, correlation_id
 FROM notifications
 WHERE status = 'processing' AND lease_until < NOW(3)
 ORDER BY lease_until
@@ -239,6 +303,7 @@ type ReapCandidatesRow struct {
 	BatchID       sql.NullString
 	Channel       NotificationsChannel
 	Attempts      uint32
+	StatusSeq     uint64
 	CorrelationID string
 }
 
@@ -258,6 +323,7 @@ func (q *Queries) ReapCandidates(ctx context.Context) ([]ReapCandidatesRow, erro
 			&i.BatchID,
 			&i.Channel,
 			&i.Attempts,
+			&i.StatusSeq,
 			&i.CorrelationID,
 		); err != nil {
 			return nil, err
@@ -279,7 +345,8 @@ SET status = 'pending', lease_until = NULL
 WHERE id IN (/*SLICE:ids*/?) AND status = 'processing'
 `
 
-// processing -> pending for rows locked by ReapCandidates in the same transaction.
+// processing -> pending for rows locked by ReapCandidates in the same
+// transaction; the trigger makes status_seq the one read plus one (row locks held).
 func (q *Queries) ReapLeases(ctx context.Context, ids []string) (int64, error) {
 	query := reapLeases
 	var queryParams []interface{}
@@ -310,7 +377,7 @@ type ReleaseLeaseParams struct {
 	ClaimVersion uint64
 }
 
-// processing -> pending without an attempt (breaker open, shutdown; decision 0008).
+// processing -> pending without an attempt (provider outage declared, shutdown; decision 0026).
 func (q *Queries) ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, releaseLease, arg.DelayUs, arg.ID, arg.ClaimVersion)
 	if err != nil {

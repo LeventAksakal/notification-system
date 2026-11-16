@@ -17,53 +17,57 @@ func TestR14CorrelationIDOnLogsAndProvider(t *testing.T) {
 	s := startStack(t, stackOptions{Workers: 1})
 	var contents []string
 
-	check := func(t *testing.T, kv []string) {
+	// check creates one notification, with X-Correlation-ID given ("" for none).
+	check := func(t *testing.T, given string) {
 		content := "r14-private-content-" + randHex(12)
 		contents = append(contents, content)
-		r := s.postJSON(t, "/v1/notifications", msg("sms", content), kv...)
-		if r.Status != 201 {
-			t.Fatalf("create: want 201, got %s", r)
+		var opts []reqOpt
+		if given != "" {
+			opts = append(opts, corrID(given))
 		}
-		var n apiNotification
-		r.decode(t, &n)
-		corr := r.Header.Get("X-Correlation-ID")
-		if len(kv) == 2 && corr != kv[1] {
-			t.Errorf("X-Correlation-ID echoed: want %q, got %q", kv[1], corr)
+		r := s.createResp(t, msg("sms", content), opts...)
+		if r.StatusCode() != 201 || r.JSON201 == nil {
+			t.Fatalf("create: want 201, got %s", show(r))
+		}
+		n := *r.JSON201
+		corr := r.HTTPResponse.Header.Get("X-Correlation-ID")
+		if given != "" && corr != given {
+			t.Errorf("X-Correlation-ID echoed: want %q, got %q", given, corr)
 		}
 		if corr == "" {
 			t.Fatalf("response carries no X-Correlation-ID header")
 		}
-		if n.CorrelationID != corr {
-			t.Errorf("notification correlationId %q differs from the response header %q", n.CorrelationID, corr)
+		if n.CorrelationId != corr {
+			t.Errorf("notification correlationId %q differs from the response header %q", n.CorrelationId, corr)
 		}
 
-		reqs := s.providerRequests(t, n.ID, 60*time.Second)
+		reqs := s.providerRequests(t, n.Id, 60*time.Second)
 		for _, pr := range reqs {
 			if pr.CorrelationID != corr {
 				t.Errorf("provider request X-Correlation-ID: want %q, got %q", corr, pr.CorrelationID)
 			}
 		}
-		s.waitStatus(t, n.ID, "sent", 30*time.Second)
+		s.waitStatus(t, n.Id, "sent", 30*time.Second)
 
 		for _, role := range []string{"serve", "worker"} {
 			var about []map[string]any
-			if !poll(10*time.Second, func() bool { about = linesAbout(s.Logs(role), n.ID); return len(about) > 0 }) {
-				t.Errorf("%s: no log line with notification_id=%s", role, n.ID)
+			if !poll(10*time.Second, func() bool { about = linesAbout(s.Logs(role), n.Id.String()); return len(about) > 0 }) {
+				t.Errorf("%s: no log line with notification_id=%s", role, n.Id)
 				continue
 			}
 			for _, l := range about {
 				if got := fieldString(l, "correlation_id"); got != corr {
-					t.Errorf("%s line about %s: correlation_id want %q, got %q: %v", role, n.ID, corr, got, l)
+					t.Errorf("%s line about %s: correlation_id want %q, got %q: %v", role, n.Id, corr, got, l)
 				}
 			}
 		}
 	}
 
 	t.Run("given id", func(t *testing.T) {
-		check(t, []string{"X-Correlation-ID", "r14-corr-" + randHex(16)})
+		check(t, "r14-corr-"+randHex(16))
 	})
 	t.Run("generated id", func(t *testing.T) {
-		check(t, nil)
+		check(t, "")
 	})
 
 	// Owner item 0006 #4, option (a): a later request about a notification (a
@@ -76,26 +80,101 @@ func TestR14CorrelationIDOnLogsAndProvider(t *testing.T) {
 		contents = append(contents, content)
 		body := msg("sms", content)
 		// Scheduled hours ahead so the running worker cannot claim it before the cancel.
-		body["scheduledAt"] = time.Now().UTC().Add(3 * time.Hour).Format(time.RFC3339)
-		n := s.create(t, body, "X-Correlation-ID", stored)
-		before := len(linesAbout(s.Logs("serve"), n.ID))
+		body.ScheduledAt = ptr(time.Now().UTC().Add(3 * time.Hour).Truncate(time.Second))
+		n := s.create(t, body, corrID(stored))
+		before := len(linesAbout(s.Logs("serve"), n.Id.String()))
 
-		r := s.postJSON(t, "/v1/notifications/"+n.ID+"/cancel", nil, "X-Correlation-ID", other)
-		if r.Status != 200 {
-			t.Fatalf("cancel: want 200, got %s", r)
+		// The cancel operation declares no X-Correlation-ID parameter; the
+		// header is set on the typed request.
+		r, err := s.API.CancelNotificationWithResponse(t.Context(), n.Id, headerEditor("X-Correlation-ID", other))
+		if err != nil {
+			t.Fatalf("cancel: %v", err)
 		}
-		if got := r.Header.Get("X-Correlation-ID"); got != other {
+		if r.StatusCode() != 200 {
+			t.Fatalf("cancel: want 200, got %s", show(r))
+		}
+		if got := r.HTTPResponse.Header.Get("X-Correlation-ID"); got != other {
 			t.Errorf("cancel response X-Correlation-ID: want the request's %q, got %q", other, got)
 		}
 		// The cancel must log at least one line about the notification, or this
 		// case would pass on silence.
 		var about []map[string]any
-		if !poll(10*time.Second, func() bool { about = linesAbout(s.Logs("serve"), n.ID); return len(about) > before }) {
-			t.Fatalf("serve: no log line with notification_id=%s after the cancel (had %d before)", n.ID, before)
+		if !poll(10*time.Second, func() bool { about = linesAbout(s.Logs("serve"), n.Id.String()); return len(about) > before }) {
+			t.Fatalf("serve: no log line with notification_id=%s after the cancel (had %d before)", n.Id, before)
 		}
 		for _, l := range about {
 			if got := fieldString(l, "correlation_id"); got != stored {
-				t.Errorf("serve line about %s: correlation_id want the stored %q, got %q: %v", n.ID, stored, got, l)
+				t.Errorf("serve line about %s: correlation_id want the stored %q, got %q: %v", n.Id, stored, got, l)
+			}
+		}
+		// The request's own id still finds the request (decision 0019, As
+		// built): the cancel line names it as request_correlation_id, and the
+		// cancel's access line carries it as correlation_id.
+		cancelLine := false
+		for _, l := range about[before:] {
+			if fieldString(l, "msg") == "notification cancelled" {
+				cancelLine = true
+				if got := fieldString(l, "request_correlation_id"); got != other {
+					t.Errorf("cancel line about %s: request_correlation_id want the request's %q, got %q: %v", n.Id, other, got, l)
+				}
+			}
+		}
+		if !cancelLine {
+			t.Errorf("serve: no \"notification cancelled\" line about %s among %v", n.Id, about[before:])
+		}
+		var access []map[string]any
+		poll(5*time.Second, func() bool {
+			access = nil
+			for _, l := range s.Logs("serve") {
+				p := fieldString(l, "path")
+				if fieldString(l, "msg") == "request" && strings.HasSuffix(p, "/cancel") && strings.Contains(p, n.Id.String()) {
+					access = append(access, l)
+				}
+			}
+			return len(access) > 0
+		})
+		if len(access) != 1 {
+			t.Fatalf("serve: want one access line for the cancel of %s, got %d", n.Id, len(access))
+		}
+		if got := fieldString(access[0], "correlation_id"); got != other {
+			t.Errorf("cancel access line: correlation_id want the request's %q, got %q: %v", other, got, access[0])
+		}
+	})
+
+	// A replayed create (same Idempotency-Key and body, another
+	// X-Correlation-ID) logs the stored id as correlation_id and the
+	// replaying request's id as request_correlation_id.
+	t.Run("replayed create: the stored id, and the replay's id as request_correlation_id", func(t *testing.T) {
+		stored := "r14-first-" + randHex(16)
+		replay := "r14-replay-" + randHex(16)
+		key := "r14-key-" + randHex(16)
+		content := "r14-private-content-" + randHex(12)
+		contents = append(contents, content)
+		body := msg("sms", content)
+		body.ScheduledAt = ptr(time.Now().UTC().Add(3 * time.Hour).Truncate(time.Second))
+		n := s.create(t, body, idemKey(key), corrID(stored))
+		r := s.createResp(t, body, idemKey(key), corrID(replay))
+		if r.StatusCode() != 201 || r.JSON201 == nil || r.JSON201.Id != n.Id {
+			t.Fatalf("replay: want 201 with the same notification %s, got %s", n.Id, show(r))
+		}
+		var replayed []map[string]any
+		if !poll(10*time.Second, func() bool {
+			replayed = nil
+			for _, l := range linesAbout(s.Logs("serve"), n.Id.String()) {
+				if fieldString(l, "msg") == "notification create replayed" {
+					replayed = append(replayed, l)
+				}
+			}
+			return len(replayed) > 0
+		}) {
+			t.Fatalf("serve: no \"notification create replayed\" line about %s", n.Id)
+		}
+		for _, l := range replayed {
+			if got := fieldString(l, "correlation_id"); got != stored {
+				t.Errorf("replayed line: correlation_id want the stored %q, got %q: %v", stored, got, l)
+			}
+			if got := fieldString(l, "request_correlation_id"); got != replay {
+				t.Errorf("replayed line: request_correlation_id want the replay's %q, got %q: %v", replay, got, l)
 			}
 		}
 	})

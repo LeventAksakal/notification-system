@@ -8,26 +8,28 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 const wsWait = 60 * time.Second
 
 // wantLifecycle checks that id's events read pending, processing, sent in that
 // order, with non-decreasing `at` and the StatusEvent required fields.
-func wantLifecycle(t *testing.T, evs []statusEvent, n apiNotification) {
+func wantLifecycle(t *testing.T, evs []apiclient.StatusEvent, n apiclient.Notification) {
 	t.Helper()
-	mine := eventsFor(evs, n.ID)
+	mine := eventsFor(evs, n.Id)
 	if got, want := statuses(mine), []string{"pending", "processing", "sent"}; !slices.Equal(got, want) {
-		t.Fatalf("events for %s: want statuses %v in order, got %v", n.ID, want, mine)
+		t.Fatalf("events for %s: want statuses %v in order, got %s", n.Id, want, eventsString(mine))
 	}
-	requireEventFields(t, mine, n.CorrelationID)
+	requireEventFields(t, mine, n.CorrelationId)
 	for i := 1; i < len(mine); i++ {
-		if mine[i].At != nil && mine[i-1].At != nil && mine[i].At.Before(*mine[i-1].At) {
+		if mine[i].At.Before(mine[i-1].At) {
 			t.Errorf("event `at` goes backwards: %v then %v", mine[i-1].At, mine[i].At)
 		}
 	}
-	if last := mine[len(mine)-1]; last.Attempts == nil || *last.Attempts != 1 {
-		t.Errorf("sent event attempts: want 1, got %v", last)
+	if last := mine[len(mine)-1]; last.Attempts != 1 {
+		t.Errorf("sent event attempts: want 1, got %s", eventString(last))
 	}
 }
 
@@ -37,7 +39,7 @@ func TestB4WSStreamsStatusChanges(t *testing.T) {
 	s := startStack(t, stackOptions{Workers: 1})
 	c := s.subscribe(t)
 	n := s.create(t, msg("sms", "b4 stream"))
-	evs := collectUntil(t, c, wsWait, reached(n.ID, "sent"), "sent of "+n.ID)
+	evs := collectUntil(t, c, wsWait, reached(n.Id, "sent"), "sent of "+n.Id.String())
 	wantLifecycle(t, evs, n)
 }
 
@@ -46,17 +48,17 @@ func TestB4WSStreamsStatusChanges(t *testing.T) {
 func TestB4WSSnapshotAfterSent(t *testing.T) {
 	s := startStack(t, stackOptions{Workers: 1})
 	n := s.create(t, msg("email", "b4 late"))
-	s.waitStatus(t, n.ID, "sent", wsWait)
+	s.waitStatus(t, n.Id, "sent", wsWait)
 
-	c := s.subscribe(t, "notificationId", n.ID)
+	c := s.subscribe(t, "notificationId", n.Id.String())
 	e, err := readEvent(c, time.Now().Add(10*time.Second))
 	if err != nil {
 		t.Fatalf("first message of a notificationId subscription: %v", err)
 	}
-	if !e.Snapshot || e.Status != "sent" || e.NotificationID != n.ID {
-		t.Errorf("first message: want snapshot of %s with status sent, got %v", n.ID, e)
+	if !isSnapshot(e) || e.Status != "sent" || e.NotificationId != n.Id {
+		t.Errorf("first message: want snapshot of %s with status sent, got %s", n.Id, eventString(e))
 	}
-	requireEventFields(t, []statusEvent{e}, n.CorrelationID)
+	requireEventFields(t, []apiclient.StatusEvent{e}, n.CorrelationId)
 }
 
 // B4: Bonus: WebSocket Updates - subscribe by id before delivery: snapshot
@@ -64,43 +66,43 @@ func TestB4WSSnapshotAfterSent(t *testing.T) {
 func TestB4WSSnapshotThenChanges(t *testing.T) {
 	s := startStack(t, stackOptions{})
 	n := s.create(t, msg("push", "b4 early"))
-	c := s.subscribe(t, "notificationId", n.ID)
+	c := s.subscribe(t, "notificationId", n.Id.String())
 
 	first, err := readEvent(c, time.Now().Add(10*time.Second))
 	if err != nil {
 		t.Fatalf("first message of a notificationId subscription: %v", err)
 	}
-	if !first.Snapshot || first.Status != "pending" || first.NotificationID != n.ID {
-		t.Fatalf("first message: want snapshot of %s with status pending, got %v", n.ID, first)
+	if !isSnapshot(first) || first.Status != "pending" || first.NotificationId != n.Id {
+		t.Fatalf("first message: want snapshot of %s with status pending, got %s", n.Id, eventString(first))
 	}
 
 	s.StartWorker()
-	evs := collectUntil(t, c, wsWait, reached(n.ID, "sent"), "sent of "+n.ID)
+	evs := collectUntil(t, c, wsWait, reached(n.Id, "sent"), "sent of "+n.Id.String())
 	for _, e := range evs {
-		if e.NotificationID != n.ID {
-			t.Errorf("subscription to %s delivered an event of another notification: %v", n.ID, e)
+		if e.NotificationId != n.Id {
+			t.Errorf("subscription to %s delivered an event of another notification: %s", n.Id, eventString(e))
 		}
-		if e.Snapshot {
-			t.Errorf("only the first message may be a snapshot: %v", e)
+		if isSnapshot(e) {
+			t.Errorf("only the first message may be a snapshot: %s", eventString(e))
 		}
 	}
-	if got := statuses(eventsFor(evs, n.ID)); !slices.Equal(got, []string{"processing", "sent"}) {
-		t.Errorf("after the snapshot: want [processing sent], got %v", evs)
+	if got := statuses(eventsFor(evs, n.Id)); !slices.Equal(got, []string{"processing", "sent"}) {
+		t.Errorf("after the snapshot: want [processing sent], got %s", eventsString(evs))
 	}
-	requireEventFields(t, evs, n.CorrelationID)
+	requireEventFields(t, evs, n.CorrelationId)
 }
 
 // B4: Bonus: WebSocket Updates - a batchId subscription carries only that
 // batch's notifications.
 func TestB4WSBatchFilter(t *testing.T) {
 	s := startStack(t, stackOptions{})
-	b := s.createBatch(t, []map[string]any{msg("sms", "b4 batch 1"), msg("email", "b4 batch 2"), msg("push", "b4 batch 3")})
-	c := s.subscribe(t, "batchId", b.ID)
+	b := s.createBatch(t, []apiclient.NotificationCreate{msg("sms", "b4 batch 1"), msg("email", "b4 batch 2"), msg("push", "b4 batch 3")})
+	c := s.subscribe(t, "batchId", b.Id.String())
 	other := s.create(t, msg("sms", "b4 not in the batch"))
 	s.StartWorker()
 
-	allSent := func(evs []statusEvent) bool {
-		for _, id := range b.NotificationIDs {
+	allSent := func(evs []apiclient.StatusEvent) bool {
+		for _, id := range b.NotificationIds {
 			if !reached(id, "sent")(evs) {
 				return false
 			}
@@ -108,7 +110,7 @@ func TestB4WSBatchFilter(t *testing.T) {
 		return true
 	}
 	evs := collectUntil(t, c, wsWait, allSent, "sent of every batch notification")
-	s.waitStatus(t, other.ID, "sent", wsWait)
+	s.waitStatus(t, other.Id, "sent", wsWait)
 	// Drain briefly: an event of the unrelated notification would show here.
 	for {
 		e, err := readEvent(c, time.Now().Add(time.Second))
@@ -121,11 +123,11 @@ func TestB4WSBatchFilter(t *testing.T) {
 		evs = append(evs, e)
 	}
 	for _, e := range evs {
-		if !slices.Contains(b.NotificationIDs, e.NotificationID) {
-			t.Errorf("batch subscription delivered an event outside the batch: %v", e)
+		if !slices.Contains(b.NotificationIds, e.NotificationId) {
+			t.Errorf("batch subscription delivered an event outside the batch: %s", eventString(e))
 		}
-		if e.BatchID != b.ID {
-			t.Errorf("event batchId: want %s, got %v", b.ID, e)
+		if e.BatchId == nil || *e.BatchId != b.Id {
+			t.Errorf("event batchId: want %s, got %s", b.Id, eventString(e))
 		}
 	}
 }
@@ -135,12 +137,12 @@ func TestB4WSCancelIsAnEvent(t *testing.T) {
 	s := startStack(t, stackOptions{})
 	c := s.subscribe(t)
 	n := s.create(t, msg("email", "b4 cancel me"))
-	s.cancel(t, n.ID)
-	evs := collectUntil(t, c, 30*time.Second, reached(n.ID, "cancelled"), "cancelled of "+n.ID)
-	if got := statuses(eventsFor(evs, n.ID)); !slices.Equal(got, []string{"pending", "cancelled"}) {
-		t.Errorf("events for %s: want [pending cancelled], got %v", n.ID, got)
+	s.cancel(t, n.Id)
+	evs := collectUntil(t, c, 30*time.Second, reached(n.Id, "cancelled"), "cancelled of "+n.Id.String())
+	if got := statuses(eventsFor(evs, n.Id)); !slices.Equal(got, []string{"pending", "cancelled"}) {
+		t.Errorf("events for %s: want [pending cancelled], got %v", n.Id, got)
 	}
-	requireEventFields(t, eventsFor(evs, n.ID), n.CorrelationID)
+	requireEventFields(t, eventsFor(evs, n.Id), n.CorrelationId)
 }
 
 // B4: Bonus: WebSocket Updates - subscribing to an unknown notification is
@@ -149,7 +151,7 @@ func TestB4WSUnknownNotification404(t *testing.T) {
 	s := startStack(t, stackOptions{})
 	// Baseline: a known id upgrades, so a 404 below is not just a missing route.
 	n := s.create(t, msg("sms", "b4 known"))
-	s.subscribe(t, "notificationId", n.ID)
+	s.subscribe(t, "notificationId", n.Id.String())
 
 	c, status, err := s.dialWS("notificationId", newUUID())
 	if err == nil {
@@ -168,6 +170,6 @@ func TestB4WSAcrossInstances(t *testing.T) {
 	peer := s.startServe(t, nil)
 	c := peer.subscribe(t)
 	n := s.create(t, msg("push", "b4 across"))
-	evs := collectUntil(t, c, wsWait, reached(n.ID, "sent"), "sent of "+n.ID+" on the second instance")
+	evs := collectUntil(t, c, wsWait, reached(n.Id, "sent"), "sent of "+n.Id.String()+" on the second instance")
 	wantLifecycle(t, evs, n)
 }

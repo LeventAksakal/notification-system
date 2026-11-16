@@ -3,14 +3,15 @@
 package acceptance
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,11 +19,14 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
-// Valkey outage: the API keeps answering promptly, WebSocket streams end
-// instead of going silent, and workers deliver nothing while the limiter
-// cannot be consulted. The app reaches Valkey only through linkProxy, a TCP
+// Valkey outage: the instance stays ready and the API keeps answering
+// promptly (decision 0013 as changed on 15 Nov 2026: /readyz checks MySQL
+// only). WebSocket streams end instead of going silent, new subscriptions are
+// refused with 503 until the feed is back, and workers deliver nothing while
+// the limiter cannot be consulted. The app reaches Valkey only through linkProxy, a TCP
 // proxy the test can close (the port refuses connections, as in the R15
 // readiness tests), turn unresponsive (connections are accepted and nothing
 // ever answers: a hung or partitioned Valkey), or bring back on the same port.
@@ -194,58 +198,109 @@ func waitReadyz(t *testing.T, s *stack, timeout time.Duration, what string, ok f
 	t.Helper()
 	last := -1
 	if !poll(timeout, func() bool {
-		last, _, _ = probe(s.URL + "/readyz")
+		last, _, _ = s.readyz()
 		return ok(last)
 	}) {
 		t.Fatalf("not within %s: /readyz %s (last status %d, 0 = no answer)", timeout, what, last)
 	}
 }
 
-// valkeyDown takes Valkey away and waits (bounded) until /readyz stops
-// answering 200, so what follows runs while the app knows Valkey is down.
+// valkeyDown takes Valkey away and waits (bounded) until GET /v1/ws (no
+// filter) is refused with 503 unavailable, so what follows runs while the app
+// knows Valkey is down. /readyz is no signal: it checks MySQL only (decision 0013).
 func valkeyDown(t *testing.T, s *stack, p *linkProxy, o outage) {
 	t.Helper()
 	p.down(o)
-	waitReadyz(t, s, 20*time.Second, "kept answering 200 after Valkey went "+string(o), func(st int) bool { return st != http.StatusOK })
+	waitFeedRefused(t, s, 20*time.Second, "after Valkey went "+string(o))
 }
 
-// timedDo sends one JSON request with a hard client timeout and returns the
+// wsAnswer is the outcome of one GET /v1/ws handshake.
+type wsAnswer struct {
+	Status int    // 0 = no answer
+	Body   []byte // first 1 KiB of a refusal
+	Err    error
+}
+
+func (a wsAnswer) String() string {
+	e := "accepted"
+	if a.Err != nil {
+		e = a.Err.Error()
+	}
+	return "HTTP " + strconv.Itoa(a.Status) + " " + string(a.Body) + " (" + e + ")"
+}
+
+// refusedUnavailable reports a 503 with the Error body and code unavailable
+// (LiveUpdatesUnavailable in the contract).
+func (a wsAnswer) refusedUnavailable() bool {
+	var e apiclient.Error
+	return a.Err != nil && a.Status == http.StatusServiceUnavailable && json.Unmarshal(a.Body, &e) == nil && e.Code == "unavailable"
+}
+
+// tryWS performs one GET /v1/ws handshake (query name/value pairs) and closes
+// the socket at once if accepted. The generated client cannot speak
+// WebSocket, so the handshake is dialled directly, as dialWS does.
+func (s *stack) tryWS(kv ...string) wsAnswer {
+	q := url.Values{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		q.Set(kv[i], kv[i+1])
+	}
+	u := "ws" + strings.TrimPrefix(s.URL, "http") + "/v1/ws"
+	if len(q) > 0 {
+		u += "?" + q.Encode()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, res, err := websocket.Dial(ctx, u, nil) // on refusal coder/websocket leaves up to 1 KiB of body in res.Body
+	a := wsAnswer{Err: err}
+	if res != nil {
+		a.Status = res.StatusCode
+		if err != nil && res.Body != nil {
+			a.Body, _ = io.ReadAll(res.Body)
+			_ = res.Body.Close()
+		}
+	}
+	if c != nil {
+		_ = c.CloseNow()
+	}
+	return a
+}
+
+// waitFeedRefused polls GET /v1/ws until it is refused with 503 unavailable.
+func waitFeedRefused(t *testing.T, s *stack, timeout time.Duration, when string, kv ...string) wsAnswer {
+	t.Helper()
+	var last wsAnswer
+	if !poll(timeout, func() bool { last = s.tryWS(kv...); return last.refusedUnavailable() }) {
+		t.Fatalf("not within %s %s: GET /v1/ws %q want 503 with code unavailable, last %s", timeout, when, kv, last)
+	}
+	return last
+}
+
+// apiCall is one typed request (a method of the generated client without
+// "WithResponse"); the caller reads its raw answer.
+type apiCall func(ctx context.Context) (*http.Response, error)
+
+// timedDo sends one typed request with a hard client timeout and returns the
 // response and how long it took. A timeout fails the test with a message that
 // says the API did not answer in time while Valkey was down.
-func (s *stack) timedDo(t *testing.T, method, path string, body any, clientTimeout time.Duration) (*response, time.Duration) {
+func (s *stack) timedDo(t *testing.T, what string, call apiCall, clientTimeout time.Duration) (*response, time.Duration) {
 	t.Helper()
-	var rdr io.Reader
-	if body != nil {
-		buf, err := json.Marshal(body)
-		if err != nil {
-			t.Fatalf("encode body: %v", err)
-		}
-		rdr = bytes.NewReader(buf)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, s.URL+path, rdr)
-	if err != nil {
-		t.Fatalf("new request: %v", err)
-	}
-	if rdr != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
 	start := time.Now()
-	res, err := http.DefaultClient.Do(req)
+	res, err := call(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
-			t.Fatalf("%s %s with Valkey down: no response within the client timeout of %s (publishing must not hold the response)", method, path, clientTimeout)
+			t.Fatalf("%s with Valkey down: no response within the client timeout of %s (publishing must not hold the response)", what, clientTimeout)
 		}
-		t.Fatalf("%s %s with Valkey down: %v", method, path, err)
+		t.Fatalf("%s with Valkey down: %v", what, err)
 	}
 	defer func() { _ = res.Body.Close() }()
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		if ctx.Err() != nil {
-			t.Fatalf("%s %s with Valkey down: body not complete within the client timeout of %s", method, path, clientTimeout)
+			t.Fatalf("%s with Valkey down: body not complete within the client timeout of %s", what, clientTimeout)
 		}
-		t.Fatalf("%s %s: read body: %v", method, path, err)
+		t.Fatalf("%s: read body: %v", what, err)
 	}
 	return &response{Status: res.StatusCode, Header: res.Header, Body: b}, time.Since(start)
 }
@@ -265,7 +320,8 @@ func within(t *testing.T, what string, r *response, took time.Duration, want int
 var outages = []outage{outageClosed, outageUnresponsive}
 
 // R2: Support batch creation (up to 1000 notifications per request), and R15
-// (Valkey down makes the instance unready, it does not stall intake). CONTRACT
+// (decision 0013: Valkey down degrades live updates only, it does not stall
+// intake). CONTRACT
 // "Events": "Publishing never delays a response by more than one bounded wait
 // per request, whatever the number of events (a batch is one pipelined
 // publish with one deadline)."
@@ -276,27 +332,31 @@ func TestGapOutageBatchAcceptedPromptlyWithValkeyDown(t *testing.T) {
 			valkeyDown(t, s, p, o)
 
 			channels := []string{"sms", "email", "push"}
-			items := make([]map[string]any, 1000)
+			items := make([]apiclient.NotificationCreate, 1000)
 			for i := range items {
 				items[i] = msg(channels[i%3], "outage batch "+strconv.Itoa(i))
 			}
-			r, took := s.timedDo(t, http.MethodPost, "/v1/notifications/batch", map[string]any{"notifications": items}, 30*time.Second)
+			r, took := s.timedDo(t, "POST /v1/notifications/batch", func(ctx context.Context) (*http.Response, error) {
+				return s.API.CreateBatch(ctx, nil, apiclient.BatchCreate{Notifications: items})
+			}, 30*time.Second)
 			within(t, "POST /v1/notifications/batch (1000 items)", r, took, http.StatusCreated, 10*time.Second)
-			var b batchCreated
+			var b apiclient.BatchCreated
 			r.decode(t, &b)
-			if b.Total != 1000 || len(b.NotificationIDs) != 1000 {
-				t.Fatalf("batch: want total 1000 and 1000 ids, got total %d and %d ids", b.Total, len(b.NotificationIDs))
+			if b.Total != 1000 || len(b.NotificationIds) != 1000 {
+				t.Fatalf("batch: want total 1000 and 1000 ids, got total %d and %d ids", b.Total, len(b.NotificationIds))
 			}
-			if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE batch_id = ?", b.ID); got != 1000 {
-				t.Fatalf("rows of batch %s: want 1000, got %d", b.ID, got)
+			if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE batch_id = ?", b.Id.String()); got != 1000 {
+				t.Fatalf("rows of batch %s: want 1000, got %d", b.Id, got)
 			}
 
-			r, took = s.timedDo(t, http.MethodPost, "/v1/notifications", msg("sms", "outage single"), 30*time.Second)
+			r, took = s.timedDo(t, "POST /v1/notifications", func(ctx context.Context) (*http.Response, error) {
+				return s.API.CreateNotification(ctx, nil, msg("sms", "outage single"))
+			}, 30*time.Second)
 			within(t, "POST /v1/notifications", r, took, http.StatusCreated, 5*time.Second)
-			var n apiNotification
+			var n apiclient.Notification
 			r.decode(t, &n)
-			if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE id = ?", n.ID); got != 1 {
-				t.Fatalf("row of %s: want 1, got %d", n.ID, got)
+			if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE id = ?", n.Id.String()); got != 1 {
+				t.Fatalf("row of %s: want 1, got %d", n.Id, got)
 			}
 		})
 	}
@@ -304,8 +364,8 @@ func TestGapOutageBatchAcceptedPromptlyWithValkeyDown(t *testing.T) {
 
 // R1: Create notification requests with recipient, channel, content, and
 // priority - "POST returns an id; GET shows the same fields and a status",
-// while Valkey is down (R15: Valkey down makes the instance unready, not
-// unusable).
+// while Valkey is down (R15 and decision 0013: the instance stays ready;
+// create, read and cancel keep working, only live updates are refused).
 func TestGapOutageAPIServesWithValkeyDown(t *testing.T) {
 	const limit = 5 * time.Second
 	const clientTimeout = 30 * time.Second
@@ -314,34 +374,42 @@ func TestGapOutageAPIServesWithValkeyDown(t *testing.T) {
 			s, p := stackBehindValkeyProxy(t, 0)
 			valkeyDown(t, s, p, o)
 
-			r, took := s.timedDo(t, http.MethodPost, "/v1/notifications", msg("email", "outage r1"), clientTimeout)
+			r, took := s.timedDo(t, "POST /v1/notifications", func(ctx context.Context) (*http.Response, error) {
+				return s.API.CreateNotification(ctx, nil, msg("email", "outage r1"))
+			}, clientTimeout)
 			within(t, "POST /v1/notifications", r, took, http.StatusCreated, limit)
-			var n apiNotification
+			var n apiclient.Notification
 			r.decode(t, &n)
 
-			r, took = s.timedDo(t, http.MethodGet, "/v1/notifications/"+n.ID, nil, clientTimeout)
+			r, took = s.timedDo(t, "GET /v1/notifications/{id}", func(ctx context.Context) (*http.Response, error) {
+				return s.API.GetNotification(ctx, n.Id)
+			}, clientTimeout)
 			within(t, "GET /v1/notifications/{id}", r, took, http.StatusOK, limit)
-			var got apiNotification
+			var got apiclient.Notification
 			r.decode(t, &got)
-			if got.ID != n.ID || got.Status != "pending" || got.Channel != "email" || got.To != emailTo {
-				t.Errorf("GET %s: want the pending email just created, got %+v", n.ID, got)
+			if got.Id != n.Id || got.Status != "pending" || got.Channel != "email" || got.To != emailTo {
+				t.Errorf("GET %s: want the pending email just created, got %s", n.Id, jsonOf(got))
 			}
 
-			r, took = s.timedDo(t, http.MethodGet, "/v1/notifications?channel=email", nil, clientTimeout)
+			r, took = s.timedDo(t, "GET /v1/notifications", func(ctx context.Context) (*http.Response, error) {
+				return s.API.ListNotifications(ctx, &apiclient.ListNotificationsParams{Channel: ptr(apiclient.Email)})
+			}, clientTimeout)
 			within(t, "GET /v1/notifications", r, took, http.StatusOK, limit)
-			var page notificationPage
+			var page apiclient.NotificationPage
 			r.decode(t, &page)
 			found := false
 			for _, it := range page.Items {
-				found = found || it.ID == n.ID
+				found = found || it.Id == n.Id
 			}
 			if !found {
-				t.Errorf("list: want %s among the items, got %v", n.ID, ids(page.Items))
+				t.Errorf("list: want %s among the items, got %v", n.Id, ids(page.Items))
 			}
 
-			r, took = s.timedDo(t, http.MethodPost, "/v1/notifications/"+n.ID+"/cancel", nil, clientTimeout)
+			r, took = s.timedDo(t, "POST /v1/notifications/{id}/cancel", func(ctx context.Context) (*http.Response, error) {
+				return s.API.CancelNotification(ctx, n.Id)
+			}, clientTimeout)
 			within(t, "POST /v1/notifications/{id}/cancel", r, took, http.StatusOK, limit)
-			if st := s.storedStatus(t, n.ID); st != "cancelled" {
+			if st := s.storedStatus(t, n.Id); st != "cancelled" {
 				t.Errorf("after cancel: stored status want cancelled, got %q", st)
 			}
 		})
@@ -366,43 +434,39 @@ func TestGapOutageWSClosedWhileFeedLost(t *testing.T) {
 		if errors.Is(err, errWSTimeout) {
 			t.Fatalf("Valkey down for 10s: the subscriber's stream is still open and silent (want the server to close it)")
 		}
+		if errors.Is(err, errEventIncomplete) {
+			t.Errorf("event before the stream ended: %v", err)
+			continue
+		}
 		if err != nil {
 			var ce websocket.CloseError
-			if errors.As(err, &ce) {
-				t.Logf("stream ended after %s with close %d %q", time.Since(closedAt).Round(time.Millisecond), ce.Code, ce.Reason)
-			} else {
-				t.Logf("stream ended after %s: %v", time.Since(closedAt).Round(time.Millisecond), err)
+			if !errors.As(err, &ce) || ce.Code != websocket.StatusServiceRestart {
+				t.Fatalf("stream ended after %s with %v: want close 1012 service restart (decision 0013)", time.Since(closedAt).Round(time.Millisecond), err)
 			}
+			t.Logf("stream ended after %s with close %d %q", time.Since(closedAt).Round(time.Millisecond), ce.Code, ce.Reason)
 			break
 		}
-		t.Logf("event before the stream ended: %v", e)
+		t.Logf("event before the stream ended: %s", eventString(e))
 	}
 
-	// While the feed is lost a new handshake is refused with a 5xx.
-	waitReadyz(t, s, 20*time.Second, "kept answering 200 after Valkey went away", func(st int) bool { return st != http.StatusOK })
-	nc, status, err := s.dialWS()
-	if err == nil {
-		_ = nc.CloseNow()
-		t.Fatalf("GET /v1/ws while Valkey is down: handshake accepted (want it refused with 5xx)")
-	}
-	if status < 500 {
-		t.Fatalf("GET /v1/ws while Valkey is down: want HTTP >= 500, got %d (%v)", status, err)
-	}
-	t.Logf("GET /v1/ws while Valkey is down: refused with HTTP %d", status)
+	// While the feed is lost a new handshake is refused with 503 unavailable.
+	a := waitFeedRefused(t, s, 20*time.Second, "after Valkey went away")
+	t.Logf("GET /v1/ws while Valkey is down: %s", a)
 
 	// Valkey back: a new subscription works again, snapshot then live events.
 	if !p.up(t) {
 		t.Skipf("could not listen on %s again to bring Valkey back; recovery step skipped", p.Addr)
 	}
-	waitReadyz(t, s, 30*time.Second, "never answered 200 after Valkey came back", func(st int) bool { return st == http.StatusOK })
 
 	n := s.create(t, msg("push", "outage after recovery"))
 	var sub *websocket.Conn
-	if !poll(20*time.Second, func() bool {
-		sub, status, err = s.dialWS("notificationId", n.ID)
+	var status int
+	var err error
+	if !poll(30*time.Second, func() bool {
+		sub, status, err = s.dialWS("notificationId", n.Id.String())
 		return err == nil
 	}) {
-		t.Fatalf("GET /v1/ws?notificationId=%s still refused 20s after /readyz was 200 again (HTTP %d): %v", n.ID, status, err)
+		t.Fatalf("GET /v1/ws?notificationId=%s still refused 30s after Valkey came back (HTTP %d): %v", n.Id, status, err)
 	}
 	t.Cleanup(func() { _ = sub.CloseNow() })
 
@@ -410,11 +474,11 @@ func TestGapOutageWSClosedWhileFeedLost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first message after recovery: %v", err)
 	}
-	if !first.Snapshot || first.NotificationID != n.ID || first.Status != "pending" {
-		t.Fatalf("first message after recovery: want snapshot of %s pending, got %v", n.ID, first)
+	if !isSnapshot(first) || first.NotificationId != n.Id || first.Status != "pending" {
+		t.Fatalf("first message after recovery: want snapshot of %s pending, got %s", n.Id, eventString(first))
 	}
-	s.cancel(t, n.ID)
-	collectUntil(t, sub, 10*time.Second, reached(n.ID, "cancelled"), "live cancelled event of "+n.ID+" after recovery")
+	s.cancel(t, n.Id)
+	collectUntil(t, sub, 10*time.Second, reached(n.Id, "cancelled"), "live cancelled event of "+n.Id.String()+" after recovery")
 }
 
 // R7: Process notifications asynchronously via queue workers, and R8:
@@ -426,8 +490,8 @@ func TestGapOutageWorkerSendsNothingWithValkeyDown(t *testing.T) {
 
 	// Baseline: through this proxy the worker does deliver.
 	base := s.create(t, msg("sms", "outage baseline"))
-	s.providerRequests(t, base.ID, 20*time.Second)
-	s.waitStatus(t, base.ID, "sent", 20*time.Second)
+	s.providerRequests(t, base.Id, 20*time.Second)
+	s.waitStatus(t, base.Id, "sent", 20*time.Second)
 	before := providerReceived(s)
 
 	valkeyDown(t, s, p, outageClosed)
@@ -435,7 +499,7 @@ func TestGapOutageWorkerSendsNothingWithValkeyDown(t *testing.T) {
 	created := make([]string, 0, 20)
 	channels := []string{"sms", "email", "push"}
 	for i := range 20 {
-		created = append(created, s.create(t, msg(channels[i%3], "outage worker "+strconv.Itoa(i))).ID)
+		created = append(created, s.create(t, msg(channels[i%3], "outage worker "+strconv.Itoa(i))).Id.String())
 	}
 
 	// consistently for 3 s, with the observed numbers in the failure message.
@@ -445,7 +509,7 @@ func TestGapOutageWorkerSendsNothingWithValkeyDown(t *testing.T) {
 	defer tick.Stop()
 	for {
 		extra := providerReceived(s) - before
-		moved := s.count(t, q, base.ID)
+		moved := s.count(t, q, base.Id.String())
 		if extra != 0 || moved != 0 {
 			t.Fatalf("with Valkey down the worker went ahead: provider received %d new requests (want 0, the limiter fails closed); %d notifications not pending or with attempts (want 0)",
 				extra, moved)
@@ -461,7 +525,7 @@ func TestGapOutageWorkerSendsNothingWithValkeyDown(t *testing.T) {
 			t.Errorf("notification %s reached the provider while Valkey was down", id)
 		}
 	}
-	if got := s.count(t, "SELECT COUNT(*) FROM delivery_attempts WHERE notification_id <> ?", base.ID); got != 0 {
+	if got := s.count(t, "SELECT COUNT(*) FROM delivery_attempts WHERE notification_id <> ?", base.Id.String()); got != 0 {
 		t.Errorf("delivery_attempts while Valkey was down: want 0, got %d", got)
 	}
 	if got := s.count(t, "SELECT COUNT(*) FROM notifications WHERE status = 'failed'"); got != 0 {

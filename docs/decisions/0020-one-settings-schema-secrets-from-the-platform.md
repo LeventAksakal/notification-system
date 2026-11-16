@@ -21,4 +21,4 @@ The repository had a hand-kept `.env.example` beside the schema in code: two sha
 Option 1. The local compose stack keeps working with no setup: its MySQL passwords are development-only fallbacks in `docker-compose.yml`, overridable from the environment. Revisit option 2 when local development needs a secret that is real (a provider sandbox key shared by the team).
 
 ## Confirmation
-`go test ./config`: every setting has a default or is required, bounds and a doc line; a secret is read from `<NAME>` or `<NAME>_FILE`, never both; `app env check` reports an unknown `APP_` variable and never prints a secret's value. `TestReadmeNamesEverySetting`: the README table and the schema agree.
+`go test ./config`: every setting has a default or is required, bounds and a doc line; a secret is read from `<NAME>` or `<NAME>_FILE`, never both; `app env check` reports an unknown `APP_` variable and never prints a secret's value. `TestEnvExampleListsEverySettingOnceWithItsDefault` (`config/env_test.go`) and `TestEveryDialIsDocumentedAndHasADefaultOrIsInjected`: `.env.example` and the settings agree, and every dial has its doc line.

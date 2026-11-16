@@ -26,34 +26,21 @@ import (
 // Channel is the Valkey pub/sub channel every status change is published on.
 const Channel = "notifier:status-events"
 
-const (
-	// publishTimeout bounds one publish call (one event, or a whole batch as
-	// one pipeline), so an unreachable Valkey delays a commit's caller by at
-	// most this much.
-	publishTimeout = time.Second
-	// publishHoldOff is how long publishes fail at once after one timed out
-	// or lost its connection: during an outage only the first change of each
-	// hold-off waits. A successful publish ends it early.
-	publishHoldOff = 100 * time.Millisecond
-)
+// publishTimeout bounds one publish call (one event, or a whole batch as one
+// pipeline), so an unreachable Valkey delays a commit's caller by at most
+// this much, and while Valkey is down only the one probe in flight waits it.
+//
+// Where it comes from: a PUBLISH to a healthy Valkey on the same network is
+// answered in about a millisecond, so a call that takes a second is a Valkey
+// that is down or hung, not a slow one; and one second spent by a caller is
+// far inside the API's request timeout (APP_REQUEST_TIMEOUT, 10 s) and the
+// worker's result-write timeout (storeTimeout, 5 s). A subscriber waits
+// twice this for a missing predecessor (holdForPredecessor). Arbitrary
+// within those bounds; to tune it, take the p99.9 of publish latency under
+// load and keep it two orders of magnitude above that.
+const publishTimeout = time.Second
 
-// Origin says which kind of process published a change. The hub uses it to
-// put a create or replay (published by the API) before the worker's claim of
-// the same notification when the two arrive the other way round.
-type Origin string
-
-// The publishing roles.
-const (
-	OriginAPI    Origin = "api"
-	OriginWorker Origin = "worker"
-)
-
-// Message is one status change as it travels between processes.
-type Message struct {
-	notification.Event
-	Origin Origin
-}
-
+// wireMessage is one status change as it travels between processes.
 type wireMessage struct {
 	NotificationID string    `json:"notificationId"`
 	BatchID        string    `json:"batchId,omitempty"`
@@ -62,57 +49,54 @@ type wireMessage struct {
 	Error          string    `json:"error,omitempty"`
 	At             time.Time `json:"at"`
 	CorrelationID  string    `json:"correlationId"`
-	Origin         Origin    `json:"origin"`
+	Seq            uint64    `json:"seq,omitempty"` // absent from a publisher that predates it
 }
 
-func encode(m Message) ([]byte, error) {
+func encode(e notification.Event) ([]byte, error) {
 	return json.Marshal(wireMessage{
-		NotificationID: m.NotificationID, BatchID: m.BatchID, Status: string(m.Status), Attempts: m.Attempts,
-		Error: m.Error, At: m.At, CorrelationID: m.CorrelationID, Origin: m.Origin,
+		NotificationID: e.NotificationID, BatchID: e.BatchID, Status: string(e.Status), Attempts: e.Attempts,
+		Error: e.Error, At: e.At, CorrelationID: e.CorrelationID, Seq: e.Seq,
 	})
 }
 
-func decode(b []byte) (Message, error) {
+func decode(b []byte) (notification.Event, error) {
 	var w wireMessage
 	if err := json.Unmarshal(b, &w); err != nil {
-		return Message{}, fmt.Errorf("decode status event: %w", err)
+		return notification.Event{}, fmt.Errorf("decode status event: %w", err)
 	}
 	if w.NotificationID == "" || !notification.Status(w.Status).Valid() {
-		return Message{}, fmt.Errorf("decode status event: id %q status %q", w.NotificationID, w.Status)
+		return notification.Event{}, fmt.Errorf("decode status event: id %q status %q", w.NotificationID, w.Status)
 	}
-	return Message{Origin: w.Origin, Event: notification.Event{
+	return notification.Event{
 		NotificationID: w.NotificationID, BatchID: w.BatchID, Status: notification.Status(w.Status), Attempts: w.Attempts,
-		Error: w.Error, At: w.At, CorrelationID: w.CorrelationID,
-	}}, nil
+		Error: w.Error, At: w.At, CorrelationID: w.CorrelationID, Seq: w.Seq,
+	}, nil
 }
 
-// ErrUnavailable is returned without trying while a recent publish timed out
-// or lost its connection: Valkey is taken as down for publishHoldOff, so a
-// burst of status changes during an outage costs one bounded wait, not one
-// per change. One probe publish at a time still tries, and its success ends
-// the hold-off.
+// ErrUnavailable is returned without trying while Valkey is taken as down: a
+// publish timed out or lost its connection, and no publish has succeeded
+// since. One probe publish at a time still tries, and its success ends it, so
+// a burst of status changes during an outage costs one bounded wait at a
+// time, not one per change.
 var ErrUnavailable = errors.New("status events: valkey unavailable")
 
 // Publisher is the notification.Publisher that sends each change to Valkey.
 type Publisher struct {
 	client  valkey.Client
 	channel string
-	origin  Origin
-	now     func() time.Time
 
 	mu sync.Mutex
 	// down is set by a timeout or connection failure and cleared by the next
-	// success; downUntil is the end of the hold-off it started.
-	down      bool
-	downUntil time.Time
-	probing   bool // a publish is trying during the hold-off
+	// success.
+	down    bool
+	probing bool // a publish is trying while down
 }
 
 var _ notification.Publisher = (*Publisher)(nil)
 
-// NewPublisher publishes on Channel through client, marking messages with origin.
-func NewPublisher(client valkey.Client, origin Origin) *Publisher {
-	return &Publisher{client: client, channel: Channel, origin: origin, now: time.Now}
+// NewPublisher publishes on Channel through client.
+func NewPublisher(client valkey.Client) *Publisher {
+	return &Publisher{client: client, channel: Channel}
 }
 
 // Publish sends e synchronously, so changes published one after another by
@@ -125,8 +109,8 @@ func (p *Publisher) Publish(ctx context.Context, e notification.Event) error {
 
 // PublishAll sends es in order as one pipeline under one deadline of
 // publishTimeout, whatever their number. After a timeout or a connection
-// failure, calls fail at once with ErrUnavailable for publishHoldOff, except
-// one probe at a time; the first success ends the hold-off.
+// failure, calls fail at once with ErrUnavailable, except one probe at a
+// time, until a publish succeeds.
 func (p *Publisher) PublishAll(ctx context.Context, es []notification.Event) error {
 	if len(es) == 0 {
 		return nil
@@ -137,7 +121,7 @@ func (p *Publisher) PublishAll(ctx context.Context, es []notification.Event) err
 	}
 	cmds := make(valkey.Commands, 0, len(es))
 	for _, e := range es {
-		b, err := encode(Message{Event: e, Origin: p.origin})
+		b, err := encode(e)
 		if err != nil {
 			p.settle(ctx, probe, errAnswered)
 			return err
@@ -174,15 +158,15 @@ func (p *Publisher) PublishAll(ctx context.Context, es []notification.Event) err
 }
 
 // errAnswered marks a call that failed without a sign that Valkey is down
-// (error replies only, or nothing sent): it neither starts nor ends a hold-off.
+// (error replies only, or nothing sent): it neither marks Valkey down nor up.
 var errAnswered = errors.New("answered with errors")
 
-// admit says whether a call may try now, and whether it is the probe of a
-// hold-off.
+// admit says whether a call may try now, and whether it is the probe while
+// Valkey is down.
 func (p *Publisher) admit() (probe, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.down || !p.now().Before(p.downUntil) {
+	if !p.down {
 		return false, true
 	}
 	if p.probing {
@@ -192,8 +176,8 @@ func (p *Publisher) admit() (probe, ok bool) {
 	return true, true
 }
 
-// settle records the outcome of a call: err nil is a success, which ends a
-// hold-off; a connection failure starts one; errAnswered changes nothing.
+// settle records the outcome of a call: err nil is a success, which marks
+// Valkey up; a connection failure marks it down; errAnswered changes nothing.
 func (p *Publisher) settle(ctx context.Context, probe bool, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -209,11 +193,10 @@ func (p *Publisher) settle(ctx context.Context, probe bool, err error) {
 	case errors.Is(err, errAnswered):
 	default:
 		if !p.down {
-			slog.WarnContext(ctx, "status events: valkey unreachable; publishes fail at once until one succeeds",
-				"hold_off", publishHoldOff, "err", err)
+			slog.WarnContext(ctx, "status events: valkey unreachable; publishes fail at once until a probe succeeds",
+				"err", err)
 		}
 		p.down = true
-		p.downUntil = p.now().Add(publishHoldOff)
 	}
 }
 

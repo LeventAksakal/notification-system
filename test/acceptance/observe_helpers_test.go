@@ -20,107 +20,45 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/google/uuid"
 
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
-
-// ---- API shapes (api/openapi.yaml) ----
-
-type latencyMs struct {
-	P50 int `json:"p50"`
-	P95 int `json:"p95"`
-	P99 int `json:"p99"`
-}
-
-type queueDepth struct {
-	Channel            string `json:"channel"`
-	Pending            int    `json:"pending"`
-	Scheduled          int    `json:"scheduled"`
-	Processing         int    `json:"processing"`
-	OldestPendingAgeMs int    `json:"oldestPendingAgeMs"`
-}
-
-type deliveryTotals struct {
-	Sent           int       `json:"sent"`
-	Failed         int       `json:"failed"`
-	SuccessRate    float64   `json:"successRate"`
-	FailureRate    float64   `json:"failureRate"`
-	Attempts       int       `json:"attempts"`
-	FailedAttempts int       `json:"failedAttempts"`
-	LatencyMs      latencyMs `json:"latencyMs"`
-}
-
-// deliveryStats is DeliveryStats; encoding/json flattens the embedded fields.
-type deliveryStats struct {
-	Channel string `json:"channel"`
-	deliveryTotals
-}
-
-type metrics struct {
-	GeneratedAt       time.Time       `json:"generatedAt"`
-	WindowSeconds     int             `json:"windowSeconds"`
-	QueueDepth        int             `json:"queueDepth"`
-	Queue             []queueDepth    `json:"queue"`
-	Totals            statusCounts    `json:"totals"`
-	Delivery          deliveryTotals  `json:"delivery"`
-	DeliveryByChannel []deliveryStats `json:"deliveryByChannel"`
-}
-
-type health struct {
-	Status string            `json:"status"`
-	Checks map[string]string `json:"checks"`
-}
-
-// statusEvent is one WebSocket message. Pointer fields tell "absent" from zero.
-type statusEvent struct {
-	NotificationID string     `json:"notificationId"`
-	BatchID        string     `json:"batchId"`
-	Status         string     `json:"status"`
-	Attempts       *int       `json:"attempts"`
-	Error          string     `json:"error"`
-	At             *time.Time `json:"at"`
-	CorrelationID  string     `json:"correlationId"`
-	Snapshot       bool       `json:"snapshot"`
-}
-
-func (e statusEvent) String() string {
-	a := "<absent>"
-	if e.Attempts != nil {
-		a = strconv.Itoa(*e.Attempts)
-	}
-	return fmt.Sprintf("{id=%s batch=%s status=%s attempts=%s snapshot=%t corr=%q}",
-		e.NotificationID, e.BatchID, e.Status, a, e.Snapshot, e.CorrelationID)
-}
 
 // ---- metrics ----
 
-// metrics fetches GET /v1/metrics with the given raw query ("" for none) and
-// requires 200.
-func (s *stack) metrics(t *testing.T, query string) metrics {
+// The shapes are the generated ones: apiclient.Metrics, QueueDepth,
+// DeliveryTotals, DeliveryStats, LatencyMs, Health and StatusEvent.
+
+// metrics fetches GET /v1/metrics (windowSeconds 0: the parameter is left
+// out) and requires 200.
+func (s *stack) metrics(t *testing.T, windowSeconds int) apiclient.Metrics {
 	t.Helper()
-	p := "/v1/metrics"
-	if query != "" {
-		p += "?" + query
+	p := apiclient.GetMetricsParams{}
+	if windowSeconds != 0 {
+		p.WindowSeconds = &windowSeconds
 	}
-	r := s.getJSON(t, p)
-	if r.Status != http.StatusOK {
-		t.Fatalf("GET %s: want 200, got %s", p, r)
+	r, err := s.API.GetMetricsWithResponse(t.Context(), &p)
+	if err != nil {
+		t.Fatalf("GET /v1/metrics (windowSeconds %d): %v", windowSeconds, err)
 	}
-	var m metrics
-	r.decode(t, &m)
-	return m
+	if r.StatusCode() != http.StatusOK || r.JSON200 == nil {
+		t.Fatalf("GET /v1/metrics (windowSeconds %d): want 200, got %s", windowSeconds, show(r))
+	}
+	return *r.JSON200
 }
 
 // queueByChannel indexes m.Queue by channel and fails unless it holds exactly
 // one entry for each of sms, email and push.
-func queueByChannel(t *testing.T, m metrics) map[string]queueDepth {
+func queueByChannel(t *testing.T, m apiclient.Metrics) map[string]apiclient.QueueDepth {
 	t.Helper()
-	out := map[string]queueDepth{}
+	out := map[string]apiclient.QueueDepth{}
 	for _, q := range m.Queue {
-		if _, dup := out[q.Channel]; dup {
+		if _, dup := out[string(q.Channel)]; dup {
 			t.Fatalf("queue has two entries for %q: %+v", q.Channel, m.Queue)
 		}
-		out[q.Channel] = q
+		out[string(q.Channel)] = q
 	}
 	for _, ch := range []string{"sms", "email", "push"} {
 		if _, ok := out[ch]; !ok || len(out) != 3 {
@@ -130,14 +68,14 @@ func queueByChannel(t *testing.T, m metrics) map[string]queueDepth {
 	return out
 }
 
-func deliveryByChannel(t *testing.T, m metrics) map[string]deliveryStats {
+func deliveryByChannel(t *testing.T, m apiclient.Metrics) map[string]apiclient.DeliveryStats {
 	t.Helper()
-	out := map[string]deliveryStats{}
+	out := map[string]apiclient.DeliveryStats{}
 	for _, d := range m.DeliveryByChannel {
-		if _, dup := out[d.Channel]; dup {
+		if _, dup := out[string(d.Channel)]; dup {
 			t.Fatalf("deliveryByChannel has two entries for %q: %+v", d.Channel, m.DeliveryByChannel)
 		}
-		out[d.Channel] = d
+		out[string(d.Channel)] = d
 	}
 	for _, ch := range []string{"sms", "email", "push"} {
 		if _, ok := out[ch]; !ok || len(out) != 3 {
@@ -147,9 +85,9 @@ func deliveryByChannel(t *testing.T, m metrics) map[string]deliveryStats {
 	return out
 }
 
-func sortedQueue(q []queueDepth) []queueDepth {
+func sortedQueue(q []apiclient.QueueDepth) []apiclient.QueueDepth {
 	c := slices.Clone(q)
-	slices.SortFunc(c, func(a, b queueDepth) int { return strings.Compare(a.Channel, b.Channel) })
+	slices.SortFunc(c, func(a, b apiclient.QueueDepth) int { return strings.Compare(string(a.Channel), string(b.Channel)) })
 	return c
 }
 
@@ -195,6 +133,7 @@ func (s *stack) startServe(t *testing.T, over map[string]string) *stack {
 	env := withEnv(s.env, o)
 	peer := &stack{
 		URL:         "http://127.0.0.1:" + strconv.Itoa(port),
+		API:         newAPIClient(t, "http://127.0.0.1:"+strconv.Itoa(port)),
 		DSN:         envValue(env, "APP_DATABASE_DSN"),
 		DB:          s.DB,
 		Provider:    s.Provider,
@@ -209,7 +148,7 @@ func (s *stack) startServe(t *testing.T, over map[string]string) *stack {
 		if c.exited() {
 			t.Fatalf("second app serve exited before ready:\n%s", strings.Join(c.logs.lines(), "\n"))
 		}
-		if st, err := quickGet(peer.URL + "/readyz"); err == nil && st == http.StatusOK {
+		if st, _, err := peer.readyz(); err == nil && st == http.StatusOK {
 			return peer
 		}
 		if time.Now().After(deadline) {
@@ -219,28 +158,37 @@ func (s *stack) startServe(t *testing.T, over map[string]string) *stack {
 	}
 }
 
-// probe is GET url with a 5 s bound; it decodes a Health body when present.
-func probe(url string) (int, health, error) {
+// healthz is GET /healthz through the typed client with a 5 s bound; it
+// returns the status and the Health body (an error when there is none).
+func (s *stack) healthz() (int, apiclient.Health, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	r, err := s.API.HealthWithResponse(ctx)
 	if err != nil {
-		return 0, health{}, err
+		return 0, apiclient.Health{}, err
 	}
-	res, err := http.DefaultClient.Do(req)
+	if r.JSON200 == nil {
+		return r.StatusCode(), apiclient.Health{}, fmt.Errorf("not a Health body: %s", show(r))
+	}
+	return r.StatusCode(), *r.JSON200, nil
+}
+
+// readyz is GET /readyz through the typed client with a 5 s bound; it returns
+// the status and the Health body of a 200 or a 503 (an error otherwise).
+func (s *stack) readyz() (int, apiclient.Health, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r, err := s.API.ReadyWithResponse(ctx)
 	if err != nil {
-		return 0, health{}, err
+		return 0, apiclient.Health{}, err
 	}
-	defer func() { _ = res.Body.Close() }()
-	b, err := io.ReadAll(res.Body)
-	if err != nil {
-		return res.StatusCode, health{}, err
+	switch {
+	case r.JSON200 != nil:
+		return r.StatusCode(), *r.JSON200, nil
+	case r.JSON503 != nil:
+		return r.StatusCode(), *r.JSON503, nil
 	}
-	var h health
-	if err := json.Unmarshal(b, &h); err != nil {
-		return res.StatusCode, health{}, fmt.Errorf("not a Health body: %q", truncate(b))
-	}
-	return res.StatusCode, h, nil
+	return r.StatusCode(), apiclient.Health{}, fmt.Errorf("not a Health body: %s", show(r))
 }
 
 // ---- TCP proxy ----
@@ -335,9 +283,19 @@ func (p *tcpProxy) Close() {
 
 // ---- WebSocket ----
 
-// dialWS opens GET /v1/ws with the given query parameters (name/value pairs).
-// On a refused handshake it returns the HTTP status (0 when none arrived).
+// dialWS opens GET /v1/ws with the given query parameters (name/value pairs),
+// once, without retrying: tests that expect a refusal (404, 503) call it or
+// tryWS directly. On a refused handshake it returns the HTTP status (0 when
+// none arrived).
 func (s *stack) dialWS(kv ...string) (*websocket.Conn, int, error) {
+	c, a := s.handshakeWS(kv...)
+	return c, a.Status, a.Err
+}
+
+// handshakeWS performs one GET /v1/ws handshake and returns the open socket,
+// or the refusal with up to 1 KiB of its body (coder/websocket leaves that
+// much in res.Body when the handshake is refused).
+func (s *stack) handshakeWS(kv ...string) (*websocket.Conn, wsAnswer) {
 	q := url.Values{}
 	for i := 0; i+1 < len(kv); i += 2 {
 		q.Set(kv[i], kv[i+1])
@@ -349,65 +307,147 @@ func (s *stack) dialWS(kv ...string) (*websocket.Conn, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	c, res, err := websocket.Dial(ctx, u, nil)
-	status := 0
+	a := wsAnswer{Err: err}
 	if res != nil {
-		status = res.StatusCode
+		a.Status = res.StatusCode
 		if res.Body != nil {
+			if err != nil {
+				a.Body, _ = io.ReadAll(res.Body)
+			}
 			_ = res.Body.Close()
 		}
 	}
 	if err != nil {
-		return nil, status, err
+		return nil, a
 	}
 	c.SetReadLimit(1 << 20)
-	return c, status, nil
+	return c, a
 }
 
-// subscribe is dialWS that must succeed; the socket closes when the test ends.
+// feedConnectWait bounds how long subscribe keeps reconnecting while an
+// instance answers 503 `unavailable` because its event feed is not live yet
+// (a just-started instance is ready, /readyz checks MySQL only, before its
+// hub has confirmed its Valkey subscription; the contract says "reconnect
+// shortly"). Derived from the hub's own connect path (internal/realtime
+// Hub.Run/listen and valkey-go's defaults): one SUBSCRIBE attempt that fails
+// takes at most valkey-go's DefaultDialTimeout (5 s), the hub then waits
+// retryFirst (100 ms) and a second attempt again at most 5 s: 10.1 s for a
+// feed that comes up after one failed attempt. The 15 s bound is that plus
+// about 50 % margin for a loaded machine. A feed still down after it is a
+// failure, not slowness. To tune it: if valkey-go's dial timeout or the hub's
+// retryFirst change, recompute 2 x dial timeout + retryFirst and keep the margin.
+const feedConnectWait = 15 * time.Second
+
+// Reconnect backoff of subscribe after a 503 `unavailable`: doubling from
+// the first wait, capped. Arbitrary, like a client's own reconnect backoff:
+// short against feedConnectWait so a feed that comes up is joined within
+// about a second.
+const (
+	feedRetryFirst = 100 * time.Millisecond
+	feedRetryMax   = time.Second
+)
+
+// subscribe opens GET /v1/ws as a client following the contract: a 503 whose
+// body code is `unavailable` (this instance's event feed is not live) is
+// retried with a short backoff for up to feedConnectWait; any other refusal
+// fails at once. The socket closes when the test ends.
 func (s *stack) subscribe(t *testing.T, kv ...string) *websocket.Conn {
 	t.Helper()
-	c, status, err := s.dialWS(kv...)
-	if err != nil {
-		t.Fatalf("GET /v1/ws %q: handshake failed (HTTP %d): %v", kv, status, err)
+	start := time.Now()
+	wait := feedRetryFirst
+	tries := 0
+	for {
+		tries++
+		c, a := s.handshakeWS(kv...)
+		if a.Err == nil {
+			if tries > 1 {
+				t.Logf("GET /v1/ws %q: accepted after %d attempts in %s (503 unavailable until the event feed was live)",
+					kv, tries, time.Since(start).Round(time.Millisecond))
+			}
+			t.Cleanup(func() { _ = c.CloseNow() })
+			return c
+		}
+		if !a.refusedUnavailable() {
+			t.Fatalf("GET /v1/ws %q: handshake failed (HTTP %d): %v", kv, a.Status, a.Err)
+		}
+		if time.Since(start)+wait > feedConnectWait {
+			t.Fatalf("GET /v1/ws %q: handshake still refused after %d attempts in %s (bound %s; event feed never live): last %s",
+				kv, tries, time.Since(start).Round(time.Millisecond), feedConnectWait, a)
+		}
+		time.Sleep(wait)
+		wait = min(wait*2, feedRetryMax)
 	}
-	t.Cleanup(func() { _ = c.CloseNow() })
-	return c
 }
 
 var errWSTimeout = errors.New("no message before the deadline")
 
+// errEventIncomplete is a StatusEvent message without one of its required
+// fields `at` and `attempts`, which apiclient.StatusEvent decodes to zero.
+var errEventIncomplete = errors.New("StatusEvent without a required field")
+
 // readEvent reads one StatusEvent before deadline. The socket is unusable
 // after errWSTimeout (coder/websocket closes it when a read is cancelled).
-func readEvent(c *websocket.Conn, deadline time.Time) (statusEvent, error) {
+// A message without `at` or `attempts` (both required) is errEventIncomplete:
+// the generated type cannot tell an absent field from its zero value.
+func readEvent(c *websocket.Conn, deadline time.Time) (apiclient.StatusEvent, error) {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	typ, b, err := c.Read(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
-			return statusEvent{}, errWSTimeout
+			return apiclient.StatusEvent{}, errWSTimeout
 		}
-		return statusEvent{}, fmt.Errorf("read: %w", err)
+		return apiclient.StatusEvent{}, fmt.Errorf("read: %w", err)
 	}
 	if typ != websocket.MessageText {
-		return statusEvent{}, fmt.Errorf("want a text message, got type %v: %q", typ, b)
+		return apiclient.StatusEvent{}, fmt.Errorf("want a text message, got type %v: %q", typ, b)
 	}
-	var e statusEvent
+	var e apiclient.StatusEvent
 	if err := json.Unmarshal(b, &e); err != nil {
-		return statusEvent{}, fmt.Errorf("not a StatusEvent: %q (%w)", b, err)
+		return apiclient.StatusEvent{}, fmt.Errorf("not a StatusEvent: %q (%w)", b, err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(b, &keys); err != nil {
+		return apiclient.StatusEvent{}, fmt.Errorf("not a StatusEvent: %q (%w)", b, err)
+	}
+	for _, k := range []string{"at", "attempts"} {
+		if _, ok := keys[k]; !ok {
+			return apiclient.StatusEvent{}, fmt.Errorf("%w: event %s: `%s` missing: %q", errEventIncomplete, eventString(e), k, b)
+		}
 	}
 	return e, nil
 }
 
+// isSnapshot reports whether e is the snapshot of a notificationId subscription.
+func isSnapshot(e apiclient.StatusEvent) bool { return deref(e.Snapshot) }
+
+func eventString(e apiclient.StatusEvent) string {
+	batch := ""
+	if e.BatchId != nil {
+		batch = e.BatchId.String()
+	}
+	return fmt.Sprintf("{id=%s batch=%s status=%s attempts=%d snapshot=%t corr=%q}",
+		e.NotificationId, batch, e.Status, e.Attempts, isSnapshot(e), e.CorrelationId)
+}
+
+func eventsString(evs []apiclient.StatusEvent) string {
+	out := make([]string, len(evs))
+	for i, e := range evs {
+		out[i] = eventString(e)
+	}
+	return "[" + strings.Join(out, " ") + "]"
+}
+
 // collectUntil reads events until done reports true on the events read so
 // far, failing the test after timeout with what arrived.
-func collectUntil(t *testing.T, c *websocket.Conn, timeout time.Duration, done func([]statusEvent) bool, what string) []statusEvent {
+func collectUntil(t *testing.T, c *websocket.Conn, timeout time.Duration, done func([]apiclient.StatusEvent) bool, what string) []apiclient.StatusEvent {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
-	var got []statusEvent
+	var got []apiclient.StatusEvent
 	for !done(got) {
 		e, err := readEvent(c, deadline)
 		if err != nil {
-			t.Fatalf("waiting for %s: %v; events so far: %v", what, err, got)
+			t.Fatalf("waiting for %s: %v; events so far: %s", what, err, eventsString(got))
 		}
 		got = append(got, e)
 	}
@@ -415,44 +455,42 @@ func collectUntil(t *testing.T, c *websocket.Conn, timeout time.Duration, done f
 }
 
 // eventsFor keeps the events about one notification, in arrival order.
-func eventsFor(evs []statusEvent, id string) []statusEvent {
-	var out []statusEvent
+func eventsFor(evs []apiclient.StatusEvent, id uuid.UUID) []apiclient.StatusEvent {
+	var out []apiclient.StatusEvent
 	for _, e := range evs {
-		if e.NotificationID == id {
+		if e.NotificationId == id {
 			out = append(out, e)
 		}
 	}
 	return out
 }
 
-func statuses(evs []statusEvent) []string {
+func statuses(evs []apiclient.StatusEvent) []string {
 	out := make([]string, len(evs))
 	for i, e := range evs {
-		out[i] = e.Status
+		out[i] = string(e.Status)
 	}
 	return out
 }
 
 // reached returns a done func for collectUntil: true once id has an event
 // with status want.
-func reached(id, want string) func([]statusEvent) bool {
-	return func(evs []statusEvent) bool {
-		return slices.ContainsFunc(evs, func(e statusEvent) bool { return e.NotificationID == id && e.Status == want })
+func reached(id uuid.UUID, want string) func([]apiclient.StatusEvent) bool {
+	return func(evs []apiclient.StatusEvent) bool {
+		return slices.ContainsFunc(evs, func(e apiclient.StatusEvent) bool { return e.NotificationId == id && string(e.Status) == want })
 	}
 }
 
-// requireEventFields checks the StatusEvent required fields on each event.
-func requireEventFields(t *testing.T, evs []statusEvent, correlationID string) {
+// requireEventFields checks the StatusEvent required fields on each event
+// (readEvent already refused a message without `at` or `attempts`).
+func requireEventFields(t *testing.T, evs []apiclient.StatusEvent, correlationID string) {
 	t.Helper()
 	for _, e := range evs {
-		if e.At == nil || e.At.IsZero() {
-			t.Errorf("event %v: `at` missing", e)
+		if e.At.IsZero() {
+			t.Errorf("event %s: `at` missing", eventString(e))
 		}
-		if e.Attempts == nil {
-			t.Errorf("event %v: `attempts` missing", e)
-		}
-		if e.CorrelationID != correlationID {
-			t.Errorf("event %v: correlationId want %q", e, correlationID)
+		if e.CorrelationId != correlationID {
+			t.Errorf("event %s: correlationId want %q", eventString(e), correlationID)
 		}
 	}
 }
@@ -461,11 +499,11 @@ func requireEventFields(t *testing.T, evs []statusEvent, correlationID string) {
 
 // providerRequests waits until the provider double recorded a request with
 // Idempotency-Key = id (the notification id) and returns them.
-func (s *stack) providerRequests(t *testing.T, id string, timeout time.Duration) []fakeprovider.Request {
+func (s *stack) providerRequests(t *testing.T, id uuid.UUID, timeout time.Duration) []fakeprovider.Request {
 	t.Helper()
 	var rs []fakeprovider.Request
 	if !poll(timeout, func() bool {
-		rs = s.Provider.Requests(fakeprovider.Filter{Key: id})
+		rs = s.Provider.Requests(fakeprovider.Filter{Key: id.String()})
 		return len(rs) > 0
 	}) {
 		t.Fatalf("not within %s: provider double never received notification %s (stored status %q)",
@@ -489,18 +527,18 @@ func poll(timeout time.Duration, cond func() bool) bool {
 	}
 }
 
-func (s *stack) storedStatusQuiet(id string) string {
+func (s *stack) storedStatusQuiet(id uuid.UUID) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var st string
-	if err := s.DB.QueryRowContext(ctx, "SELECT status FROM notifications WHERE id = ?", id).Scan(&st); err != nil {
+	if err := s.DB.QueryRowContext(ctx, "SELECT status FROM notifications WHERE id = ?", id.String()).Scan(&st); err != nil {
 		return "error: " + err.Error()
 	}
 	return st
 }
 
 // waitStatus waits until the stored status is want.
-func (s *stack) waitStatus(t *testing.T, id, want string, timeout time.Duration) {
+func (s *stack) waitStatus(t *testing.T, id uuid.UUID, want string, timeout time.Duration) {
 	t.Helper()
 	if !poll(timeout, func() bool { return s.storedStatusQuiet(id) == want }) {
 		t.Fatalf("not within %s: notification %s never reached %q (stored status %q)",

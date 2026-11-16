@@ -1,7 +1,7 @@
 version: "2"
 sql:
   - engine: mysql
-    schema: migrations # the goose files generated from schema/ (tools/schemadiff); sqlc skips the Down sections
+    schema: internal/store/schema.gen.sql # written by tools/schemadiff from migrations/, without triggers (sqlc cannot parse them)
     queries: internal/store/queries
     gen:
       go:
@@ -9,3 +9,8 @@ sql:
         out: internal/store/sqlc
         emit_interface: true
         emit_json_tags: false
+        overrides:
+          # INT UNSIGNED NULL becomes sql.NullInt32 by default, which holds only
+          # half the column's range (2,147,483,647 of 4,294,967,295).
+          - column: notifications.template_version
+            go_type: { import: database/sql, type: NullInt64 }

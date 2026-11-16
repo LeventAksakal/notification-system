@@ -30,19 +30,19 @@ import (
 
 	"github.com/LeventAksakal/notification-system/config"
 	delivery "github.com/LeventAksakal/notification-system/internal/delivery"
-	"github.com/LeventAksakal/notification-system/internal/delivery/breaker"
+	"github.com/LeventAksakal/notification-system/internal/delivery/health"
 	"github.com/LeventAksakal/notification-system/internal/delivery/limiter"
 	"github.com/LeventAksakal/notification-system/internal/httpapi"
 	"github.com/LeventAksakal/notification-system/internal/intake"
-	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/provider"
 	"github.com/LeventAksakal/notification-system/internal/realtime"
 	"github.com/LeventAksakal/notification-system/internal/store"
 	"github.com/LeventAksakal/notification-system/internal/telemetry"
+	"github.com/LeventAksakal/notification-system/internal/wake"
 )
 
 func main() {
-	cmd := "serve"
+	cmd := "" // no default role: a container started without one fails at once
 	if len(os.Args) > 1 {
 		cmd = os.Args[1]
 	}
@@ -62,6 +62,10 @@ func run(ctx context.Context, cmd string) error {
 	case "env":
 		// No config, no connections, no telemetry.
 		return env(os.Stdout, os.Args[2:], os.Environ()) //nolint:forbidigo // app env check validates the whole environment against config
+	case "migrate", "serve", "worker":
+	default:
+		// Refused before config and connections: a typo is not a database error.
+		return fmt.Errorf("%w, got %q", errUsage, cmd)
 	}
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -73,7 +77,11 @@ func run(ctx context.Context, cmd string) error {
 	}
 	defer func() {
 		// The signal has cancelled ctx by now; WithoutCancel keeps its values
-		// but not its cancellation, so the flush gets its own 5 s.
+		// but not its cancellation, so the flush gets its own 5 s. Source: a
+		// free choice inside compose's 25 s stop_grace_period, which holds
+		// APP_SHUTDOWN_TIMEOUT (10 s) + this flush + 5 s for final writes; an
+		// export to a local collector takes milliseconds, so 5 s is ample
+		// (OpenTelemetry's own export deadline, OTEL_BSP_EXPORT_TIMEOUT, is 30 s).
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if err := shutdownObs(ctx); err != nil {
@@ -92,12 +100,13 @@ func run(ctx context.Context, cmd string) error {
 		return store.Migrate(ctx, db)
 	case "serve":
 		return serve(ctx, cfg, db)
-	case "worker":
+	default: // "worker"; anything else was refused above
 		return worker(ctx, cfg, db)
-	default:
-		return fmt.Errorf("unknown command %q (serve, worker, migrate, healthcheck, env)", cmd)
 	}
 }
+
+// errUsage is the exit of a missing or unknown role.
+var errUsage = errors.New("usage: app serve|worker|migrate|healthcheck|env [check]")
 
 // errEnvCheck is the exit of an `app env check` that found problems; they
 // are on stdout already.
@@ -145,15 +154,6 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		return err
 	}
 
-	breakers := make(map[notification.Channel]*breaker.Breaker, len(notification.Channels))
-	for _, ch := range notification.Channels {
-		breakers[ch] = breaker.New(breaker.Config{
-			Window:       cfg.BreakerWindow,
-			MinRequests:  cfg.BreakerMinRequests,
-			FailureRatio: cfg.BreakerFailureRatio,
-			Cooldown:     cfg.BreakerCooldown,
-		}, time.Now)
-	}
 	w := delivery.New(delivery.Config{
 		Concurrency:     cfg.WorkerConcurrency,
 		MaxAttempts:     cfg.MaxAttempts,
@@ -164,18 +164,29 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		ShutdownTimeout: cfg.ShutdownTimeout,
 		Weights:         cfg.PriorityWeights,
 		Horizon:         cfg.RateLimitHorizon,
-		SendAlign:       delivery.DefaultSendAlign,
+		ProviderTimeout: cfg.ProviderTimeout,
+		HealthCooldown:  cfg.BreakerCooldown,
 	}, delivery.Deps{
 		Queue:     store.NewQueue(db),
-		Limiter:   limiter.New(vk, cfg.RateLimitPerSecond, cfg.RateLimitHeadroomPct, cfg.RateLimitHorizon, "ratelimit:"),
+		Limiter:   limiter.New(vk, cfg.RateLimitPerSecond, cfg.RateLimitHeadroomPct, "ratelimit:"),
 		Sender:    provider.New(cfg.ProviderURLs, cfg.ProviderTimeout, cfg.WorkerConcurrency),
-		Publisher: realtime.NewPublisher(vk, realtime.OriginWorker),
-		Breakers:  breakers,
+		Publisher: realtime.NewPublisher(vk),
+		Health:    health.NewValkey(vk, health.Config{Failures: cfg.BreakerFailures, Cooldown: cfg.BreakerCooldown}, "health:"),
 		Tracer:    otel.Tracer("notifier/worker"),
+		Waker:     wake.NewPublisher(vk),
+		Wakes:     wake.NewListener(vk),
 	})
+	retryWorst, retryMean := delivery.RetrySpan(cfg.MaxAttempts, cfg.RetryBase, cfg.RetryCap)
 	slog.InfoContext(ctx, "worker started", "concurrency", cfg.WorkerConcurrency, "weights", cfg.PriorityWeights,
+		"max_attempts", cfg.MaxAttempts, "retry_span_mean", retryMean.String(), "retry_span_worst", retryWorst.String(),
 		"rate_per_second", cfg.RateLimitPerSecond, "headroom_percent", cfg.RateLimitHeadroomPct,
 		"horizon", cfg.RateLimitHorizon.String())
+	if cfg.MaxAttempts < cfg.BreakerFailures {
+		// Allowed (a deliberate fail-fast choice), but a lone message then
+		// spends its whole budget before its outage can be declared (0026).
+		slog.WarnContext(ctx, "retry budget below the outage threshold: a lone message is dead-lettered before an outage is detected",
+			"max_attempts", cfg.MaxAttempts, "breaker_failures", cfg.BreakerFailures)
+	}
 	err = w.Run(ctx)
 	slog.InfoContext(context.WithoutCancel(ctx), "worker stopped")
 	return err
@@ -190,20 +201,13 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 
 	// One Valkey subscription per process feeds every WebSocket (decision 0013).
 	hub := realtime.NewHub(vk)
-	svc := intake.New(db, realtime.NewPublisher(vk, realtime.OriginAPI), cfg.IdempotencyRetention)
+	svc := intake.New(db, realtime.NewPublisher(vk), cfg.IdempotencyRetention).WithWaker(wake.NewPublisher(vk))
+	// Readiness is MySQL only: intake, reads and cancels need nothing else.
+	// While the hub's Valkey subscription is down, /v1/ws refuses new
+	// subscribers with 503 and open streams are closed (decision 0013), so
+	// live updates degrade on their own without taking intake out of rotation.
 	srv := httpapi.NewServer(svc, map[string]httpapi.Check{
 		"mysql": db.PingContext,
-		// Ready only while events reach this instance: a subscriber accepted
-		// now must not miss the next change.
-		"valkey": func(ctx context.Context) error {
-			if err := vk.Do(ctx, vk.B().Ping().Build()).Error(); err != nil {
-				return err
-			}
-			if !hub.Live() {
-				return errors.New("status event subscription not active")
-			}
-			return nil
-		},
 	}, httpapi.Options{Metrics: store.NewMetricsReader(db), Hub: hub, WSSendBuffer: cfg.WSSendBuffer,
 		RequestTimeout: cfg.RequestTimeout})
 	h, err := srv.Handler()
@@ -223,6 +227,7 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		return serveHTTP(gctx, ln, &http.Server{Handler: h, ReadHeaderTimeout: cfg.ReadHeaderTimeout}, cfg.ShutdownTimeout)
 	})
 	g.Go(func() error { return svc.SweepIdempotencyKeys(gctx, cfg.IdempotencySweep) })
+	g.Go(func() error { return svc.SweepFinished(gctx, cfg.IdempotencySweep, cfg.NotificationRetention) })
 	g.Go(func() error { return hub.Run(gctx) })
 	g.Go(func() error {
 		<-gctx.Done()
@@ -253,6 +258,9 @@ func serveHTTP(ctx context.Context, ln net.Listener, srv *http.Server, grace tim
 	return g.Wait()
 }
 
+// healthcheck asks /readyz. Its 3 s sits between /readyz's own 2 s deadline
+// (so the probe hears readyz's answer, not its own timeout) and compose's
+// 4 s healthcheck timeout (so compose hears this command's verdict).
 func healthcheck(ctx context.Context, url string) error {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()

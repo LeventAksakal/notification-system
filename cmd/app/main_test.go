@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
@@ -79,6 +80,18 @@ func TestEnvPrintsTheReferenceOrChecksTheEnvironment(t *testing.T) {
 			}
 			if strings.Contains(out.String(), "pw-x9") {
 				t.Errorf("output shows the secret:\n%s", out.String())
+			}
+		})
+	}
+}
+
+// A container started without a role, or with a misspelt one, stops at once
+// with the usage line: it never reads settings or opens a connection.
+func TestARoleMustBeNamed(t *testing.T) {
+	for name, cmd := range map[string]string{"no role": "", "a misspelt role": "srve"} {
+		t.Run(name, func(t *testing.T) {
+			if err := run(context.Background(), cmd); !errors.Is(err, errUsage) {
+				t.Fatalf("run(%q) = %v, want the usage error", cmd, err)
 			}
 		})
 	}

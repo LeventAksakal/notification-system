@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // dlJitterMax is the largest delay jitterProxy adds to one chunk of Valkey's
@@ -184,7 +185,7 @@ func TestGapDeliveryR8RateUnderLimiterReplyJitter(t *testing.T) {
 	const perChannel = 700
 	chans := []string{"sms", "email", "push"}
 	s := startStack(t, stackOptions{Workers: 0, Env: dlFastEnv(nil)})
-	s.dlCreateMany(t, perChannel*3, func(i int) map[string]any {
+	s.dlCreateMany(t, perChannel*3, func(i int) apiclient.NotificationCreate {
 		return msg(chans[i%3], fmt.Sprintf("gap R8 jitter %d", i))
 	})
 

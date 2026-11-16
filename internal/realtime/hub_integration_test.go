@@ -76,7 +76,7 @@ func TestHubFansOutPublishedEventsByFilter(t *testing.T) {
 	all, _ := h.Subscribe(realtime.Filter{}, 16)
 	one, _ := h.Subscribe(realtime.Filter{NotificationID: "n2"}, 16)
 	batch, _ := h.Subscribe(realtime.Filter{BatchID: "b1"}, 16)
-	api := realtime.NewPublisher(pubClient, realtime.OriginAPI)
+	api := realtime.NewPublisher(pubClient)
 	now := time.Now().UTC()
 	for _, e := range []notification.Event{
 		{NotificationID: "n1", BatchID: "b1", Status: notification.StatusPending, At: now, CorrelationID: "c1"},
@@ -108,7 +108,7 @@ func TestHubDropsASlowSubscriberWithoutBlockingOthers(t *testing.T) {
 
 	slow, _ := h.Subscribe(realtime.Filter{}, 2)
 	fast, _ := h.Subscribe(realtime.Filter{}, 64)
-	pub := realtime.NewPublisher(pubClient, realtime.OriginAPI)
+	pub := realtime.NewPublisher(pubClient)
 	for i := range 5 {
 		e := notification.Event{NotificationID: "n" + string(rune('a'+i)), Status: notification.StatusPending, At: time.Now()}
 		if err := pub.Publish(t.Context(), e); err != nil {
@@ -194,7 +194,7 @@ func TestHubEndsStreamsWhenItsFeedDropsAndRefusesUntilBack(t *testing.T) {
 	}
 	defer again.Close()
 	e := notification.Event{NotificationID: "back", Status: notification.StatusPending, At: time.Now().UTC()}
-	if err := realtime.NewPublisher(pubClient, realtime.OriginAPI).Publish(t.Context(), e); err != nil {
+	if err := realtime.NewPublisher(pubClient).Publish(t.Context(), e); err != nil {
 		t.Fatal(err)
 	}
 	if got := next(t, again); got.NotificationID != "back" {

@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-13
 tags: [tooling, agentguard]
 ---
@@ -20,3 +20,4 @@ A test-writer started with worktree isolation could not write `test/acceptance/m
 Option 2 for this run; nobody edited `tools/`. Also add `.claude/worktrees/` to `.gitignore` when the guard is fixed.
 
 ## Answer
+Owner, 16 Nov 2026: covered in the 15 to 16 Nov walkthrough. The assumption taken above stands as the answer; closed by the coordinator.

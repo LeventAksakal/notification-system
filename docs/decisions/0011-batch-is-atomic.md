@@ -1,10 +1,13 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-13
-decision-makers: owner (pending); proposed by the coordinator
+decision-makers: owner (in chat, 15 Nov 2026); proposed by the coordinator
 revisit: when clients ask for batches larger than 1000
 ---
 # A batch is accepted or rejected as a whole (0011)
+
+## Question
+If a batch of 1000 has a few invalid items, do we store the valid ones, or nothing?
 
 ## Rule
 `POST /v1/notifications/batch` validates every item, then inserts all of them and the batch row in one transaction, or inserts nothing.
@@ -18,10 +21,17 @@ The brief: "batch creation (up to 1000 notifications per request)" and "query no
 3. Accept the batch unvalidated and validate asynchronously, reporting bad items in the batch status. Fastest response and scales past 1000; a new batch state machine, and errors arrive late.
 
 ## Decision
-Pending. Recommended: option 1. Batch status returns counts per notification status plus the items page by page. More than 1000 items is refused by the spec's `maxItems` before any handler runs.
+Option 1. Batch status returns counts per notification status plus the items page by page. More than 1000 items is refused by the spec's `maxItems` before any handler runs.
 
 ## Confirmation
 Acceptance tests: 1000 valid items create 1000 rows and one batch; 1001 items are refused; 999 valid plus 1 invalid creates no rows and the error names index and field.
 
 ## As built (14 Nov 2026)
 All valid answers `201` with the batch, not `202` (`api/openapi.yaml`): the rows exist when the response is written.
+
+## Numbers (15 Nov 2026)
+| Number | Value | Where it comes from |
+|---|---|---|
+| Items per batch | 1000 | The brief |
+| Request body | 8 MiB (`notification.MaxRequestBodyBytes`) | The real cap for batches of large items (1000 emails at the 32,768-byte email limit would be about 32 MB); its reason belongs to record 0017 |
+| Per-item limits | by channel (SMS 1600 characters and E.164 recipient, email 32,768 bytes and 254-byte address, push 4,067 bytes) | Record 0017; a batch's 400 names each failing item by index and field |

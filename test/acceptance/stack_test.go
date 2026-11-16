@@ -10,15 +10,20 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // The harness itself: the stack starts, answers its probes, and a worker
 // starts with its output captured.
 func TestHarnessStartsStack(t *testing.T) {
 	s := startStack(t, stackOptions{})
-	for _, p := range []string{"/readyz", "/healthz"} {
-		if r := s.getJSON(t, p); r.Status != http.StatusOK {
-			t.Errorf("GET %s: want 200, got %s", p, r)
+	for _, p := range []struct {
+		path  string
+		probe func() (int, apiclient.Health, error)
+	}{{"/readyz", s.readyz}, {"/healthz", s.healthz}} {
+		if st, h, err := p.probe(); err != nil || st != http.StatusOK {
+			t.Errorf("GET %s: want 200, got %d %+v (%v)", p.path, st, h, err)
 		}
 	}
 	n := s.StartWorker()
@@ -34,7 +39,8 @@ func TestHarnessStartsStack(t *testing.T) {
 }
 
 // D4: API documentation: Swagger/OpenAPI specification
-// (the spec is served and matches the handlers).
+// (the spec is served and matches the handlers). /openapi.json and /docs are
+// not operations of the contract, so they are read raw.
 func TestD4SpecAndDocsAreServed(t *testing.T) {
 	s := startStack(t, stackOptions{})
 

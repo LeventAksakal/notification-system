@@ -11,10 +11,22 @@ import (
 )
 
 type Querier interface {
+	// Attempts are written before the provider call (decision 0005): in flight,
+	// committed with the claim, then given their result. One claim makes at most
+	// one call (attempts_claim_idx).
+	// Runs in the claim's transaction, after LeaseNotifications: each claimed row's
+	// call, in flight, numbered from the notification's count and carrying the new
+	// claim_version. One statement per claim, however many rows; the claim's row
+	// locks are held, so no reaper or release can interleave.
+	BeginAttempts(ctx context.Context, ids []string) (int64, error)
 	// ListNotifications is built in Go (store.ListNotificationsQuery): the WHERE
 	// holds only the filters a request sets, so each filter keeps its index.
 	// The only way out of pending to cancelled; a lost race changes nothing.
-	CancelNotification(ctx context.Context, id string) (int64, error)
+	// The trigger stores status_seq + 1; LAST_INSERT_ID(expr) computes the same
+	// value from the old row and hands it back in the OK packet
+	// (sql.Result.LastInsertId), so the event carries it without a second read
+	// that a later change could overtake.
+	CancelNotification(ctx context.Context, id string) (sql.Result, error)
 	// The delivery queue (decisions 0003, 0018). A claim is a lease: it sets
 	// lease_until and bumps claim_version; every later write by the claimer
 	// carries WHERE status = 'processing' AND claim_version = ?, so a worker that
@@ -25,19 +37,58 @@ type Querier interface {
 	ClaimCandidates(ctx context.Context, arg ClaimCandidatesParams) ([]ClaimCandidatesRow, error)
 	// Counts per API status (scheduled is a view of pending).
 	CountBatchByStatus(ctx context.Context, batchID sql.NullString) ([]CountBatchByStatusRow, error)
+	// The database clock, the one clock every schedule decision uses (decision
+	// 0016): due_at, the claim, the scheduled status and the horizon check.
+	DatabaseNow(ctx context.Context) (time.Time, error)
+	// The attempts of the rows locked by RetentionCandidates (attempts_notification_idx).
+	DeleteAttemptsOf(ctx context.Context, ids []string) (int64, error)
 	// Forget one key older than the retention, so it can be used again.
 	DeleteExpiredIdempotencyKey(ctx context.Context, arg DeleteExpiredIdempotencyKeyParams) (int64, error)
+	DeleteFoldedAttemptShards(ctx context.Context, arg DeleteFoldedAttemptShardsParams) (int64, error)
+	DeleteFoldedFinishShards(ctx context.Context, arg DeleteFoldedFinishShardsParams) (int64, error)
+	// The rows locked by RetentionCandidates, after their attempts.
+	DeleteNotifications(ctx context.Context, ids []string) (int64, error)
 	DeleteTemplate(ctx context.Context, name string) (int64, error)
-	// processing -> failed (permanent refusal or an exhausted budget).
+	// The claim's call was never made (a release: the job missed its slot, the
+	// an outage was declared, shutdown came first; or FailSpent), so its in-flight
+	// attempt is removed, not counted. Runs after the notification's update in
+	// the same transaction.
+	DeleteUnsentAttempt(ctx context.Context, arg DeleteUnsentAttemptParams) (int64, error)
+	// processing -> failed without a call: unknown calls (counted by the reaper)
+	// have already spent the attempt budget. Fenced by claim_version like the
+	// other finishes, so the new status_seq is the claim's plus one.
+	FailSpent(ctx context.Context, arg FailSpentParams) (int64, error)
+	// started_at stays the claim's time (at most the reservation horizon before
+	// the request): rewriting it would move the row in attempts_window_idx a
+	// second time on every send.
+	// The result of the claim's call (attempts_claim_idx); a result may replace
+	// unknown when it arrives after the lease ran out.
+	FinishAttempt(ctx context.Context, arg FinishAttemptParams) (int64, error)
+	// processing -> failed (permanent refusal or an exhausted budget); both count.
 	FinishFailed(ctx context.Context, arg FinishFailedParams) (int64, error)
 	// processing -> pending, due again after delay_us (a retry is a stored due time, decision 0007).
+	// counted is 1 when the failure counts against the budget, 0 when it belongs
+	// to a declared provider outage (decision 0026).
 	FinishRetry(ctx context.Context, arg FinishRetryParams) (int64, error)
-	// processing -> sent.
+	// processing -> sent. Every write below is fenced by claim_version, and only a
+	// claim moves a row into processing (bumping claim_version), so when it
+	// matches no status change happened since the claim: the new status_seq (the
+	// trigger raises it) is the claim's plus one, known without reading it back.
 	FinishSent(ctx context.Context, arg FinishSentParams) (int64, error)
+	// Adds the shards 1 to 3 of attempts_per_minute minutes in [from_minute,
+	// until_minute) into shard 0 (DeleteFoldedAttemptShards removes them in the
+	// same transaction). Shards only spread the minutes still being written;
+	// once folded, a past minute is one row per key again, as cheap to read as
+	// unsharded rollups. The locking read keeps the range still until commit.
+	FoldAttemptRollups(ctx context.Context, arg FoldAttemptRollupsParams) (int64, error)
+	// As FoldAttemptRollups, for finishes_per_minute.
+	FoldFinishRollups(ctx context.Context, arg FoldFinishRollupsParams) (int64, error)
 	GetBatch(ctx context.Context, id string) (Batch, error)
 	GetIdempotencyKey(ctx context.Context, idemKey string) (IdempotencyKey, error)
 	GetNotification(ctx context.Context, id string) (GetNotificationRow, error)
 	GetTemplate(ctx context.Context, name string) (Template, error)
+	// Which of the reaper's locked rows have an attempt in flight on their current claim.
+	InFlightOf(ctx context.Context, ids []string) ([]string, error)
 	InsertBatch(ctx context.Context, arg InsertBatchParams) error
 	InsertDeliveryAttempt(ctx context.Context, arg InsertDeliveryAttemptParams) error
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
@@ -46,23 +97,57 @@ type Querier interface {
 	// database clock (stored pending, never tried, due in the future), the same
 	// rule the list filter uses.
 	// due_at is the schedule or now on the database clock; a past schedule means now.
+	// template_name and template_version: the template that rendered content, both NULL for plain content.
 	InsertNotification(ctx context.Context, arg InsertNotificationParams) error
+	// Creates version 1 (the insert trigger sets it); a duplicate key means the
+	// template exists and an update needs If-Match (decision 0015).
+	InsertTemplate(ctx context.Context, arg InsertTemplateParams) error
 	// pending -> processing for the rows locked by ClaimCandidates in the same
-	// transaction, in one statement (one round trip, however many rows).
+	// transaction, in one statement (one round trip, however many rows). The
+	// trigger raises status_seq; each row's new value is the one ClaimCandidates
+	// read plus one, since the row lock is held from that SELECT to the commit.
 	LeaseNotifications(ctx context.Context, arg LeaseNotificationsParams) (int64, error)
-	// One page of a batch in request order (batch_idx); after_index -1 starts at the first item.
+	// One page of a batch in request order (batch_position_idx); after_index -1 starts at the first item.
 	ListBatchItems(ctx context.Context, arg ListBatchItemsParams) ([]ListBatchItemsRow, error)
 	// Every id of a batch in request order; rebuilds a replayed BatchCreated.
 	ListBatchNotificationIDs(ctx context.Context, batchID sql.NullString) ([]string, error)
-	// Oldest first (attempts_notification_idx).
+	// Every notification of a batch with its status_seq (batch_idx, then the
+	// row): the base a batch subscription orders live events against.
+	ListBatchStatusSeqs(ctx context.Context, batchID sql.NullString) ([]ListBatchStatusSeqsRow, error)
+	// Oldest first (attempts_notification_idx). Every finished or abandoned call:
+	// unknown (the worker died mid-call) is shown as such (owner item 0015, 16 Nov
+	// 2026); in_flight is not, since a call still running has no outcome yet.
 	ListDeliveryAttempts(ctx context.Context, notificationID string) ([]DeliveryAttempt, error)
 	ListTemplates(ctx context.Context) ([]Template, error)
-	// Provider calls started in the window (since its start), per channel, from
-	// attempts_window_idx (started_at, channel, outcome) alone.
-	MetricsAttempts(ctx context.Context, since time.Time) ([]MetricsAttemptsRow, error)
-	// Notifications that reached sent or failed in the window (since its
-	// start), per channel, from finished_idx (finished_at, status, channel) alone.
-	MetricsFinished(ctx context.Context, since sql.NullTime) ([]MetricsFinishedRow, error)
+	// Delivery over a window [since, now] is read on the same timestamps the
+	// rollup triggers truncate: whole minutes from the rollups, and the window's
+	// partial first minute m0 from the raw rows, whichever side of since is
+	// shorter: [since, m0 + 1 min) added to the rollups from m0 + 1 min, or
+	// [m0, since) subtracted from the rollups from m0 (exact, as a rollup row
+	// equals a recount of its rows). So at most 30 s of raw rows are read,
+	// whatever the window; the current minute's rollup rows commit with the
+	// outcomes they count.
+	// Provider calls per channel and outcome in the whole minutes from
+	// from_minute on (attempts_per_minute primary key range).
+	MetricsAttemptRollups(ctx context.Context, fromMinute time.Time) ([]MetricsAttemptRollupsRow, error)
+	// Provider calls started in [from_time, until_time), one row each, from
+	// attempts_window_idx (started_at, channel, outcome) alone. The caller counts
+	// them: at most half a minute of rows (metrics.go, halfMinute), and sending
+	// them costs less than MySQL's temporary-table GROUP BY (13 against 18 ms for
+	// 8,300 rows at 1M rows, measured 16 Nov 2026).
+	MetricsAttemptsBetween(ctx context.Context, arg MetricsAttemptsBetweenParams) ([]MetricsAttemptsBetweenRow, error)
+	// Notifications that reached sent or failed in the whole minutes from
+	// from_minute on, per channel, status and latency bucket (finishes_per_minute
+	// primary key range).
+	MetricsFinishRollups(ctx context.Context, fromMinute time.Time) ([]MetricsFinishRollupsRow, error)
+	// Notifications that reached sent or failed in [from_time, until_time), one
+	// row each with its accept-to-sent latency in whole ms (0 for failed), from
+	// finished_idx (finished_at, status, channel, created_at, scheduled_at) alone.
+	// The latency is the expression of the rollup triggers in
+	// schema/notifications.sql. The caller buckets (latencyBucket) and counts
+	// them: 23 ms for 8,200 rows against 36 ms grouped by latency and 40 ms
+	// bucketed in SQL (1M rows, measured 16 Nov 2026).
+	MetricsFinishesBetween(ctx context.Context, arg MetricsFinishesBetweenParams) ([]MetricsFinishesBetweenRow, error)
 	// Every metrics statement runs in one read-only REPEATABLE READ transaction
 	// and takes the database clock, read once with SELECT NOW(3), as an
 	// argument, so the numbers of one summary agree with each other.
@@ -73,26 +158,79 @@ type Querier interface {
 	// oldest_due_age_ms is how long the oldest of those has waited.
 	MetricsQueue(ctx context.Context, arg MetricsQueueParams) ([]MetricsQueueRow, error)
 	// Pending notifications shown as scheduled (never tried, due after now): a
-	// claim_idx range over the not-yet-due pending rows, reading attempts.
+	// claim_idx range over the not-yet-due pending rows, from the index alone
+	// (attempts is its last column).
 	MetricsScheduled(ctx context.Context, now time.Time) (int64, error)
 	// Stored status counts over the whole table, from list_status_idx alone (an
 	// index scan, no table reads).
 	MetricsStatusCounts(ctx context.Context) ([]MetricsStatusCountsRow, error)
+	// How long until each priority's earliest pending notification of a channel
+	// is due, in microseconds on the database's clock (<= 0: due now), and
+	// whether it has any pending at all. An idle worker asks this instead of
+	// claiming. Each arm is MIN over a constant prefix of claim_idx (status,
+	// channel, priority, due_at): one index dive ("Select tables optimized
+	// away"), whatever the backlog. A GROUP BY priority form reads every pending
+	// entry of the channel instead.
+	NextDue(ctx context.Context, arg NextDueParams) ([]NextDueRow, error)
 	// sqlc needs at least one query; the readiness probe can use it.
 	Ping(ctx context.Context) (int32, error)
 	// Runs inside a READ COMMITTED transaction: the expired leases (lease_idx),
 	// locked so two reapers never return the same row. Bounded per tick.
 	ReapCandidates(ctx context.Context) ([]ReapCandidatesRow, error)
-	// processing -> pending for rows locked by ReapCandidates in the same transaction.
+	// processing -> pending for rows locked by ReapCandidates in the same
+	// transaction; the trigger makes status_seq the one read plus one (row locks held).
 	ReapLeases(ctx context.Context, ids []string) (int64, error)
-	// processing -> pending without an attempt (breaker open, shutdown; decision 0008).
+	// processing -> pending without an attempt (provider outage declared, shutdown; decision 0026).
 	ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error)
-	// A dead letter goes back to pending with a fresh attempt budget; history is kept.
-	ReplayNotification(ctx context.Context, id string) (int64, error)
+	// A dead letter goes back to pending with a fresh attempt budget; history is
+	// kept. The new status_seq comes back as LastInsertId, as for a cancel.
+	ReplayNotification(ctx context.Context, id string) (sql.Result, error)
+	// A new schedule for a notification no worker has claimed yet (claim_version
+	// 0: never leased, so no attempt, retry backoff or Retry-After is pending).
+	// One statement: a claim racing it on the same row either leased it first
+	// (no row matches) or leases it after with the new due_at. due_at follows
+	// the create rule (a past or absent schedule means now). When the row
+	// changes, ON UPDATE stamps updated_at with this statement's NOW(3), which the
+	// scheduled_within_horizon CHECK measures from; when it does not (the same
+	// schedule again), nothing is written and 0 rows are reported.
+	RescheduleNotification(ctx context.Context, arg RescheduleNotificationParams) (int64, error)
+	// Retention (decision 0025): finished notifications, their attempts and their
+	// batches are deleted once they are older than the retention, on the database
+	// clock, in bounded batches.
+	// Runs inside a READ COMMITTED transaction: up to LIMIT finished notifications
+	// that finished before `before`, oldest first, through finished_idx. The
+	// caller sets before to the start of the minute the retention reaches into,
+	// the bound the metrics rollups are swept at too: a minute's rows and its
+	// rollup go together, so a metrics window (at most the retention) that starts
+	// in a minute finds both whole. The rows are locked, so a replay waits for the delete (and then
+	// finds nothing) instead of reviving a row whose history is being deleted;
+	// rows another sweeper or a replay holds are skipped.
+	RetentionCandidates(ctx context.Context, arg RetentionCandidatesParams) ([]string, error)
+	// Up to LIMIT attempts_per_minute rows of minutes before `before` (primary
+	// key range), the minute bound RetentionCandidates deletes rows at. Deleting a
+	// minute while rows it counts are kept, or keeping it while some are deleted,
+	// would make a window that starts in it subtract raw rows that no longer
+	// match its rollup (negative or inflated counts). The endpoint reads at most
+	// MaxMetricsWindow (1 h), which the retention's 1 h floor covers.
+	SweepAttemptRollups(ctx context.Context, arg SweepAttemptRollupsParams) (int64, error)
+	// Up to LIMIT batches older than the retention none of whose notifications is
+	// left (batches_created_idx, then batch_position_idx per batch). A batch's
+	// notifications are inserted with it, so an old batch never gains one.
+	SweepBatches(ctx context.Context, arg SweepBatchesParams) (int64, error)
+	// As SweepAttemptRollups, for finishes_per_minute.
+	SweepFinishRollups(ctx context.Context, arg SweepFinishRollupsParams) (int64, error)
 	// Forget up to 1000 keys older than the retention, on the database clock (the
 	// clock that set created_at), through idempotency_created_idx.
 	SweepIdempotencyKeys(ctx context.Context, retentionMs interface{}) (int64, error)
-	UpsertTemplate(ctx context.Context, arg UpsertTemplateParams) error
+	// The reaper's rows: an attempt in flight on an expired lease becomes unknown
+	// and counts toward the notification's attempts (the request may have left)
+	// and against its budget: the reaper cannot tell an outage from a message
+	// that kills its worker, and the second must end (decision 0026).
+	UnknownOnReap(ctx context.Context, ids []string) (int64, error)
+	// Optimistic concurrency: replaces the body only if the caller read the
+	// current version; 0 rows means stale or absent. version = version + 1 is what
+	// the update trigger forces anyway; it is written here so the query reads true.
+	UpdateTemplate(ctx context.Context, arg UpdateTemplateParams) (int64, error)
 }
 
 var _ Querier = (*Queries)(nil)

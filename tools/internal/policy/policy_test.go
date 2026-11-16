@@ -28,7 +28,8 @@ func TestDecide(t *testing.T) {
 		reasons string // substring expected in the deny reason
 	}{
 		{"coordinator edits app code", edit("", "internal/sender/send.go"), true, ""},
-		{"coordinator edits a contract", edit("", "api/openapi.yaml"), true, ""},
+		{"coordinator edits a contract", edit("", "internal/httpapi/contract.go"), true, ""},
+		{"nobody hand-edits the generated API spec", edit("", "api/openapi.yaml"), false, "go generate"},
 		{"coordinator cannot hand-edit sqlc output", edit("", "internal/store/sqlc/query.sql.go"), false, "go generate"},
 		{"nobody hand-edits *.gen.go", edit("implementer", "internal/httpapi/server.gen.go"), false, "generated"},
 		{"generated migrations", edit("", "migrations/20261110_init.sql"), false, "generated"},
@@ -38,6 +39,8 @@ func TestDecide(t *testing.T) {
 		{"implementer cannot touch the judge", edit("implementer", "test/acceptance/send_once_test.go"), false, "may not write"},
 		{"implementer cannot change a contract", edit("implementer", "schema/messages.sql"), false, "frozen contract"},
 		{"implementer cannot change the core types", edit("implementer", "internal/notification/types.go"), false, "frozen contract"},
+		{"implementer cannot change the HTTP contract", edit("implementer", "internal/httpapi/contract.go"), false, "frozen contract"},
+		{"implementer writes an HTTP handler", edit("implementer", "internal/httpapi/notifications.go"), true, ""},
 		{"implementer cannot edit the guard", edit("implementer", "tools/agentguard/main.go"), false, "may not write"},
 		{"implementer cannot edit decision records", edit("implementer", "docs/decisions/0001-record-decisions-as-adrs.md"), false, "may not write"},
 		{"implementer writes an owner item", edit("implementer", ".agents/owner-items/0001-limit.md"), true, ""},

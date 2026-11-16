@@ -7,7 +7,7 @@ revisit: when a second deployable or a library consumer appears
 # Packages are named for their role; contracts and settings sit at the root (0022)
 
 ## Rule
-Contracts and settings are top-level folders (`api/`, `schema/`, `config/`); Go code lives under `internal/` in packages named for what they do: domain (`notification`), use cases (`intake`, `delivery` with `limiter/` and `breaker/` under it), transport adapters (`httpapi`, which also serves the WebSocket), outbound adapters (`store`, `provider`, `realtime`), and `telemetry`; `cmd/app` only wires them. No type is written by hand where a contract generates it.
+Contracts and settings are top-level folders (`api/`, `schema/`, `config/`); Go code lives under `internal/` in packages named for what they do: domain (`notification`), use cases (`intake`, `delivery` with `limiter/`, `health/` and `leasebudget/` under it), transport adapters (`httpapi`, which also serves the WebSocket), outbound adapters (`store`, `provider`, `realtime`, `wake`), `telemetry`, and the provider double `fakeprovider`; `cmd/app` only wires them. No type is written by hand where a contract generates it.
 
 ## Context
 Owner, 15 Nov 2026: "internal seems cryptic for the source code ... rather than hiding the configuration under source code I argue it should be top level"; then "you may keep internal if its the standard go convention but reorganize the other stuff so its idiomatic and an outsider has a convenient time exploring"; "websocket message scheme is similar to openapi spec ... those are network contracts". The layout had `internal/core`, `internal/obs`, `internal/api` (beside the top-level `api/` contract), `internal/config`, and the delivery parts (worker, limiter, breaker) side by side with everything else.
@@ -18,7 +18,10 @@ Owner, 15 Nov 2026: "internal seems cryptic for the source code ... rather than 
 3. Keep the layout. No churn; `core`, `obs` and the scattered delivery parts stay cryptic.
 
 ## Decision
-Option 2, the owner's choice. `core` became `notification` ("core" names nothing), `api` became `httpapi` (no clash with the `api/` contract), `worker` became `delivery` with its policies nested, `obs` became `telemetry`, `internal/config` became `config/`. The WebSocket stays in `httpapi`: it is one GET route on the same server, and a package of its own would need a second server type to share the mux. Its message type, `StatusEvent`, is generated from `api/openapi.yaml` (`skip-prune`), replacing a hand-written copy. AsyncAPI was considered for the WebSocket contract and not adopted: with one server-to-client message it would repeat the route and its parameters already in the OpenAPI document; it earns its place when clients send messages or message types multiply.
+Option 2, the owner's choice. `core` became `notification` ("core" names nothing), `api` became `httpapi` (no clash with the `api/` contract), `worker` became `delivery` with its policies nested, `obs` became `telemetry`, `internal/config` became `config/`. The WebSocket stays in `httpapi`: it is one GET route on the same server, and a package of its own would need a second server type to share the mux. Its message type, `StatusEvent`, was generated from `api/openapi.yaml` (`skip-prune`); superseded by 0024: it is now a server type (`internal/httpapi/stream_event.go`) and the specs are generated from it. AsyncAPI was considered for the WebSocket contract and not adopted: with one server-to-client message it would repeat the route and its parameters already in the OpenAPI document; it earns its place when clients send messages or message types multiply.
 
 ## Confirmation
 `go build ./...`; `.claude/agent-policy.json` lists the contracts (`api/**`, `schema/**`, `internal/notification/**`) and `tools/ownercheck` enforces them at merge; `grep -rn 'type statusEvent' internal/` finds nothing.
+
+## Superseded in part (16 Nov 2026)
+The sentence "AsyncAPI was considered for the WebSocket contract and not adopted" is superseded by 0027: the stream now has a snapshot, ordered status messages, a 503 refusal and close codes, and the owner asked for its contract to be published alongside the HTTP one.

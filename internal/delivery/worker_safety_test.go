@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LeventAksakal/notification-system/internal/delivery/breaker"
+	"github.com/LeventAksakal/notification-system/internal/delivery/health"
 	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/provider"
 )
@@ -60,7 +60,8 @@ func TestWorkerLeaseSafety(t *testing.T) {
 			return provider.Response{}, ctx.Err()
 		}}
 		cfg := testConfig()
-		cfg.Lease = 600 * time.Millisecond
+		// 350 ms above the margin: room to start the call, too little to finish it.
+		cfg.Lease = leaseMargin + 350*time.Millisecond
 		cfg.MaxAttempts = 1
 		stop := run(t, New(cfg, Deps{Queue: q, Limiter: testLimiter(), Sender: snd}))
 		id := "sms-normal-0"
@@ -88,7 +89,7 @@ func TestWorkerMissedSlotIsReleasedNotSentLate(t *testing.T) {
 	snd := &countingSender{fn: accept}
 	w := New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: snd})
 	cr := w.newChannelRun(notification.ChannelEmail, testPlaces(1, 0))
-	tk, _, _ := cr.br.Allow()
+	tk, _, _, _ := cr.gate.Allow(t.Context(), time.Second)
 	tolerance := 5 * time.Millisecond
 	// The job reaches its send step three intervals after its slot (a slow
 	// claim, a timer late under load).
@@ -166,17 +167,19 @@ func TestWorkerPublishesReapedLeases(t *testing.T) {
 	}
 }
 
-func TestWorkerDoesNotSendWhenTheBreakerOpenedAfterTheClaim(t *testing.T) {
+func TestWorkerDoesNotSendWhenAnOutageWasDeclaredAfterTheClaim(t *testing.T) {
 	q := newMemQueue()
 	q.add(1, notification.ChannelSMS, notification.PriorityHigh)
 	jobs, _ := q.Claim(t.Context(), notification.ChannelSMS, notification.PriorityHigh, 1, time.Minute)
-	br := breaker.New(breaker.Config{Window: time.Minute, MinRequests: 1, FailureRatio: 0.5, Cooldown: time.Minute}, time.Now)
+	st := health.NewMemory(health.Config{Failures: 1, Cooldown: time.Minute}, time.Now)
 	snd := &countingSender{fn: accept}
-	w := New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: snd, Breakers: map[notification.Channel]*breaker.Breaker{notification.ChannelSMS: br}})
+	w := New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: snd, Health: st})
 	cr := w.newChannelRun(notification.ChannelSMS, testPlaces(1, 0))
-	tk, _, _ := br.Allow() // admitted while closed
-	other, _, _ := br.Allow()
-	br.Done(other, false) // another call fails: the breaker opens
+	tk, _, _, _ := cr.gate.Allow(t.Context(), time.Second) // admitted while closed
+	other, _, _, _ := cr.gate.Allow(t.Context(), time.Second)
+	if _, err := cr.gate.Done(t.Context(), other, true, 0); err != nil { // another call fails: the outage is declared
+		t.Fatal(err)
+	}
 	w.sendAt(t.Context(), t.Context(), cr, jobs[0], nil, time.Now(), tk, 5*time.Millisecond, 0)
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -192,7 +195,7 @@ func TestWorkerDoesNotSendASlotPlacedBeforeAClockStep(t *testing.T) {
 	snd := &countingSender{fn: accept}
 	w := New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: snd})
 	cr := w.newChannelRun(notification.ChannelSMS, testPlaces(1, 0))
-	tk, _, _ := cr.br.Allow()
+	tk, _, _, _ := cr.gate.Allow(t.Context(), time.Second)
 	// The slot is placed under the mapping's generation; then a Take shows
 	// the limiter's clock 5 s ahead of where the mapping had it.
 	now, remote := time.Now(), time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)

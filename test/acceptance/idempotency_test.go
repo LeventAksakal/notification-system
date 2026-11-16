@@ -7,13 +7,17 @@ import (
 	"slices"
 	"sync"
 	"testing"
+
+	"github.com/google/uuid"
+
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // concurrently runs f n times at once (released together) and returns every
 // response; a transport error fails the test.
-func concurrently(t *testing.T, n int, f func() (*response, error)) []*response {
+func concurrently[R any](t *testing.T, n int, f func() (R, error)) []R {
 	t.Helper()
-	res := make([]*response, n)
+	res := make([]R, n)
 	errs := make([]error, n)
 	var wg sync.WaitGroup
 	start := make(chan struct{})
@@ -41,21 +45,19 @@ func TestR11IdempotentCreate(t *testing.T) {
 	t.Run("same key and body twice: one row, same id, replay header", func(t *testing.T) {
 		key := "r11-single-" + newUUID()
 		body := msg("sms", "only once please")
-		first := s.postJSON(t, "/v1/notifications", body, "Idempotency-Key", key)
-		second := s.postJSON(t, "/v1/notifications", body, "Idempotency-Key", key)
-		if first.Status != http.StatusCreated || second.Status != http.StatusCreated {
-			t.Fatalf("want 201 twice, got %s and %s", first, second)
+		first := s.createResp(t, body, idemKey(key))
+		second := s.createResp(t, body, idemKey(key))
+		if first.StatusCode() != http.StatusCreated || second.StatusCode() != http.StatusCreated || first.JSON201 == nil || second.JSON201 == nil {
+			t.Fatalf("want 201 twice, got %s and %s", show(first), show(second))
 		}
-		var a, b apiNotification
-		first.decode(t, &a)
-		second.decode(t, &b)
-		if a.ID == "" || a.ID != b.ID {
-			t.Errorf("ids: first %q, replay %q", a.ID, b.ID)
+		a, b := *first.JSON201, *second.JSON201
+		if a.Id == uuid.Nil || a.Id != b.Id {
+			t.Errorf("ids: first %q, replay %q", a.Id, b.Id)
 		}
-		if got := second.Header.Get("Idempotent-Replayed"); got != "true" {
+		if got := second.HTTPResponse.Header.Get("Idempotent-Replayed"); got != "true" {
 			t.Errorf("replay header: want true, got %q", got)
 		}
-		if got := first.Header.Get("Idempotent-Replayed"); got != "" {
+		if got := first.HTTPResponse.Header.Get("Idempotent-Replayed"); got != "" {
 			t.Errorf("first response carries Idempotent-Replayed: %q", got)
 		}
 		if n := s.count(t, "SELECT COUNT(*) FROM notifications WHERE content = ?", "only once please"); n != 1 {
@@ -67,18 +69,16 @@ func TestR11IdempotentCreate(t *testing.T) {
 		key := "r11-race-" + newUUID()
 		body := msg("email", "raced body")
 		const copies = 20
-		res := concurrently(t, copies, func() (*response, error) {
-			return s.send(http.MethodPost, "/v1/notifications", body, "Idempotency-Key", key)
+		res := concurrently(t, copies, func() (*apiclient.CreateNotificationResponse, error) {
+			return s.API.CreateNotificationWithResponse(t.Context(), &apiclient.CreateNotificationParams{IdempotencyKey: &key}, body)
 		})
-		idSeen := map[string]int{}
+		idSeen := map[uuid.UUID]int{}
 		for i, r := range res {
-			if r.Status != http.StatusCreated {
-				t.Errorf("copy %d: want 201, got %s", i, r)
+			if r.StatusCode() != http.StatusCreated || r.JSON201 == nil {
+				t.Errorf("copy %d: want 201, got %s", i, show(r))
 				continue
 			}
-			var n apiNotification
-			r.decode(t, &n)
-			idSeen[n.ID]++
+			idSeen[r.JSON201.Id]++
 		}
 		if len(idSeen) != 1 {
 			t.Errorf("want one id across %d copies, got %v", copies, idSeen)
@@ -90,8 +90,8 @@ func TestR11IdempotentCreate(t *testing.T) {
 
 	t.Run("same key, different body: 422 idempotency_key_reused", func(t *testing.T) {
 		key := "r11-reuse-" + newUUID()
-		s.create(t, msg("push", "first body"), "Idempotency-Key", key)
-		r := s.postJSON(t, "/v1/notifications", msg("push", "second body"), "Idempotency-Key", key)
+		s.create(t, msg("push", "first body"), idemKey(key))
+		r := s.postCreate(t, msg("push", "second body"), idemKey(key))
 		wantError(t, r, http.StatusUnprocessableEntity, "idempotency_key_reused")
 		if n := s.count(t, "SELECT COUNT(*) FROM notifications WHERE content = ?", "second body"); n != 0 {
 			t.Errorf("the refused body was stored: %d rows", n)
@@ -102,8 +102,8 @@ func TestR11IdempotentCreate(t *testing.T) {
 		body := msg("sms", "twice on purpose")
 		a := s.create(t, body)
 		b := s.create(t, body)
-		if a.ID == b.ID {
-			t.Errorf("without a key both requests returned id %s", a.ID)
+		if a.Id == b.Id {
+			t.Errorf("without a key both requests returned id %s", a.Id)
 		}
 	})
 }
@@ -116,18 +116,16 @@ func TestR11IdempotentBatch(t *testing.T) {
 
 	t.Run("same key and body twice: one batch, same ids, replay header", func(t *testing.T) {
 		key := "r11-batch-" + newUUID()
-		first := s.postJSON(t, "/v1/notifications/batch", map[string]any{"notifications": items}, "Idempotency-Key", key)
-		second := s.postJSON(t, "/v1/notifications/batch", map[string]any{"notifications": items}, "Idempotency-Key", key)
-		if first.Status != http.StatusCreated || second.Status != http.StatusCreated {
-			t.Fatalf("want 201 twice, got %s and %s", first, second)
+		first := s.createBatchResp(t, items, idemKey(key))
+		second := s.createBatchResp(t, items, idemKey(key))
+		if first.StatusCode() != http.StatusCreated || second.StatusCode() != http.StatusCreated || first.JSON201 == nil || second.JSON201 == nil {
+			t.Fatalf("want 201 twice, got %s and %s", show(first), show(second))
 		}
-		var a, b batchCreated
-		first.decode(t, &a)
-		second.decode(t, &b)
-		if a.ID == "" || a.ID != b.ID || !slices.Equal(a.NotificationIDs, b.NotificationIDs) {
-			t.Errorf("replay differs: first %s %v, replay %s %v", a.ID, a.NotificationIDs, b.ID, b.NotificationIDs)
+		a, b := *first.JSON201, *second.JSON201
+		if a.Id == uuid.Nil || a.Id != b.Id || !slices.Equal(a.NotificationIds, b.NotificationIds) {
+			t.Errorf("replay differs: first %s %v, replay %s %v", a.Id, a.NotificationIds, b.Id, b.NotificationIds)
 		}
-		if got := second.Header.Get("Idempotent-Replayed"); got != "true" {
+		if got := second.HTTPResponse.Header.Get("Idempotent-Replayed"); got != "true" {
 			t.Errorf("replay header: want true, got %q", got)
 		}
 		if n := s.count(t, "SELECT COUNT(*) FROM batches"); n != 1 {
@@ -141,23 +139,21 @@ func TestR11IdempotentBatch(t *testing.T) {
 	t.Run("20 concurrent copies: every response 201 with one batch id, one set of rows", func(t *testing.T) {
 		key := "r11-batch-race-" + newUUID()
 		raceItems := batchItems(3)
-		for _, it := range raceItems {
-			it["content"] = "race " + it["content"].(string)
+		for i := range raceItems {
+			raceItems[i].Content = ptr("race " + deref(raceItems[i].Content))
 		}
 		beforeBatches := s.count(t, "SELECT COUNT(*) FROM batches")
 		const copies = 20
-		res := concurrently(t, copies, func() (*response, error) {
-			return s.send(http.MethodPost, "/v1/notifications/batch", map[string]any{"notifications": raceItems}, "Idempotency-Key", key)
+		res := concurrently(t, copies, func() (*apiclient.CreateBatchResponse, error) {
+			return s.API.CreateBatchWithResponse(t.Context(), &apiclient.CreateBatchParams{IdempotencyKey: &key}, apiclient.BatchCreate{Notifications: raceItems})
 		})
-		batchIDs := map[string]int{}
+		batchIDs := map[uuid.UUID]int{}
 		for i, r := range res {
-			if r.Status != http.StatusCreated {
-				t.Errorf("copy %d: want 201, got %s", i, r)
+			if r.StatusCode() != http.StatusCreated || r.JSON201 == nil {
+				t.Errorf("copy %d: want 201, got %s", i, show(r))
 				continue
 			}
-			var b batchCreated
-			r.decode(t, &b)
-			batchIDs[b.ID]++
+			batchIDs[r.JSON201.Id]++
 		}
 		if len(batchIDs) != 1 {
 			t.Errorf("want one batch id across %d copies, got %v", copies, batchIDs)
@@ -172,8 +168,8 @@ func TestR11IdempotentBatch(t *testing.T) {
 
 	t.Run("same key, different body: 422 idempotency_key_reused", func(t *testing.T) {
 		key := "r11-batch-reuse-" + newUUID()
-		s.createBatch(t, batchItems(2), "Idempotency-Key", key)
-		r := s.postJSON(t, "/v1/notifications/batch", map[string]any{"notifications": batchItems(3)}, "Idempotency-Key", key)
+		s.createBatch(t, batchItems(2), idemKey(key))
+		r := s.postBatch(t, batchItems(3), idemKey(key))
 		wantError(t, r, http.StatusUnprocessableEntity, "idempotency_key_reused")
 	})
 }

@@ -85,15 +85,47 @@ const (
 	FailureExhausted FailureKind = "exhausted"
 )
 
-// AttemptOutcome is how one provider call ended.
+// AttemptOutcome is where one provider call stands, or how it ended.
 type AttemptOutcome string
 
-// Accepted: 2xx. Transient: will be retried. Permanent: will not.
+// InFlight: recorded and committed before the request leaves; no result yet.
+// Accepted: 2xx. Transient: will be retried. Permanent: will not. Unknown:
+// the request may have left but its result was never recorded (the lease ran
+// out, or shutdown aborted the call); a late result may still replace it.
 const (
+	OutcomeInFlight  AttemptOutcome = "in_flight"
 	OutcomeAccepted  AttemptOutcome = "accepted"
 	OutcomeTransient AttemptOutcome = "transient"
 	OutcomePermanent AttemptOutcome = "permanent"
+	OutcomeUnknown   AttemptOutcome = "unknown"
 )
+
+// AttemptOutcomes lists every attempt outcome.
+var AttemptOutcomes = []AttemptOutcome{OutcomeInFlight, OutcomeAccepted, OutcomeTransient, OutcomePermanent, OutcomeUnknown}
+
+// attemptTransitions is the attempt's own state machine; an attempt is
+// created in flight.
+//
+//	in_flight -> accepted, transient, permanent  the worker recorded the result
+//	in_flight -> unknown                         the lease ran out or the call was aborted
+//	unknown   -> accepted, transient, permanent  the late result of a worker whose lease ran out
+var attemptTransitions = map[AttemptOutcome][]AttemptOutcome{
+	OutcomeInFlight:  {OutcomeAccepted, OutcomeTransient, OutcomePermanent, OutcomeUnknown},
+	OutcomeUnknown:   {OutcomeAccepted, OutcomeTransient, OutcomePermanent},
+	OutcomeAccepted:  {},
+	OutcomeTransient: {},
+	OutcomePermanent: {},
+}
+
+// AttemptTransition is the only gate for a change of an attempt's outcome.
+func AttemptTransition(from, to AttemptOutcome) error {
+	for _, allowed := range attemptTransitions[from] {
+		if allowed == to {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: attempt %q to %q", ErrInvalidTransition, from, to)
+}
 
 // ErrInvalidTransition is returned by Transition for a change the state machine forbids.
 var ErrInvalidTransition = errors.New("invalid status transition")

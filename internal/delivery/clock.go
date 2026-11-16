@@ -32,8 +32,8 @@ type clockMap struct {
 	epoch  time.Time // carries a monotonic reading
 	window time.Duration
 	// span is how long a forward step's overlap stays where a later step's
-	// can fall into the same second: one second plus the horizon and
-	// SendAlign, which bound how far ahead slots of the old mapping wait.
+	// can fall into the same second: one second plus the largest lead and
+	// horizon, which bound how far ahead slots of the old mapping wait.
 	span time.Duration
 
 	mu      sync.Mutex

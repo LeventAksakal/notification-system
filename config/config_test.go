@@ -14,8 +14,15 @@ func env(kv map[string]string) func(string) string { return func(k string) strin
 
 func TestEveryDialIsDocumentedAndHasADefaultOrIsInjected(t *testing.T) {
 	for _, d := range Dials {
-		if !strings.HasPrefix(d.Env, "APP_") || d.Doc == "" {
-			t.Errorf("%s: needs the APP_ prefix and a doc line", d.Env)
+		prefix := "APP_"
+		if d.PassThrough {
+			prefix = "OTEL_" // a library's own variable, declared here only to document and validate it
+		}
+		if !strings.HasPrefix(d.Env, prefix) || d.Doc == "" {
+			t.Errorf("%s: needs the %s prefix and a doc line", d.Env, prefix)
+		}
+		if d.PassThrough && (d.Secret || d.Default == "") {
+			t.Errorf("%s: a pass-through setting is not a secret and its default is the library's own", d.Env)
 		}
 		if d.Secret && d.Default != "" {
 			t.Errorf("%s: a secret must not have a committed default", d.Env)
@@ -31,7 +38,7 @@ func TestDefaultsLoadOnceSecretsAreInjected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.HTTPAddr != ":8080" || c.ShutdownTimeout != 10*time.Second || c.DBMaxOpenConns != 10 || c.RequestTimeout != 15*time.Second {
+	if c.HTTPAddr != ":8080" || c.ShutdownTimeout != 10*time.Second || c.DBMaxOpenConns != 10 || c.RequestTimeout != 10*time.Second {
 		t.Fatalf("defaults not applied: %+v", c)
 	}
 }
@@ -46,8 +53,8 @@ func TestDeliveryDialsDefaultToTheContractTable(t *testing.T) {
 			t.Errorf("provider URL for %s: %q", ch, c.ProviderURL(ch))
 		}
 	}
-	if c.PriorityWeights != [3]int{70, 20, 10} || c.BreakerFailureRatio != 0.5 || c.MaxAttempts != 5 ||
-		c.RetryCap != 5*time.Minute || c.IdempotencyRetention != 24*time.Hour || c.WSSendBuffer != 256 ||
+	if c.PriorityWeights != [3]int{70, 20, 10} || c.BreakerFailures != 5 || c.MaxAttempts != 10 ||
+		c.RetryCap != 5*time.Minute || c.IdempotencyRetention != 24*time.Hour || c.WSSendBuffer != 1024 ||
 		c.RateLimitHorizon != 200*time.Millisecond || c.RateLimitHeadroomPct != 5 {
 		t.Fatalf("defaults not applied: %+v", c)
 	}
@@ -55,19 +62,21 @@ func TestDeliveryDialsDefaultToTheContractTable(t *testing.T) {
 
 func TestBrokenDeliveryDialsAreRefused(t *testing.T) {
 	for name, kv := range map[string][2]string{
-		"two weights":              {"APP_PRIORITY_WEIGHTS", "70,30"},
-		"weight over 100":          {"APP_PRIORITY_WEIGHTS", "101,0,0"},
-		"weights sum to zero":      {"APP_PRIORITY_WEIGHTS", "0,0,0"},
-		"ratio above one":          {"APP_BREAKER_FAILURE_RATIO", "1.5"},
-		"ratio not a number":       {"APP_BREAKER_FAILURE_RATIO", "half"},
-		"provider URL no host":     {"APP_PROVIDER_URL_SMS", "send"},
-		"retry cap below base":     {"APP_RETRY_CAP", "10ms"},
-		"zero concurrency":         {"APP_WORKER_CONCURRENCY", "0"},
-		"horizon above 2s":         {"APP_RATE_LIMIT_HORIZON", "3s"},
-		"horizon below 10ms":       {"APP_RATE_LIMIT_HORIZON", "5ms"},
-		"lease below 1s":           {"APP_LEASE_DURATION", "500ms"},
-		"request timeout below 1s": {"APP_REQUEST_TIMEOUT", "500ms"},
-		"request timeout above 5m": {"APP_REQUEST_TIMEOUT", "6m"},
+		"two weights":               {"APP_PRIORITY_WEIGHTS", "70,30"},
+		"weight over 100":           {"APP_PRIORITY_WEIGHTS", "101,0,0"},
+		"weights sum to zero":       {"APP_PRIORITY_WEIGHTS", "0,0,0"},
+		"breaker failures zero":     {"APP_BREAKER_FAILURES", "0"},
+		"breaker failures a ratio":  {"APP_BREAKER_FAILURES", "0.5"},
+		"provider URL no host":      {"APP_PROVIDER_URL_SMS", "send"},
+		"retry cap below base":      {"APP_RETRY_CAP", "10ms"},
+		"zero concurrency":          {"APP_WORKER_CONCURRENCY", "0"},
+		"horizon above 2s":          {"APP_RATE_LIMIT_HORIZON", "3s"},
+		"horizon below 10ms":        {"APP_RATE_LIMIT_HORIZON", "5ms"},
+		"lease below 1s":            {"APP_LEASE_DURATION", "500ms"},
+		"request timeout below 1s":  {"APP_REQUEST_TIMEOUT", "500ms"},
+		"request timeout above 5m":  {"APP_REQUEST_TIMEOUT", "6m"},
+		"retention below an hour":   {"APP_NOTIFICATION_RETENTION", "30m"},
+		"retention below the key's": {"APP_NOTIFICATION_RETENTION", "2h"}, // the key's default is 24h
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(env(map[string]string{"APP_DATABASE_DSN": "x", kv[0]: kv[1]}))
@@ -153,6 +162,37 @@ func TestASecretIsReadFromTheFileItsFileVariableNames(t *testing.T) {
 			}
 			if c.HTTPAddr != ":8080" {
 				t.Errorf("HTTP addr %q, want the default", c.HTTPAddr)
+			}
+		})
+	}
+}
+
+// The trace sampler is the SDK's own variable; config only refuses what the
+// SDK would silently replace with "sample everything" (decision 0019).
+func TestTraceSamplerVariablesAreValidatedNotHeld(t *testing.T) {
+	const dsn = "u:p@tcp(db:3306)/app"
+	for name, tc := range map[string]struct {
+		sampler, arg string
+		refused      string // "" when the pair loads
+	}{
+		"unset: the SDK's own default":         {},
+		"production setting":                   {sampler: "parentbased_traceidratio", arg: "0.02"},
+		"the SDK lower-cases and trims":        {sampler: " ParentBased_TraceIDRatio ", arg: " 0.5 "},
+		"a typo would trace everything":        {sampler: "parentbased_traceratio", refused: "OTEL_TRACES_SAMPLER: unknown sampler"},
+		"a ratio above one is refused":         {sampler: "parentbased_traceidratio", arg: "1.5", refused: "OTEL_TRACES_SAMPLER_ARG: 1.5 outside [0..1]"},
+		"a percentage is not a ratio":          {sampler: "parentbased_traceidratio", arg: "5%", refused: "OTEL_TRACES_SAMPLER_ARG: not a number"},
+		"zero keeps only what the parent kept": {sampler: "parentbased_traceidratio", arg: "0"},
+		"NaN parses but is no ratio":           {sampler: "parentbased_traceidratio", arg: "NaN", refused: "OTEL_TRACES_SAMPLER_ARG: NaN outside [0..1]"},
+		"a ratio alone keeps 100%":             {arg: "0.02", refused: "OTEL_TRACES_SAMPLER_ARG 0.02 is ignored by OTEL_TRACES_SAMPLER parentbased_always_on"},
+		"a ratio with an always sampler":       {sampler: "always_on", arg: "0.02", refused: "is ignored"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(env(map[string]string{"APP_DATABASE_DSN": dsn, "OTEL_TRACES_SAMPLER": tc.sampler, "OTEL_TRACES_SAMPLER_ARG": tc.arg}))
+			switch {
+			case tc.refused == "" && err != nil:
+				t.Fatalf("refused: %v", err)
+			case tc.refused != "" && (err == nil || !strings.Contains(err.Error(), tc.refused)):
+				t.Fatalf("want an error containing %q, got %v", tc.refused, err)
 			}
 		})
 	}

@@ -5,6 +5,7 @@ package store_test
 import (
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -52,10 +53,13 @@ func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 	// Attempts spread over two days, so the window is a small part of the index.
 	for i := range 200 {
 		if _, err := db.ExecContext(t.Context(), `INSERT INTO delivery_attempts
-			(notification_id, attempt_no, channel, started_at, duration_ms, outcome)
-			SELECT id, 1, channel, NOW(3) - INTERVAL ? MINUTE, 5, 'accepted' FROM notifications LIMIT 1`, i*15); err != nil {
+			(notification_id, attempt_no, channel, started_at, outcome, claim_version)
+			SELECT id, 1, channel, NOW(3) - INTERVAL ? MINUTE, 'in_flight', ? FROM notifications LIMIT 1`, i*15, i+1); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := db.ExecContext(t.Context(), `UPDATE delivery_attempts SET outcome = 'accepted', duration_ms = 5, http_status = 202`); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(t.Context(), `ANALYZE TABLE notifications, delivery_attempts`); err != nil {
 		t.Fatal(err)
@@ -65,8 +69,8 @@ func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 		t.Fatal(err)
 	}
 	since := now.Add(-time.Minute)
+	edge := since.Truncate(time.Minute).Add(time.Minute)
 	qs := metricsQueries(t)
-	latency, latencyArgs := store.LatencyQuery(since)
 	cases := []struct {
 		name     string
 		query    string
@@ -77,9 +81,10 @@ func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 		{"queue", qs["MetricsQueue"], []any{now, now, now, now}, "claim_idx", false},
 		{"status counts", qs["MetricsStatusCounts"], nil, "list_status_idx", false},
 		{"scheduled", qs["MetricsScheduled"], []any{now}, "claim_idx", false},
-		{"finished in window", qs["MetricsFinished"], []any{since}, "finished_idx", true},
-		{"attempts in window", qs["MetricsAttempts"], []any{since}, "attempts_window_idx", true},
-		{"latency in window", latency, latencyArgs, "finished_idx", true},
+		{"attempt rollups", qs["MetricsAttemptRollups"], []any{edge}, "PRIMARY", true},
+		{"finish rollups", qs["MetricsFinishRollups"], []any{edge}, "PRIMARY", true},
+		{"attempts in the partial minute", qs["MetricsAttemptsBetween"], []any{since, edge}, "attempts_window_idx", true},
+		{"finishes in the partial minute", qs["MetricsFinishesBetween"], []any{since, edge}, "finished_idx", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -89,7 +94,7 @@ func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 			used := false
 			for _, row := range explain(t, db, tc.query, tc.args) {
 				table := row["table"]
-				if table != "notifications" && table != "delivery_attempts" {
+				if !slices.Contains([]string{"notifications", "delivery_attempts", "attempts_per_minute", "finishes_per_minute"}, table) {
 					continue
 				}
 				t.Logf("%s: table=%s type=%s key=%s extra=%s", tc.name, table, row["type"], row["key"], row["Extra"])
@@ -124,7 +129,9 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 	exec(`UPDATE notifications SET due_at = NOW(3) + INTERVAL 1 HOUR WHERE id = ?`, later[0])
 	retry := insertListed(t, db, 1, notification.ChannelSMS, notification.StatusPending) // backing off: scheduled in the queue, pending in totals
 	exec(`UPDATE notifications SET due_at = NOW(3) + INTERVAL 1 HOUR, attempts = 1 WHERE id = ?`, retry[0])
-	insertListed(t, db, 1, notification.ChannelEmail, notification.StatusProcessing)
+	processing := insertListed(t, db, 1, notification.ChannelEmail, notification.StatusProcessing)
+	attemptIn(t, db, processing[0], 1, notification.OutcomeInFlight) // counts nowhere
+	attemptIn(t, db, retry[0], 1, notification.OutcomeUnknown)       // counts, apart from failures
 	sent := insertListed(t, db, 4, notification.ChannelPush, notification.StatusSent)
 	// Latency runs from the first due time: the creation, or the schedule when
 	// later. due_at, moved by retries and releases, does not count.
@@ -138,13 +145,11 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 		exec(`UPDATE notifications SET created_at = NOW(3) - INTERVAL ? MICROSECOND,
 			scheduled_at = NOW(3) - INTERVAL ? MICROSECOND, due_at = NOW(3) - INTERVAL 5000 MICROSECOND,
 			finished_at = NOW(3) WHERE id = ?`, firstDue[i].createdAgoUs, firstDue[i].scheduledAgoUs, id)
-		exec(`INSERT INTO delivery_attempts (notification_id, attempt_no, channel, started_at, duration_ms, outcome)
-			VALUES (?, 1, 'push', NOW(3), 5, 'accepted')`, id)
+		attemptIn(t, db, id, 1, notification.OutcomeAccepted)
 	}
 	failed := insertListed(t, db, 1, notification.ChannelEmail, notification.StatusFailed)
 	exec(`UPDATE notifications SET finished_at = NOW(3) WHERE id = ?`, failed[0])
-	exec(`INSERT INTO delivery_attempts (notification_id, attempt_no, channel, started_at, duration_ms, outcome)
-		VALUES (?, 1, 'email', NOW(3), 5, 'permanent')`, failed[0])
+	attemptIn(t, db, failed[0], 1, notification.OutcomePermanent)
 	old := insertListed(t, db, 1, notification.ChannelEmail, notification.StatusSent) // outside the window
 	exec(`UPDATE notifications SET finished_at = NOW(3) - INTERVAL 2 HOUR WHERE id = ?`, old[0])
 
@@ -177,15 +182,16 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 		}
 	}
 	d := m.Delivery
-	if d.Sent != 4 || d.Failed != 1 || d.Attempts != 5 || d.FailedAttempts != 1 {
+	if d.Sent != 4 || d.Failed != 1 || d.Attempts != 5 || d.FailedAttempts != 1 || d.UnknownAttempts != 1 {
 		t.Errorf("delivery: %+v", d)
 	}
 	if d.SuccessRate() != 0.8 || d.FailureRate() != 0.2 {
 		t.Errorf("rates: %v %v", d.SuccessRate(), d.FailureRate())
 	}
 	// Latencies 100, 200, 300, 400 ms (each within a ms of it): nearest rank
-	// p50 = 2nd, p95 = p99 = 4th.
-	if l := d.Latency; l.P50 < 200 || l.P50 > 201 || l.P95 < 400 || l.P95 > 401 || l.P99 != l.P95 {
+	// p50 = 2nd, p95 = p99 = 4th, each estimated inside its latency bucket.
+	inBucket := func(got, exact int) bool { return store.LatencyBucket(int64(got)) == store.LatencyBucket(int64(exact)) }
+	if l := d.Latency; !inBucket(l.P50, 200) || !inBucket(l.P95, 400) || l.P99 != l.P95 {
 		t.Errorf("latency: %+v", l)
 	}
 	if m.ByChannel[2].Latency != d.Latency || m.ByChannel[0].Latency != (store.Latency{}) {

@@ -1,4 +1,7 @@
 -- Limits repeat internal/notification/limits.go; a test asserts they agree (decision 0017).
+-- A limit counted in bytes there is length() (OCTET_LENGTH) here; one counted in characters is char_length().
+-- The not-blank REGEXPs spell notification.NotBlankPattern in ICU escapes: at least one character
+-- outside Unicode White_Space (MySQL's TRIM strips spaces only).
 -- CHECKs that compare a column with a string are written as MySQL stores them
 -- (SHOW CREATE TABLE); sqldef reports a false change for any other spelling.
 
@@ -14,9 +17,22 @@ CREATE TABLE notifications (
   -- Final content: templates are rendered at intake (decision 0015).
   content MEDIUMTEXT NOT NULL,
   status ENUM('pending', 'processing', 'sent', 'failed', 'cancelled') NOT NULL DEFAULT 'pending',
+  -- The state this row last moved from, written only by the triggers below:
+  -- 'created' on insert, the old status on every status change. NULL only on
+  -- rows that existed before the triggers (decision 0005, "As built").
+  status_from ENUM('created', 'pending', 'processing', 'sent', 'failed', 'cancelled') NULL,
+  -- Goes up by exactly one with every status change, in the statement that
+  -- makes it; creation is 1. Live events carry it, so subscribers order them
+  -- exactly and skip what a snapshot already shows (decision 0013).
+  status_seq BIGINT UNSIGNED NOT NULL DEFAULT 1,
   failure_kind ENUM('permanent', 'exhausted') NULL,
   -- Provider calls made in the current attempt budget; reset by a replay.
   attempts INT UNSIGNED NOT NULL DEFAULT 0,
+  -- Failed calls counted against the attempt budget (APP_MAX_ATTEMPTS): only
+  -- those made while the channel's provider was believed healthy; a failure
+  -- that belongs to a declared outage is recorded but not counted (decision
+  -- 0026). Reset by a replay.
+  budget_spent INT UNSIGNED NOT NULL DEFAULT 0,
   -- Earliest claim time: the schedule or the next retry (decisions 0007, 0016).
   due_at DATETIME(3) NOT NULL,
   scheduled_at DATETIME(3) NULL,
@@ -27,6 +43,11 @@ CREATE TABLE notifications (
   last_error VARCHAR(1024) NULL,
   correlation_id VARCHAR(128) NOT NULL,
   traceparent VARCHAR(64) NULL,
+  -- The template and version that rendered content (decision 0015); both NULL
+  -- when content was sent as is. No foreign key: the template may be replaced
+  -- or deleted later, and the notification keeps what produced it.
+  template_name VARCHAR(63) CHARACTER SET ascii NULL,
+  template_version INT UNSIGNED NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   -- Set on reaching sent, failed or cancelled; cleared by a replay.
@@ -34,24 +55,73 @@ CREATE TABLE notifications (
   PRIMARY KEY (id),
   CONSTRAINT notifications_batch_fk FOREIGN KEY (batch_id) REFERENCES batches (id),
   CONSTRAINT recipient_not_blank CHECK (CHAR_LENGTH(recipient) BETWEEN 1 AND 255),
-  CONSTRAINT recipient_email_length CHECK (((`channel` <> _utf8mb4'email') or (char_length(`recipient`) <= 254))),
-  CONSTRAINT recipient_sms_e164 CHECK (((`channel` <> _utf8mb4'sms') or regexp_like(`recipient`,_utf8mb4'^\\+[0-9]{7,15}$'))),
-  CONSTRAINT content_length CHECK ((((`channel` = _utf8mb4'sms') and (char_length(`content`) between 1 and 1600)) or ((`channel` = _utf8mb4'email') and (char_length(`content`) between 1 and 100000)) or ((`channel` = _utf8mb4'push') and (char_length(`content`) between 1 and 1024)))),
+  CONSTRAINT recipient_not_whitespace CHECK (regexp_like(`recipient`,_utf8mb4'[^\\t\\n\\x{0B}\\f\\r \\x{85}\\x{A0}\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]')),
+  CONSTRAINT recipient_email_length CHECK (((`channel` <> _utf8mb4'email') or (length(`recipient`) <= 254))),
+  CONSTRAINT recipient_sms_e164 CHECK (((`channel` <> _utf8mb4'sms') or regexp_like(`recipient`,_utf8mb4'^\\+[1-9][0-9]{1,14}$'))),
+  CONSTRAINT content_length CHECK ((((`channel` = _utf8mb4'sms') and (char_length(`content`) between 1 and 1600)) or ((`channel` = _utf8mb4'email') and (length(`content`) between 1 and 32768)) or ((`channel` = _utf8mb4'push') and (length(`content`) between 1 and 4067)))),
+  CONSTRAINT content_not_blank CHECK (regexp_like(`content`,_utf8mb4'[^\\t\\n\\x{0B}\\f\\r \\x{85}\\x{A0}\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]')),
   CONSTRAINT failure_kind_only_when_failed CHECK ((status = 'failed') = (failure_kind IS NOT NULL)),
+  CONSTRAINT budget_within_attempts CHECK ((`budget_spent` <= `attempts`)),
+  CONSTRAINT status_seq_from_one CHECK ((`status_seq` >= 1)),
+  -- The state machine (internal/notification/status.go, transitions): every
+  -- (status_from, status) pair the triggers can produce must be an allowed
+  -- edge; 'created' -> pending is the only way in. store_rules_integration_test.go
+  -- asserts this list equals the Go map.
+  CONSTRAINT status_transition CHECK (((`status_from` is null) or ((`status_from`,`status`) in ((_utf8mb4'created',_utf8mb4'pending'),(_utf8mb4'pending',_utf8mb4'processing'),(_utf8mb4'pending',_utf8mb4'cancelled'),(_utf8mb4'processing',_utf8mb4'sent'),(_utf8mb4'processing',_utf8mb4'pending'),(_utf8mb4'processing',_utf8mb4'failed'),(_utf8mb4'failed',_utf8mb4'pending'))))),
+  CONSTRAINT finished_exactly_when_terminal CHECK (((`status` in (_utf8mb4'sent',_utf8mb4'failed',_utf8mb4'cancelled')) = (`finished_at` is not null))),
+  CONSTRAINT lease_only_while_processing CHECK (((`status` = _utf8mb4'processing') = (`lease_until` is not null))),
+  CONSTRAINT provider_id_only_when_sent CHECK (((`status` = _utf8mb4'sent') or (`provider_message_id` is null))),
+  CONSTRAINT attempted_before_sent_or_failed CHECK (((`status` not in (_utf8mb4'sent',_utf8mb4'failed')) or (`attempts` >= 1))),
+  CONSTRAINT batch_position_with_batch CHECK (((`batch_id` is null) = (`batch_index` is null))),
+  -- The schedule horizon (notification.ScheduleHorizon, decision 0016) on the
+  -- database clock: a CHECK cannot call NOW(), but updated_at is stamped with
+  -- the statement's NOW(3) by every write that changes the row (the default
+  -- on insert, ON UPDATE), so a row that passed once keeps passing while the
+  -- server clock does not step back (decision 0016, "As built").
+  CONSTRAINT scheduled_within_horizon CHECK (((`scheduled_at` is null) or (`scheduled_at` <= (`updated_at` + interval 30 day)))),
+  CONSTRAINT template_origin_complete CHECK (((`template_name` is null) = (`template_version` is null))),
+  CONSTRAINT template_origin_version_positive CHECK ((`template_version` >= 1)),
   -- The claim: WHERE status='pending' AND channel=? AND priority=? AND due_at<=NOW(3) ORDER BY due_at.
-  KEY claim_idx (status, channel, priority, due_at),
+  -- attempts after due_at leaves the claim's order alone and lets the metrics'
+  -- scheduled count (pending, due later, never tried) read the index alone: with
+  -- 20,000 such rows the table lookups took 6.6 s on a cold buffer pool.
+  KEY claim_idx (status, channel, priority, due_at, attempts),
   -- The reaper: WHERE status='processing' AND lease_until < NOW(3).
   KEY lease_idx (status, lease_until),
-  -- Batch items in request order.
-  KEY batch_idx (batch_id, batch_index),
+  -- Batch items in request order, one row per position.
+  UNIQUE KEY batch_position_idx (batch_id, batch_index),
   -- Lists newest first, filtered by channel or by status.
   KEY list_channel_idx (channel, id),
   KEY list_status_idx (status, id),
-  -- Metrics: what finished inside a window.
-  KEY finished_idx (finished_at, status, channel)
+  -- Metrics: what finished inside a window. Retention: WHERE finished_at < ? (decision 0025).
+  -- created_at and scheduled_at make the metrics' partial-minute latency read
+  -- (MetricsFinishesBetween) index-only: 37 ms for 13 s of rows with table lookups.
+  KEY finished_idx (finished_at, status, channel, created_at, scheduled_at)
 );
 
+-- Only the triggers write status_from, so status_transition sees every status
+-- change, whoever writes it (sqldef cannot parse SIGNAL, decision 0023, so the
+-- refusal is the CHECK, not the trigger). They also own status_seq: 1 on
+-- insert, OLD + 1 on every status change, unchanged otherwise, so no query can
+-- skip or double a step whatever it writes to the column (decision 0013).
+CREATE TRIGGER notifications_status_from_insert BEFORE INSERT ON notifications FOR EACH ROW BEGIN
+  SET NEW.status_from = 'created';
+  SET NEW.status_seq = 1;
+END;
+
+CREATE TRIGGER notifications_status_from_update BEFORE UPDATE ON notifications FOR EACH ROW BEGIN
+  IF NOT (NEW.status <=> OLD.status) THEN
+    SET NEW.status_from = OLD.status;
+    SET NEW.status_seq = OLD.status_seq + 1;
+  ELSE
+    SET NEW.status_from = OLD.status_from;
+    SET NEW.status_seq = OLD.status_seq;
+  END IF;
+END;
+
 -- One row per provider call (decision 0005); also feeds the metrics endpoint (0014).
+-- Written in flight and committed before the request leaves, then updated
+-- with the result, so a crash cannot lose a call from the history.
 CREATE TABLE delivery_attempts (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   notification_id CHAR(36) CHARACTER SET ascii NOT NULL,
@@ -59,16 +129,138 @@ CREATE TABLE delivery_attempts (
   attempt_no INT UNSIGNED NOT NULL,
   channel ENUM('sms', 'email', 'push') NOT NULL,
   started_at DATETIME(3) NOT NULL,
-  duration_ms INT UNSIGNED NOT NULL,
-  outcome ENUM('accepted', 'transient', 'permanent') NOT NULL,
+  -- 0 until a result is recorded.
+  duration_ms INT UNSIGNED NOT NULL DEFAULT 0,
+  outcome ENUM('accepted', 'transient', 'permanent', 'in_flight', 'unknown') NOT NULL,
+  -- Where the outcome last moved from, written only by the triggers below
+  -- ('created' on insert); NULL on rows older than the triggers.
+  outcome_from ENUM('created', 'accepted', 'transient', 'permanent', 'in_flight', 'unknown') NULL,
+  -- The claim that made the call (notifications.claim_version); NULL on rows
+  -- older than attempts written before the call.
+  claim_version BIGINT UNSIGNED NULL,
   -- NULL when no response arrived (timeout, connection error).
   http_status SMALLINT UNSIGNED NULL,
   error VARCHAR(1024) NULL,
   provider_message_id VARCHAR(255) NULL,
   PRIMARY KEY (id),
+  CONSTRAINT attempt_no_from_one CHECK ((`attempt_no` >= 1)),
+  -- The attempt's state machine (internal/notification/status.go, attemptTransitions).
+  CONSTRAINT attempt_outcome_transition CHECK (((`outcome_from` is null) or ((`outcome_from`,`outcome`) in ((_utf8mb4'created',_utf8mb4'in_flight'),(_utf8mb4'in_flight',_utf8mb4'accepted'),(_utf8mb4'in_flight',_utf8mb4'transient'),(_utf8mb4'in_flight',_utf8mb4'permanent'),(_utf8mb4'in_flight',_utf8mb4'unknown'),(_utf8mb4'unknown',_utf8mb4'accepted'),(_utf8mb4'unknown',_utf8mb4'transient'),(_utf8mb4'unknown',_utf8mb4'permanent'))))),
+  CONSTRAINT attempt_claim_known CHECK (((`outcome_from` is null) or (`claim_version` is not null))),
+  CONSTRAINT attempt_no_result_yet CHECK (((`outcome` not in (_utf8mb4'in_flight',_utf8mb4'unknown')) or ((`http_status` is null) and (`duration_ms` = 0)))),
+  CONSTRAINT attempt_provider_id_only_when_accepted CHECK (((`outcome` = _utf8mb4'accepted') or (`provider_message_id` is null))),
+  CONSTRAINT attempt_accepted_is_2xx CHECK (((`outcome` <> _utf8mb4'accepted') or ((`http_status` is not null) and (`http_status` between 200 and 299)))),
+  CONSTRAINT attempt_http_status_range CHECK ((`http_status` between 100 and 999)),
+  CONSTRAINT attempt_error_exactly_when_failed_or_unknown CHECK (((`outcome` in (_utf8mb4'accepted',_utf8mb4'in_flight')) = (`error` is null))),
   CONSTRAINT attempts_notification_fk FOREIGN KEY (notification_id) REFERENCES notifications (id),
   -- A notification's history, oldest first.
   KEY attempts_notification_idx (notification_id, id),
+  -- One provider call per claim; the result write finds its row here.
+  UNIQUE KEY attempts_claim_idx (notification_id, claim_version),
   -- Metrics: attempts started inside a window.
   KEY attempts_window_idx (started_at, channel, outcome)
 );
+
+CREATE TRIGGER delivery_attempts_outcome_from_insert BEFORE INSERT ON delivery_attempts FOR EACH ROW BEGIN
+  SET NEW.outcome_from = 'created';
+END;
+
+CREATE TRIGGER delivery_attempts_outcome_from_update BEFORE UPDATE ON delivery_attempts FOR EACH ROW BEGIN
+  IF NOT (NEW.outcome <=> OLD.outcome) THEN
+    SET NEW.outcome_from = OLD.outcome;
+  ELSE
+    SET NEW.outcome_from = OLD.outcome_from;
+  END IF;
+END;
+
+
+-- The metrics rollups (schema/delivery_rollups.sql) are pre-computed views of
+-- the rows below: a rollup row holds what MetricsFinishesBetween or
+-- MetricsAttemptsBetween (internal/store/queries/metrics.sql) count for its
+-- minute. These triggers keep them so in the transaction that changes a row,
+-- whoever writes it: a change takes the row's old contribution out (never
+-- below 0, for rows older than the rollups) and puts its new one in. Deletes
+-- (retention) leave the rollups alone; they have their own retention
+-- (decision 0014, "As built"). A take-out goes to the key's first shard that
+-- holds a count; if it changed nothing it runs once more: a take-out that
+-- waited on a fold (store.FoldRollups) resumes past the shard 0 row the fold
+-- inserted, and finds the shards it scans deleted. The second run sees that
+-- shard 0, which folds never delete. A take-out that finds nothing twice is a
+-- row older than the rollups. The latency is the expression of
+-- MetricsFinishesBetween; the bucket expression is latencyBucket in
+-- internal/store/latency_buckets.go, which metrics_rollup_integration_test.go
+-- holds it equal to.
+CREATE TRIGGER notifications_finish_rollup_insert AFTER INSERT ON notifications FOR EACH ROW BEGIN
+  DECLARE ms BIGINT;
+  IF NEW.status IN ('sent', 'failed') AND NEW.finished_at IS NOT NULL THEN
+    SET ms = CAST(CEIL(TIMESTAMPDIFF(MICROSECOND, GREATEST(COALESCE(NEW.scheduled_at, NEW.created_at), NEW.created_at), NEW.finished_at) / 1000) AS SIGNED);
+    INSERT INTO finishes_per_minute (minute, channel, status, latency_le_ms, shard, n)
+    VALUES (NEW.finished_at - INTERVAL (SECOND(NEW.finished_at) * 1000000 + MICROSECOND(NEW.finished_at)) MICROSECOND, NEW.channel, NEW.status,
+      CASE WHEN NEW.status <> 'sent' OR ms <= 0 THEN 0
+        ELSE (((ms - 1) >> GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0)) + 1) << GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0) END, CRC32(NEW.id) % 4, 1)
+    ON DUPLICATE KEY UPDATE n = n + 1;
+  END IF;
+END;
+
+CREATE TRIGGER notifications_finish_rollup_update AFTER UPDATE ON notifications FOR EACH ROW BEGIN
+  DECLARE ms BIGINT;
+  IF NOT (NEW.status <=> OLD.status AND NEW.finished_at <=> OLD.finished_at AND NEW.channel <=> OLD.channel
+      AND NEW.created_at <=> OLD.created_at AND NEW.scheduled_at <=> OLD.scheduled_at) THEN
+    IF OLD.status IN ('sent', 'failed') AND OLD.finished_at IS NOT NULL THEN
+      SET ms = CAST(CEIL(TIMESTAMPDIFF(MICROSECOND, GREATEST(COALESCE(OLD.scheduled_at, OLD.created_at), OLD.created_at), OLD.finished_at) / 1000) AS SIGNED);
+      UPDATE finishes_per_minute SET n = n - 1
+      WHERE minute = OLD.finished_at - INTERVAL (SECOND(OLD.finished_at) * 1000000 + MICROSECOND(OLD.finished_at)) MICROSECOND
+        AND channel = OLD.channel AND status = OLD.status AND n > 0
+        AND latency_le_ms = CASE WHEN OLD.status <> 'sent' OR ms <= 0 THEN 0
+          ELSE (((ms - 1) >> GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0)) + 1) << GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0) END
+      ORDER BY shard LIMIT 1;
+      IF ROW_COUNT() = 0 THEN -- a fold committed shard 0 behind this scan while it waited (see below)
+        UPDATE finishes_per_minute SET n = n - 1
+        WHERE minute = OLD.finished_at - INTERVAL (SECOND(OLD.finished_at) * 1000000 + MICROSECOND(OLD.finished_at)) MICROSECOND
+          AND channel = OLD.channel AND status = OLD.status AND n > 0
+          AND latency_le_ms = CASE WHEN OLD.status <> 'sent' OR ms <= 0 THEN 0
+            ELSE (((ms - 1) >> GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0)) + 1) << GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0) END
+        ORDER BY shard LIMIT 1;
+      END IF;
+    END IF;
+    IF NEW.status IN ('sent', 'failed') AND NEW.finished_at IS NOT NULL THEN
+      SET ms = CAST(CEIL(TIMESTAMPDIFF(MICROSECOND, GREATEST(COALESCE(NEW.scheduled_at, NEW.created_at), NEW.created_at), NEW.finished_at) / 1000) AS SIGNED);
+      INSERT INTO finishes_per_minute (minute, channel, status, latency_le_ms, shard, n)
+      VALUES (NEW.finished_at - INTERVAL (SECOND(NEW.finished_at) * 1000000 + MICROSECOND(NEW.finished_at)) MICROSECOND, NEW.channel, NEW.status,
+        CASE WHEN NEW.status <> 'sent' OR ms <= 0 THEN 0
+          ELSE (((ms - 1) >> GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0)) + 1) << GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0) END, CRC32(NEW.id) % 4, 1)
+      ON DUPLICATE KEY UPDATE n = n + 1;
+    END IF;
+  END IF;
+END;
+
+-- in_flight is not an outcome yet and counts nowhere.
+CREATE TRIGGER delivery_attempts_rollup_insert AFTER INSERT ON delivery_attempts FOR EACH ROW BEGIN
+  IF NEW.outcome IN ('accepted', 'transient', 'permanent', 'unknown') THEN
+    INSERT INTO attempts_per_minute (minute, channel, outcome, shard, n)
+    VALUES (NEW.started_at - INTERVAL (SECOND(NEW.started_at) * 1000000 + MICROSECOND(NEW.started_at)) MICROSECOND, NEW.channel, NEW.outcome, NEW.id % 4, 1)
+    ON DUPLICATE KEY UPDATE n = n + 1;
+  END IF;
+END;
+
+CREATE TRIGGER delivery_attempts_rollup_update AFTER UPDATE ON delivery_attempts FOR EACH ROW BEGIN
+  IF NOT (NEW.outcome <=> OLD.outcome AND NEW.started_at <=> OLD.started_at AND NEW.channel <=> OLD.channel) THEN
+    IF OLD.outcome IN ('accepted', 'transient', 'permanent', 'unknown') THEN
+      UPDATE attempts_per_minute SET n = n - 1
+      WHERE minute = OLD.started_at - INTERVAL (SECOND(OLD.started_at) * 1000000 + MICROSECOND(OLD.started_at)) MICROSECOND
+        AND channel = OLD.channel AND outcome = OLD.outcome AND n > 0
+      ORDER BY shard LIMIT 1;
+      IF ROW_COUNT() = 0 THEN -- a fold committed shard 0 behind this scan while it waited
+        UPDATE attempts_per_minute SET n = n - 1
+        WHERE minute = OLD.started_at - INTERVAL (SECOND(OLD.started_at) * 1000000 + MICROSECOND(OLD.started_at)) MICROSECOND
+          AND channel = OLD.channel AND outcome = OLD.outcome AND n > 0
+        ORDER BY shard LIMIT 1;
+      END IF;
+    END IF;
+    IF NEW.outcome IN ('accepted', 'transient', 'permanent', 'unknown') THEN
+      INSERT INTO attempts_per_minute (minute, channel, outcome, shard, n)
+      VALUES (NEW.started_at - INTERVAL (SECOND(NEW.started_at) * 1000000 + MICROSECOND(NEW.started_at)) MICROSECOND, NEW.channel, NEW.outcome, NEW.id % 4, 1)
+      ON DUPLICATE KEY UPDATE n = n + 1;
+    END IF;
+  END IF;
+END;

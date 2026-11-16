@@ -1,0 +1,9 @@
+package: apiclient
+output: client.gen.go
+generate:
+  models: true
+  client: true
+output-options:
+  # StatusEvent is referenced only from the WebSocket operation's
+  # x-websocket-message; keep it so the stream's messages are typed too.
+  skip-prune: true

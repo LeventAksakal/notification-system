@@ -23,6 +23,7 @@ tasks:
       - '{{.T}} golangci-lint version'
       - '{{.T}} sqlc version'
       - '{{.T}} oapi-codegen -version'
+      - '{{.T}} oasdiff --version'
       - '{{.T}} gotestsum --version'
       - '{{.T}} mockgen -version'
       - docker version --format 'docker {{"{{"}}.Server.Version{{"}}"}}'
@@ -61,8 +62,13 @@ tasks:
     cmds: ['go build -o .claude/bin/agentguard.exe ./tools/agentguard']
 
   gen:
-    desc: Regenerate SQL and API code from their sources (migrations come from migrate:diff)
+    desc: 'Regenerate from the sources: sqlc types from SQL, api/openapi.yaml from internal/httpapi, the Go client from the spec (migrations come from migrate:diff)'
     cmds: ['go generate ./...']
+
+  api:breaking:
+    desc: 'Fail if api/openapi.yaml breaks clients of a base revision (usage: task api:breaking [BASE=main])'
+    cmds:
+      - go run ./tools/apibreaking -base {{.BASE | default "main"}}
 
   lint:
     desc: golangci-lint, failing on any silent typecheck error
@@ -85,7 +91,7 @@ tasks:
     # alone, because their rate floors need the machine to themselves.
     cmds:
       - '{{.T}} gotestsum --format pkgname -- -tags integration {{.CLI_ARGS | default "./internal/..."}}'
-      - '{{if not .CLI_ARGS}}{{.T}} gotestsum --format pkgname -- -tags integration ./test/...{{end}}'
+      - '{{if not .CLI_ARGS}}{{.T}} gotestsum --format pkgname -- -tags integration -timeout 30m ./test/...{{end}}'
 
   test:all:
     desc: Unit tests, then integration tests

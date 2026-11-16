@@ -18,6 +18,10 @@ services:
       MYSQL_DATABASE: app
       MYSQL_USER: app
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-local-dev}
+    # `app migrate` runs as the non-SUPER user app and creates triggers; with
+    # binary logging on, MySQL refuses that unless this is set. Safe with the
+    # default ROW binlog format; deprecated in 8.4 (owner item 0014).
+    command: ["--log-bin-trust-function-creators=ON"]
     volumes: [mysql:/var/lib/mysql]
     # Loopback only, for a database client on the host (MYSQL_PORT if 3306 is taken).
     ports: ["127.0.0.1:${MYSQL_PORT:-3306}:3306"]
@@ -79,7 +83,7 @@ services:
       migrate: { condition: service_completed_successfully }
       valkey: { condition: service_healthy }
       otel: { condition: service_started }
-    stop_grace_period: 15s # above APP_SHUTDOWN_TIMEOUT so drains finish
+    stop_grace_period: 25s # APP_SHUTDOWN_TIMEOUT 10s + final writes 5s + telemetry flush 5s + 5s to spare
     restart: unless-stopped # a crashed API comes back; `docker compose stop` still stops it
     healthcheck:
       test: ["CMD", "/app", "healthcheck"]
@@ -111,7 +115,7 @@ services:
       otel: { condition: service_started }
     deploy:
       replicas: 3
-    stop_grace_period: 15s # above APP_SHUTDOWN_TIMEOUT so in-flight sends finish
+    stop_grace_period: 25s # APP_SHUTDOWN_TIMEOUT 10s + final result writes 5s (storeTimeout) + telemetry flush 5s + 5s to spare
     restart: unless-stopped # a crashed worker comes back; its claimed rows return when their lease ends
 
 volumes:

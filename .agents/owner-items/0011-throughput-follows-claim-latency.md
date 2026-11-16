@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-14
 tags: [worker, rate-limit, throughput, ci]
 ---
@@ -30,3 +30,4 @@ Two separate causes: a late timer (CPU starvation; the cap forbids sending late,
 Option 1. The isolation test now uses dials where the original defect (one shared pool of provider calls) measures 17 to 18.5 per second against 81 to 86 for the current code, and asserts 40. The throughput floors (90 and 93) stay strict by default; CI's two-core runner sets `ACCEPTANCE_RATE_FLOOR=40`, where only the cap and that sanity floor are asserted.
 
 ## Answer
+Owner, 15 Nov 2026: "througput drop is real and should be a concern". Built by adaptive-align (aaeb893, decision 0009): send alignment follows the measured claim latency (p95 of the newest 20 claims) instead of a fixed 200 ms; R8 now runs at 94 to 95 per second with the busiest second at most 97. Closed 16 Nov.

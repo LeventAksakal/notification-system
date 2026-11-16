@@ -168,8 +168,7 @@ func readCommand(r *bufio.Reader) ([]string, error) {
 	return args, nil
 }
 
-// newTestPublisher publishes to f with a clock frozen at one moment, so a
-// hold-off, once started, lasts until a success ends it.
+// newTestPublisher publishes to f with one connection and no client retries.
 func newTestPublisher(t *testing.T, f *fakeValkey) *Publisher {
 	t.Helper()
 	c, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{f.addr}, DisableCache: true,
@@ -178,17 +177,14 @@ func newTestPublisher(t *testing.T, f *fakeValkey) *Publisher {
 		t.Fatal(err)
 	}
 	t.Cleanup(c.Close)
-	p := NewPublisher(c, OriginWorker)
-	frozen := time.Now()
-	p.now = func() time.Time { return frozen }
-	return p
+	return NewPublisher(c)
 }
 
 func event(i int) notification.Event {
 	return notification.Event{NotificationID: fmt.Sprintf("n%d", i), Status: notification.StatusProcessing, At: time.Now()}
 }
 
-func TestPublisherErrorReplyDoesNotHoldOffTheNextPublish(t *testing.T) {
+func TestPublisherErrorReplyDoesNotMarkValkeyDown(t *testing.T) {
 	noLeaks(t)
 	f := newFakeValkey(t)
 	p := newTestPublisher(t, f)
@@ -202,7 +198,7 @@ func TestPublisherErrorReplyDoesNotHoldOffTheNextPublish(t *testing.T) {
 	}
 }
 
-func TestPublisherTimeoutHoldsOffOthersUntilAProbeSucceeds(t *testing.T) {
+func TestPublisherTimeoutFailsOthersAtOnceUntilAProbeSucceeds(t *testing.T) {
 	noLeaks(t)
 	f := newFakeValkey(t)
 	p := newTestPublisher(t, f)
@@ -211,8 +207,8 @@ func TestPublisherTimeoutHoldsOffOthersUntilAProbeSucceeds(t *testing.T) {
 		t.Fatalf("publish to a hung server: want a timeout, got %v", err)
 	}
 
-	// The hold-off is open (the clock is frozen inside it). One caller
-	// probes; the server holds its reply until the test lets it go.
+	// Valkey is taken as down. One caller probes; the server holds its reply
+	// until the test lets it go.
 	f.setMode(replyGated)
 	f.unhang()
 	probe := make(chan error, 1)
@@ -226,10 +222,10 @@ func TestPublisherTimeoutHoldsOffOthersUntilAProbeSucceeds(t *testing.T) {
 		start := time.Now()
 		err := p.Publish(t.Context(), event(10+i))
 		if !errors.Is(err, ErrUnavailable) {
-			t.Fatalf("publish during the hold-off, with a probe in flight: want ErrUnavailable, got %v", err)
+			t.Fatalf("publish while down, with a probe in flight: want ErrUnavailable, got %v", err)
 		}
 		if d := time.Since(start); d > 50*time.Millisecond {
-			t.Errorf("publish during the hold-off took %s, want it to fail at once", d)
+			t.Errorf("publish while down took %s, want it to fail at once", d)
 		}
 	}
 
@@ -239,7 +235,7 @@ func TestPublisherTimeoutHoldsOffOthersUntilAProbeSucceeds(t *testing.T) {
 		t.Fatalf("probe publish: %v", err)
 	}
 	if err := p.Publish(t.Context(), event(3)); err != nil {
-		t.Fatalf("publish after the probe succeeded, still inside the hold-off: want it sent, got %v", err)
+		t.Fatalf("publish after the probe succeeded: want it sent, got %v", err)
 	}
 }
 
@@ -268,4 +264,27 @@ func noLeaks(t *testing.T) {
 	t.Helper()
 	before := goleak.IgnoreCurrent()
 	t.Cleanup(func() { goleak.VerifyNone(t, before) })
+}
+
+func TestPublisherProbeAnsweredWithAnErrorFreesTheNextProbe(t *testing.T) {
+	noLeaks(t)
+	f := newFakeValkey(t)
+	p := newTestPublisher(t, f)
+	f.setMode(replyHang)
+	if err := p.Publish(t.Context(), event(1)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("publish to a hung server: want a timeout, got %v", err)
+	}
+	// Valkey answers again, first with an error reply (LOADING after a
+	// restart): the probe fails, but it proves nothing about being down.
+	f.setMode(replyErrOnce)
+	f.unhang()
+	if err := p.Publish(t.Context(), event(2)); err == nil || errors.Is(err, ErrUnavailable) {
+		t.Fatalf("probe answered with an error reply: want that error, got %v", err)
+	}
+	if err := p.Publish(t.Context(), event(3)); err != nil {
+		t.Fatalf("next publish after an error-reply probe: want it tried and sent, got %v", err)
+	}
+	if err := p.Publish(t.Context(), event(4)); err != nil {
+		t.Fatalf("publish after Valkey is up again: %v", err)
+	}
 }

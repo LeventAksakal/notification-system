@@ -23,15 +23,20 @@ import (
 func insertListed(t *testing.T, db *sql.DB, n int, ch notification.Channel, status notification.Status) []string {
 	t.Helper()
 	to := map[notification.Channel]string{notification.ChannelSMS: "+905551234567", notification.ChannelEmail: "a@example.com", notification.ChannelPush: "device-1"}[ch]
-	kind := sql.NullString{String: "permanent", Valid: status == notification.StatusFailed}
 	ids := make([]string, n)
 	for i := range n {
 		id := uuid.Must(uuid.NewV7())
 		ids[i] = id.String()
 		if _, err := db.ExecContext(t.Context(), `INSERT INTO notifications
-			(id, recipient, channel, content, status, failure_kind, due_at, correlation_id, created_at)
-			VALUES (?, ?, ?, 'hello', ?, ?, NOW(3), 'corr', ?)`, ids[i], to, ch, status, kind, idCreatedAt(ids[i])); err != nil {
+			(id, recipient, channel, content, due_at, correlation_id, created_at)
+			VALUES (?, ?, ?, 'hello', NOW(3), 'corr', ?)`, ids[i], to, ch, idCreatedAt(ids[i])); err != nil {
 			t.Fatalf("insert: %v", err)
+		}
+		// Rows are inserted pending and walked to status (decision 0005).
+		for _, step := range pathTo[status] {
+			if err := moveTo(t, db, ids[i], step); err != nil {
+				t.Fatalf("walking to %s, step %s: %v", status, step, err)
+			}
 		}
 	}
 	return ids

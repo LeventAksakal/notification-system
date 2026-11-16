@@ -11,60 +11,61 @@ package acceptance
 // tests cannot make MySQL refuse the second chunk of a valid batch.
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
 	"github.com/LeventAksakal/notification-system/internal/notification"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // gapWalk walks a filtered list page by page at the given limit. It fails on
 // a page larger than limit or a row seen twice, and returns the rows in the
 // order the pages gave them.
-func (s *stack) gapWalk(t *testing.T, q url.Values, limit int) []apiNotification {
+func (s *stack) gapWalk(t *testing.T, q apiclient.ListNotificationsParams, limit int) []apiclient.Notification {
 	t.Helper()
-	q = cloneValues(q)
-	q.Set("limit", strconv.Itoa(limit))
-	seen := map[string]bool{}
-	var out []apiNotification
+	q.Limit = &limit
+	seen := map[uuid.UUID]bool{}
+	var out []apiclient.Notification
 	for page := 1; ; page++ {
 		if page > 200 {
-			t.Fatalf("%s: pagination does not end", q.Encode())
+			t.Fatalf("%s: pagination does not end", listString(q))
 		}
 		p := s.list(t, q)
 		if len(p.Items) > limit {
-			t.Fatalf("%s page %d: limit %d but %d items", q.Encode(), page, limit, len(p.Items))
+			t.Fatalf("%s page %d: limit %d but %d items", listString(q), page, limit, len(p.Items))
 		}
 		for _, n := range p.Items {
-			if seen[n.ID] {
-				t.Errorf("%s: row %s appears on more than one page (again on page %d)", q.Encode(), n.ID, page)
+			if seen[n.Id] {
+				t.Errorf("%s: row %s appears on more than one page (again on page %d)", listString(q), n.Id, page)
 			}
-			seen[n.ID] = true
+			seen[n.Id] = true
 		}
 		out = append(out, p.Items...)
-		if p.NextCursor == "" {
+		if deref(p.NextCursor) == "" {
 			return out
 		}
-		q.Set("cursor", p.NextCursor)
+		q.Cursor = p.NextCursor
 	}
 }
 
 // gapNewestFirst returns the ids of ns sorted newest first (createdAt desc, id desc).
-func gapNewestFirst(ns []apiNotification) []string {
+func gapNewestFirst(ns []apiclient.Notification) []uuid.UUID {
 	c := slices.Clone(ns)
 	sort.SliceStable(c, func(i, j int) bool { return newerFirst(c[i], c[j]) })
 	return ids(c)
 }
 
-func gapFilter(ns []apiNotification, keep func(apiNotification) bool) []apiNotification {
-	var out []apiNotification
+func gapFilter(ns []apiclient.Notification, keep func(apiclient.Notification) bool) []apiclient.Notification {
+	var out []apiclient.Notification
 	for _, n := range ns {
 		if keep(n) {
 			out = append(out, n)
@@ -82,50 +83,50 @@ func TestGapR6FilterWithCursor(t *testing.T) {
 	// 27 rows: channels rotate sms/email/push; i%5==2 is scheduled 3 h ahead;
 	// i%4==3 (when not scheduled) is cancelled. Expected status per row.
 	chans := []string{"sms", "email", "push"}
-	var all []apiNotification
-	want := map[string]string{} // id -> expected API status
+	var all []apiclient.Notification
+	want := map[uuid.UUID]string{} // id -> expected API status
 	for i := range 27 {
 		body := msg(chans[i%3], fmt.Sprintf("gap r6 row %d", i))
 		status := "pending"
 		if i%5 == 2 {
-			body["scheduledAt"] = time.Now().UTC().Add(3 * time.Hour).Format(time.RFC3339)
+			body.ScheduledAt = ptr(time.Now().UTC().Add(3 * time.Hour).Truncate(time.Second))
 			status = "scheduled"
 		}
 		n := s.create(t, body)
 		if i%4 == 3 && status == "pending" {
-			s.cancel(t, n.ID)
+			s.cancel(t, n.Id)
 			status = "cancelled"
 		}
 		all = append(all, n)
-		want[n.ID] = status
+		want[n.Id] = status
 	}
 
-	check := func(t *testing.T, q url.Values, keep func(apiNotification) bool) {
+	check := func(t *testing.T, q apiclient.ListNotificationsParams, keep func(apiclient.Notification) bool) {
 		t.Helper()
 		exp := gapNewestFirst(gapFilter(all, keep))
 		if len(exp) <= 4 {
-			t.Fatalf("test setup: %s selects %d rows, need more than one page of 4", q.Encode(), len(exp))
+			t.Fatalf("test setup: %s selects %d rows, need more than one page of 4", listString(q), len(exp))
 		}
 		got := ids(s.gapWalk(t, q, 4))
 		if !slices.Equal(got, exp) {
-			t.Errorf("%s at limit 4: want exactly %d rows newest first\n want %v\n  got %v", q.Encode(), len(exp), exp, got)
+			t.Errorf("%s at limit 4: want exactly %d rows newest first\n want %v\n  got %v", listString(q), len(exp), exp, got)
 		}
 	}
 
 	t.Run("channel=email", func(t *testing.T) {
-		check(t, url.Values{"channel": {"email"}}, func(n apiNotification) bool { return n.Channel == "email" })
+		check(t, apiclient.ListNotificationsParams{Channel: ptr(apiclient.Email)}, func(n apiclient.Notification) bool { return n.Channel == "email" })
 	})
 
 	for _, st := range []string{"pending", "scheduled", "cancelled"} {
 		t.Run("status="+st, func(t *testing.T) {
-			check(t, url.Values{"status": {st}}, func(n apiNotification) bool { return want[n.ID] == st })
+			check(t, apiclient.ListNotificationsParams{Status: ptr(apiclient.Status(st))}, func(n apiclient.Notification) bool { return want[n.Id] == st })
 		})
 	}
 
 	t.Run("channel and status together", func(t *testing.T) {
 		// sms rows that are pending: enough for two pages.
-		check(t, url.Values{"channel": {"sms"}, "status": {"pending"}}, func(n apiNotification) bool {
-			return n.Channel == "sms" && want[n.ID] == "pending"
+		check(t, apiclient.ListNotificationsParams{Channel: ptr(apiclient.Sms), Status: ptr(apiclient.Pending)}, func(n apiclient.Notification) bool {
+			return n.Channel == "sms" && want[n.Id] == "pending"
 		})
 	})
 
@@ -134,19 +135,16 @@ func TestGapR6FilterWithCursor(t *testing.T) {
 		if !from.Before(to) {
 			t.Fatalf("test setup: createdAt of rows 4 and 22 are not ordered: %s, %s", from, to)
 		}
-		in := func(n apiNotification) bool { return !n.CreatedAt.Before(from) && n.CreatedAt.Before(to) }
-		q := url.Values{
-			"createdFrom": {from.UTC().Format(time.RFC3339Nano)},
-			"createdTo":   {to.UTC().Format(time.RFC3339Nano)},
-		}
+		in := func(n apiclient.Notification) bool { return !n.CreatedAt.Before(from) && n.CreatedAt.Before(to) }
+		q := apiclient.ListNotificationsParams{CreatedFrom: ptr(from.UTC()), CreatedTo: ptr(to.UTC())}
 		check(t, q, in)
 
-		qe := cloneValues(q)
-		qe.Set("channel", "email")
+		qe := q
+		qe.Channel = ptr(apiclient.Email)
 		// email rows in the window may be few; walk at limit 2 so it still spans pages.
-		exp := gapNewestFirst(gapFilter(all, func(n apiNotification) bool { return in(n) && n.Channel == "email" }))
+		exp := gapNewestFirst(gapFilter(all, func(n apiclient.Notification) bool { return in(n) && n.Channel == "email" }))
 		if got := ids(s.gapWalk(t, qe, 2)); !slices.Equal(got, exp) {
-			t.Errorf("%s at limit 2:\n want %v\n  got %v", qe.Encode(), exp, got)
+			t.Errorf("%s at limit 2:\n want %v\n  got %v", listString(qe), exp, got)
 		}
 	})
 }
@@ -159,9 +157,9 @@ func TestGapR6SentAndFailedFilters(t *testing.T) {
 	// The next k provider calls answer 400: permanent, failed after one call.
 	s.dlFaults(t, fakeprovider.Fault{Mode: fakeprovider.ModeStatus, Status: http.StatusBadRequest, Count: k})
 
-	created := map[string]bool{}
+	created := map[uuid.UUID]bool{}
 	for i := range total {
-		created[s.create(t, msg([]string{"sms", "email", "push"}[i%3], fmt.Sprintf("gap r6 delivery %d", i))).ID] = true
+		created[s.create(t, msg([]string{"sms", "email", "push"}[i%3], fmt.Sprintf("gap r6 delivery %d", i))).Id] = true
 	}
 	dlEventually(t, 60*time.Second, "every notification ends sent or failed", func() (bool, string) {
 		c := s.dlCounts(t, "1=1")
@@ -188,22 +186,25 @@ func TestGapR6SentAndFailedFilters(t *testing.T) {
 		want   map[string]bool
 	}{{"sent", wantSent}, {"failed", wantFailed}} {
 		t.Run("status="+tc.status, func(t *testing.T) {
-			got := s.gapWalk(t, url.Values{"status": {tc.status}}, 3)
-			gotSet := idSet(got)
+			got := s.gapWalk(t, apiclient.ListNotificationsParams{Status: ptr(apiclient.Status(tc.status))}, 3)
+			gotSet := map[string]bool{}
+			for _, n := range got {
+				gotSet[n.Id.String()] = true
+			}
 			for id := range tc.want {
 				if !gotSet[id] {
 					t.Errorf("status=%s misses %s", tc.status, id)
 				}
 			}
 			for _, n := range got {
-				if !tc.want[n.ID] {
-					t.Errorf("status=%s lists %s (status %q), which the provider did not %s", tc.status, n.ID, n.Status, tc.status)
+				if !tc.want[n.Id.String()] {
+					t.Errorf("status=%s lists %s (status %q), which the provider did not %s", tc.status, n.Id, n.Status, tc.status)
 				}
-				if n.Status != tc.status {
-					t.Errorf("status=%s lists %s with status %q", tc.status, n.ID, n.Status)
+				if string(n.Status) != tc.status {
+					t.Errorf("status=%s lists %s with status %q", tc.status, n.Id, n.Status)
 				}
-				if !created[n.ID] {
-					t.Errorf("status=%s lists unknown id %s", tc.status, n.ID)
+				if !created[n.Id] {
+					t.Errorf("status=%s lists unknown id %s", tc.status, n.Id)
 				}
 			}
 		})
@@ -216,15 +217,15 @@ func TestGapR5CancelSent(t *testing.T) {
 	s := startStack(t, stackOptions{Workers: 1, Env: dlFastEnv(nil)})
 	n := s.create(t, msg("sms", "gap r5 already sent"))
 	dlEventually(t, 30*time.Second, "the notification is sent", func() (bool, string) {
-		st := s.storedStatus(t, n.ID)
+		st := s.storedStatus(t, n.Id)
 		return st == "sent", "stored status " + st
 	})
 
-	wantError(t, s.postJSON(t, "/v1/notifications/"+n.ID+"/cancel", nil), http.StatusConflict, "not_cancellable")
-	if got := s.get(t, n.ID); got.Status != "sent" {
+	wantError(t, answered(t)(s.API.CancelNotificationWithResponse(t.Context(), n.Id)), http.StatusConflict, "not_cancellable")
+	if got := s.get(t, n.Id); got.Status != "sent" {
 		t.Errorf("after a refused cancel: want status sent, got %q", got.Status)
 	}
-	if st := s.storedStatus(t, n.ID); st != "sent" {
+	if st := s.storedStatus(t, n.Id); st != "sent" {
 		t.Errorf("after a refused cancel: stored status %q", st)
 	}
 }
@@ -239,30 +240,28 @@ func TestGapR11Idempotency(t *testing.T) {
 		const want = "Hello Ada, gap r11"
 		s.putTemplate(t, "gap-r11", "Hello {{name}}, gap r11")
 		key := "gap-r11-tpl-" + newUUID()
-		body := withTemplate("email", "gap-r11", map[string]any{"name": "Ada"})
+		body := withTemplate("email", "gap-r11", map[string]string{"name": "Ada"})
 
-		first := s.postJSON(t, "/v1/notifications", body, "Idempotency-Key", key)
-		if first.Status != http.StatusCreated {
-			t.Fatalf("first create: want 201, got %s", first)
+		first := s.createResp(t, body, idemKey(key))
+		if first.StatusCode() != http.StatusCreated || first.JSON201 == nil {
+			t.Fatalf("first create: want 201, got %s", show(first))
 		}
-		var orig apiNotification
-		first.decode(t, &orig)
+		orig := *first.JSON201
 
-		if r := s.do(t, http.MethodDelete, "/v1/templates/gap-r11", nil); r.Status != http.StatusNoContent {
-			t.Fatalf("DELETE template: want 204, got %s", r)
+		if r := answered(t)(s.API.DeleteTemplateWithResponse(t.Context(), "gap-r11")); r.StatusCode() != http.StatusNoContent {
+			t.Fatalf("DELETE template: want 204, got %s", show(r))
 		}
 		replay := func(t *testing.T, when string) {
 			t.Helper()
-			r := s.postJSON(t, "/v1/notifications", body, "Idempotency-Key", key)
-			if r.Status != http.StatusCreated {
-				t.Fatalf("replay %s: want 201 with the first response, got %s", when, r)
+			r := s.createResp(t, body, idemKey(key))
+			if r.StatusCode() != http.StatusCreated || r.JSON201 == nil {
+				t.Fatalf("replay %s: want 201 with the first response, got %s", when, show(r))
 			}
-			var got apiNotification
-			r.decode(t, &got)
-			if got.ID != orig.ID {
-				t.Errorf("replay %s: id %q, first was %q", when, got.ID, orig.ID)
+			got := *r.JSON201
+			if got.Id != orig.Id {
+				t.Errorf("replay %s: id %q, first was %q", when, got.Id, orig.Id)
 			}
-			if h := r.Header.Get("Idempotent-Replayed"); h != "true" {
+			if h := r.HTTPResponse.Header.Get("Idempotent-Replayed"); h != "true" {
 				t.Errorf("replay %s: Idempotent-Replayed want true, got %q", when, h)
 			}
 			if got.Content != want {
@@ -274,7 +273,7 @@ func TestGapR11Idempotency(t *testing.T) {
 		s.putTemplate(t, "gap-r11", "Goodbye {{name}}, changed")
 		replay(t, "after the template was replaced")
 
-		if got := s.get(t, orig.ID); got.Content != want {
+		if got := s.get(t, orig.Id); got.Content != want {
 			t.Errorf("stored content changed to %q", got.Content)
 		}
 		if n := s.count(t, "SELECT COUNT(*) FROM notifications WHERE content LIKE '%gap r11%' OR content LIKE '%changed%'"); n != 1 {
@@ -284,10 +283,10 @@ func TestGapR11Idempotency(t *testing.T) {
 
 	t.Run("same key for a single create, then a batch: 422, no batch stored", func(t *testing.T) {
 		key := "gap-r11-cross-" + newUUID()
-		s.create(t, msg("sms", "gap r11 single first"), "Idempotency-Key", key)
+		s.create(t, msg("sms", "gap r11 single first"), idemKey(key))
 		batchesBefore := s.count(t, "SELECT COUNT(*) FROM batches")
-		items := []map[string]any{msg("sms", "gap r11 cross batch 0"), msg("email", "gap r11 cross batch 1")}
-		r := s.postJSON(t, "/v1/notifications/batch", map[string]any{"notifications": items}, "Idempotency-Key", key)
+		items := []apiclient.NotificationCreate{msg("sms", "gap r11 cross batch 0"), msg("email", "gap r11 cross batch 1")}
+		r := s.postBatch(t, items, idemKey(key))
 		wantError(t, r, http.StatusUnprocessableEntity, "idempotency_key_reused")
 		if n := s.count(t, "SELECT COUNT(*) FROM batches"); n != batchesBefore {
 			t.Errorf("batches: want %d, got %d", batchesBefore, n)
@@ -304,16 +303,20 @@ func TestGapR11Idempotency(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				for _, path := range []string{"/v1/notifications", "/v1/notifications/batch"} {
-					var body any = msg("push", "gap r11 bad key")
+					body := msg("push", "gap r11 bad key")
+					var r typedAnswer
+					var err error
 					if strings.HasSuffix(path, "/batch") {
-						body = map[string]any{"notifications": []map[string]any{msg("push", "gap r11 bad key")}}
+						r, err = s.API.CreateBatchWithResponse(t.Context(), &apiclient.CreateBatchParams{IdempotencyKey: &tc.key},
+							apiclient.BatchCreate{Notifications: []apiclient.NotificationCreate{body}})
+					} else {
+						r, err = s.API.CreateNotificationWithResponse(t.Context(), &apiclient.CreateNotificationParams{IdempotencyKey: &tc.key}, body)
 					}
-					r, err := s.send(http.MethodPost, path, body, "Idempotency-Key", tc.key)
 					if err != nil {
 						t.Fatalf("POST %s with key %q: the client could not send it: %v", path, tc.key, err)
 					}
-					if r.Status >= 500 {
-						t.Errorf("POST %s with key %q: a server error: %s", path, tc.key, r)
+					if r.StatusCode() >= 500 {
+						t.Errorf("POST %s with key %q: a server error: %s", path, tc.key, show(r))
 						continue
 					}
 					wantError(t, r, http.StatusBadRequest, "invalid_request", "Idempotency-Key")
@@ -341,10 +344,13 @@ func gapEmailBody(t *testing.T, size int) string {
 // R10: Content validation (character limits, required fields)
 // (a request body is at most notification.MaxRequestBodyBytes, 8 MiB: a larger one is
 // 413 request_too_large in the Error shape; a large batch under it is accepted).
+// The over-limit bodies are sent raw: they are exact byte counts.
 func TestGapR10RequestBodyLimit(t *testing.T) {
 	s := startStack(t, stackOptions{})
 
 	t.Run("one byte over the limit: 413 request_too_large", func(t *testing.T) {
+		// The content is far over the email limit too; the body limit refuses
+		// the request before the content is validated.
 		single := gapEmailBody(t, notification.MaxRequestBodyBytes+1)
 		wantError(t, s.postJSON(t, "/v1/notifications", single), http.StatusRequestEntityTooLarge, "request_too_large")
 
@@ -362,13 +368,26 @@ func TestGapR10RequestBodyLimit(t *testing.T) {
 	})
 
 	t.Run("a 5 MB batch under the limit: 201", func(t *testing.T) {
-		items := make([]map[string]any, 100)
+		// Every item is a valid email at its content limit, so only the body
+		// size is under test: enough of them to pass 5 MB, within the batch
+		// maximum and under the body limit.
+		const size = 5_000_000
+		n := (size + notification.MaxEmailContentBytes - 1) / notification.MaxEmailContentBytes
+		items := make([]apiclient.NotificationCreate, n)
 		for i := range items {
-			items[i] = msg("email", fmt.Sprintf("%03d", i)+strings.Repeat("b", 50_000-3))
+			items[i] = msg("email", fmt.Sprintf("%04d", i)+strings.Repeat("b", notification.MaxEmailContentBytes-4))
+		}
+		body, err := json.Marshal(apiclient.BatchCreate{Notifications: items})
+		if err != nil {
+			t.Fatalf("test setup: %v", err)
+		}
+		if len(items) > notification.MaxBatchSize || len(body) < size || len(body) > notification.MaxRequestBodyBytes {
+			t.Fatalf("test setup: %d items, body %d bytes; want at most %d items and %d..%d bytes",
+				len(items), len(body), notification.MaxBatchSize, size, notification.MaxRequestBodyBytes)
 		}
 		b := s.createBatch(t, items)
-		if len(b.NotificationIDs) != len(items) {
-			t.Errorf("batch: want %d ids, got %d", len(items), len(b.NotificationIDs))
+		if len(b.NotificationIds) != len(items) {
+			t.Errorf("batch: want %d ids, got %d", len(items), len(b.NotificationIds))
 		}
 	})
 }

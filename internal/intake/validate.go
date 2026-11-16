@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/LeventAksakal/notification-system/internal/notification"
+	"github.com/LeventAksakal/notification-system/internal/store/sqlc"
 )
 
 // Conditions the API maps to its error codes.
@@ -45,6 +46,9 @@ type FieldError struct {
 	Index  *int
 	Field  string
 	Reason string
+	// Variables is set on a refused `template.variables`: what the template
+	// needs and what was sent.
+	Variables *VariableReport
 }
 
 // ValidationError lists every broken rule of a request.
@@ -77,15 +81,19 @@ type Accepted struct {
 	Priority    notification.Priority
 	Content     string
 	ScheduledAt *time.Time // nil: due now; a past time is stored and due now
+	// Template is the template and version that rendered Content; nil for
+	// content sent as is.
+	Template *TemplateOrigin
 }
 
 var smsRecipient = regexp.MustCompile(notification.SMSRecipientPattern)
 
 // Validate checks one request against every intake rule and renders its
 // template. templates maps the names of the stored templates the request may
-// reference to their bodies; a name missing from it is unknown. now is the
-// clock the schedule horizon is measured from.
-func Validate(r Request, templates map[string]string, now time.Time) (Accepted, []FieldError) {
+// reference to their rows; a name missing from it is unknown. now is the
+// database clock (Service.scheduleClock), which the schedule horizon is
+// measured from; it is only read when r carries a schedule.
+func Validate(r Request, templates map[string]sqlc.Template, now time.Time) (Accepted, []FieldError) {
 	var errs []FieldError
 	add := func(field, reason string) { errs = append(errs, FieldError{Field: field, Reason: reason}) }
 
@@ -112,9 +120,9 @@ func Validate(r Request, templates map[string]string, now time.Time) (Accepted, 
 	case r.Content != nil:
 		a.Content, haveContent = *r.Content, true
 	default:
-		content, terrs := renderRef(*r.Template, templates)
+		content, origin, terrs := renderRef(*r.Template, templates, renderLimit(r.Channel))
 		errs = append(errs, terrs...)
-		a.Content, haveContent = content, len(terrs) == 0
+		a.Content, a.Template, haveContent = content, origin, len(terrs) == 0
 	}
 	if haveContent && r.Channel.Valid() {
 		if reason := checkContent(r.Channel, a.Content); reason != "" {
@@ -123,27 +131,28 @@ func Validate(r Request, templates map[string]string, now time.Time) (Accepted, 
 	}
 
 	if r.ScheduledAt != nil {
-		if r.ScheduledAt.After(now.Add(notification.ScheduleHorizon)) {
-			add("scheduledAt", fmt.Sprintf("must be at most %s ahead", humanDuration(notification.ScheduleHorizon)))
+		a.ScheduledAt = truncate(r.ScheduledAt)
+		if a.ScheduledAt.After(now.Add(notification.ScheduleHorizon)) {
+			add("scheduledAt", horizonReason())
 		}
-		t := r.ScheduledAt.UTC().Truncate(time.Millisecond)
-		a.ScheduledAt = &t
 	}
 	return a, errs
 }
 
+// blankReason is the reason given for an empty or whitespace-only field.
+const blankReason = "must not be empty or whitespace only"
+
 func checkRecipient(c notification.Channel, to string) string {
-	n := utf8.RuneCountInString(to)
-	if n == 0 {
-		return "must not be empty"
+	if notification.IsBlank(to) {
+		return blankReason
 	}
-	if limit := notification.MaxRecipientLenFor(c); n > limit {
-		return fmt.Sprintf("must be at most %d characters", limit)
+	if l := notification.RecipientLimit(c); l.Unit.Len(to) > l.Max {
+		return fmt.Sprintf("must be at most %d %s", l.Max, l.Unit)
 	}
 	switch c {
 	case notification.ChannelSMS:
 		if !smsRecipient.MatchString(to) {
-			return "must be an E.164 phone number (+ and 7 to 15 digits)"
+			return "must be an E.164 phone number: + and at most 15 digits, the first not 0"
 		}
 	case notification.ChannelEmail:
 		if strings.Count(to, "@") != 1 {
@@ -153,52 +162,52 @@ func checkRecipient(c notification.Channel, to string) string {
 	return ""
 }
 
+// checkContent checks the final content, given or rendered from a template.
 func checkContent(c notification.Channel, content string) string {
-	n := utf8.RuneCountInString(content)
-	if n == 0 {
-		return "must not be empty"
+	if notification.IsBlank(content) {
+		return blankReason
 	}
-	if limit := notification.MaxContentLenFor(c); n > limit {
-		return fmt.Sprintf("is %d characters; %s allows at most %d", n, c, limit)
+	if l := notification.ContentLimit(c); l.Unit.Len(content) > l.Max {
+		return fmt.Sprintf("is %d %s; %s allows at most %d", l.Unit.Len(content), l.Unit, c, l.Max)
 	}
 	return ""
 }
 
-func renderRef(ref TemplateRef, templates map[string]string) (string, []FieldError) {
-	var errs []FieldError
-	if len(ref.Variables) > notification.MaxTemplateVariables {
-		errs = append(errs, FieldError{Field: "template.variables", Reason: fmt.Sprintf("at most %d variables", notification.MaxTemplateVariables)})
+// renderLimit is the most bytes a rendering may reach for channel c: its
+// content limit in bytes, or 4 bytes per character (the UTF-8 maximum) for a
+// limit in characters. An unknown channel gets the largest content limit.
+func renderLimit(c notification.Channel) int {
+	l := notification.ContentLimit(c)
+	switch {
+	case l.Max == 0:
+		return notification.MaxContentLen
+	case l.Unit == notification.Characters:
+		return l.Max * utf8.UTFMax
 	}
-	for name, v := range ref.Variables {
-		if utf8.RuneCountInString(v) > notification.MaxTemplateVariableLen {
-			errs = append(errs, FieldError{Field: "template.variables." + name,
-				Reason: fmt.Sprintf("must be at most %d characters", notification.MaxTemplateVariableLen)})
-		}
-	}
-	body, ok := templates[ref.Name]
-	if !ok {
-		return "", append(errs, FieldError{Field: "template.name", Reason: "no template with this name"})
-	}
-	content, missing := Render(body, ref.Variables)
-	for _, name := range missing {
-		errs = append(errs, FieldError{Field: "template.variables." + name, Reason: "the template needs this variable"})
-	}
-	return content, errs
+	return l.Max
 }
 
 // CheckTemplate validates a template before it is stored.
 func CheckTemplate(name, body string) []FieldError {
 	var errs []FieldError
 	if n := len(name); n == 0 || n > notification.MaxTemplateNameLen || !templateName.MatchString(name) {
-		errs = append(errs, FieldError{Field: "name", Reason: fmt.Sprintf("must match %s, at most %d characters", notification.TemplateNamePattern, notification.MaxTemplateNameLen)})
+		errs = append(errs, FieldError{Field: "name", Reason: fmt.Sprintf("must be a DNS label: lowercase letters, digits and '-', starting and ending with a letter or digit, at most %d characters", notification.MaxTemplateNameLen)})
 	}
-	if n := utf8.RuneCountInString(body); n == 0 || n > notification.MaxTemplateBodyLen {
-		errs = append(errs, FieldError{Field: "body", Reason: fmt.Sprintf("must be 1 to %d characters", notification.MaxTemplateBodyLen)})
+	switch {
+	case notification.IsBlank(body):
+		errs = append(errs, FieldError{Field: "body", Reason: blankReason})
+	case len(body) > notification.MaxTemplateBodyBytes:
+		errs = append(errs, FieldError{Field: "body", Reason: fmt.Sprintf("must be at most %d bytes", notification.MaxTemplateBodyBytes)})
 	}
 	return errs
 }
 
 var templateName = regexp.MustCompile(notification.TemplateNamePattern)
+
+// horizonReason is the refusal of a schedule beyond notification.ScheduleHorizon.
+func horizonReason() string {
+	return fmt.Sprintf("must be at most %s ahead", humanDuration(notification.ScheduleHorizon))
+}
 
 func humanDuration(d time.Duration) string {
 	if d%(24*time.Hour) == 0 {

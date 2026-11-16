@@ -26,7 +26,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
+	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
 // The limiter dials every stack starts with (harness_test.go) and the rate
@@ -99,45 +102,8 @@ func dlFastEnv(extra map[string]string) map[string]string {
 	return env
 }
 
-// dlAttempt is the API's DeliveryAttempt schema.
-type dlAttempt struct {
-	AttemptNo         int       `json:"attemptNo"`
-	StartedAt         time.Time `json:"startedAt"`
-	DurationMs        int       `json:"durationMs"`
-	Outcome           string    `json:"outcome"`
-	HTTPStatus        *int      `json:"httpStatus"`
-	Error             string    `json:"error"`
-	ProviderMessageID string    `json:"providerMessageId"`
-}
-
-func (a dlAttempt) String() string {
-	st := "none"
-	if a.HTTPStatus != nil {
-		st = fmt.Sprint(*a.HTTPStatus)
-	}
-	return fmt.Sprintf("#%d %s http=%s err=%q", a.AttemptNo, a.Outcome, st, a.Error)
-}
-
-// dlNotification is the Notification schema with the delivery fields the
-// intake helpers do not decode.
-type dlNotification struct {
-	apiNotification
-	ProviderMessageID string      `json:"providerMessageId"`
-	FinishedAt        *time.Time  `json:"finishedAt"`
-	History           []dlAttempt `json:"deliveryAttempts"` // shadows apiNotification.DeliveryAttempts
-}
-
-// dlGet fetches one notification with its attempt history; requires 200.
-func (s *stack) dlGet(t *testing.T, id string) dlNotification {
-	t.Helper()
-	r := s.getJSON(t, "/v1/notifications/"+id)
-	if r.Status != http.StatusOK {
-		t.Fatalf("GET /v1/notifications/%s: want 200, got %s", id, r)
-	}
-	var n dlNotification
-	r.decode(t, &n)
-	return n
-}
+// Notifications read by id are apiclient.Notification (s.get); their attempt
+// history is history(n), each entry an apiclient.DeliveryAttempt.
 
 // dlEventually polls cond until it reports true or timeout passes, then fails
 // with what cond said last (so the message shows the final state, not the
@@ -171,20 +137,20 @@ func dlWaitUntil(at time.Time) {
 
 // dlCreateMany creates n notifications through batches of at most 1000 and
 // returns their ids in creation order.
-func (s *stack) dlCreateMany(t *testing.T, n int, item func(i int) map[string]any) []string {
+func (s *stack) dlCreateMany(t *testing.T, n int, item func(i int) apiclient.NotificationCreate) []uuid.UUID {
 	t.Helper()
-	ids := make([]string, 0, n)
+	ids := make([]uuid.UUID, 0, n)
 	for start := 0; start < n; start += 1000 {
 		end := min(start+1000, n)
-		items := make([]map[string]any, 0, end-start)
+		items := make([]apiclient.NotificationCreate, 0, end-start)
 		for i := start; i < end; i++ {
 			items = append(items, item(i))
 		}
 		b := s.createBatch(t, items)
-		if len(b.NotificationIDs) != len(items) {
-			t.Fatalf("batch of %d returned %d ids", len(items), len(b.NotificationIDs))
+		if len(b.NotificationIds) != len(items) {
+			t.Fatalf("batch of %d returned %d ids", len(items), len(b.NotificationIds))
 		}
-		ids = append(ids, b.NotificationIDs...)
+		ids = append(ids, b.NotificationIds...)
 	}
 	return ids
 }

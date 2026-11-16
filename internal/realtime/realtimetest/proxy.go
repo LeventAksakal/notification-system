@@ -1,5 +1,6 @@
 // Package realtimetest holds test helpers for code that talks to Valkey: a
-// TCP proxy a test can close to make Valkey look down, and open again.
+// TCP proxy a test can close to make Valkey look down, open again, or slow
+// down.
 package realtimetest
 
 import (
@@ -12,12 +13,14 @@ import (
 )
 
 // Proxy forwards TCP connections from Addr to a target. Close drops every
-// connection and stops listening; Reopen listens on Addr again.
+// connection and stops listening; Reopen listens on Addr again; SetDelay
+// holds what clients send for a while before passing it on.
 type Proxy struct {
 	Addr   string
 	target string
 
 	mu    sync.Mutex
+	delay time.Duration
 	ln    net.Listener
 	conns map[net.Conn]struct{}
 	wg    sync.WaitGroup
@@ -54,6 +57,7 @@ func (p *Proxy) serve(ln net.Listener) {
 		if err != nil {
 			return
 		}
+		// A local test target answers in milliseconds; 5 s only bounds a broken one.
 		up, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(context.Background(), "tcp", p.target)
 		if err != nil {
 			_ = down.Close()
@@ -69,15 +73,43 @@ func (p *Proxy) serve(ln net.Listener) {
 		p.conns[down], p.conns[up] = struct{}{}, struct{}{}
 		p.wg.Add(2)
 		p.mu.Unlock()
-		pipe := func(dst, src net.Conn) {
+		pipe := func(dst, src net.Conn, delayed bool) {
 			defer p.wg.Done()
-			_, _ = io.Copy(dst, src)
+			if delayed {
+				_, _ = io.Copy(dst, delayedReader{src, p})
+			} else {
+				_, _ = io.Copy(dst, src)
+			}
 			_ = dst.Close()
 			_ = src.Close()
 		}
-		go pipe(up, down)
-		go pipe(down, up)
+		go pipe(up, down, true)
+		go pipe(down, up, false)
 	}
+}
+
+// SetDelay makes every later chunk a client sends wait d before it is passed
+// to the target (0: no wait). Replies are not delayed.
+func (p *Proxy) SetDelay(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.delay = d
+}
+
+type delayedReader struct {
+	src net.Conn
+	p   *Proxy
+}
+
+func (r delayedReader) Read(b []byte) (int, error) {
+	n, err := r.src.Read(b)
+	r.p.mu.Lock()
+	d := r.p.delay
+	r.p.mu.Unlock()
+	if n > 0 && d > 0 {
+		time.Sleep(d)
+	}
+	return n, err
 }
 
 // Close stops listening and drops every open connection; safe to repeat.
@@ -95,7 +127,9 @@ func (p *Proxy) Close() {
 	p.wg.Wait()
 }
 
-// Reopen listens on Addr again after Close, retrying the bind for up to 10 s.
+// Reopen listens on Addr again after Close, retrying the bind every 50 ms
+// for up to 10 s (arbitrary test bounds: Windows can hold a just-closed port
+// for a moment; 10 s is far above what that takes).
 func (p *Proxy) Reopen(t testing.TB) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
