@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-16
 tags: [limits, email, decision-0017]
 ---
@@ -19,3 +19,4 @@ The owner ruled on 15 Nov 2026 that every limit must come from a standard. The o
 Option 1, since the provider is a stand-in and the brief names none. Revisit when a real email provider is chosen.
 
 ## Answer
+Settled by decision 0017 (limits-standards, ce1fd26): the email body limit is 32,768 bytes (`notification.MaxEmailContentBytes`), with its source in 0017's Numbers table. Closed 16 Nov.
