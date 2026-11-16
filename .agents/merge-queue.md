@@ -55,3 +55,10 @@ Don't route around the guard. Write the tests you would add to `.agents/pr/<lane
 - Held acceptance tests landed in f6497d1 (47 of 48 pass). `TestGapDeliveryR7SecondRowAfterALoneSend` fails on three workers (p99 387 ms against 100 ms); fixed by adaptive-align (`claude/fix-r7-second-row`, squash-merged 16 Nov): p50 12.3 ms, p99 18.9 ms; rate caps hold (busiest second at most 97, R8 at 94 to 95/s). `GiveBack`'s doc comment in `ports.go` changed (doc only).
 - Before the gate, update these REQUIREMENTS rows: R15 (readiness without Valkey), B3 (template versions), a new O1 row (retention), R11 evidence (CallOutlivesLease replaced by SlowCallEndsInsideLease), R13 (rollups), B1 and R12 (shared health, budget_spent).
 - Realtime commit `46aefb6` doesn't build on its own; squashing covers it.
+
+## Owner answers (16 Nov 2026, 09:10)
+- Keep `APP_MAX_ATTEMPTS` at 10 (decision 0026).
+- REQUIREMENTS row on the VS Code profile reworded: no local path, company line or extension authors (git history keeps the old text).
+- No licence: all rights reserved for the submission.
+- `integration/decision-review` lands on `main` as one squash commit (f6497d1 failed an acceptance test, so the commits are not all atomic).
+- History rewrite (drop Co-Authored-By trailers and private quotes): skipped. Every hash cited in docs and commit messages would dangle and the force push to `main` is denied by the agent policy; the tip is clean.
