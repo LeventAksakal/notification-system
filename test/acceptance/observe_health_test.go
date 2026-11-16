@@ -12,7 +12,8 @@ import (
 )
 
 // R15: Health check endpoint - "Healthy when dependencies answer" (decision
-// 0019: /healthz liveness, /readyz checks MySQL and Valkey).
+// 0019: /healthz liveness; 0013 as changed 15 Nov 2026: /readyz checks MySQL
+// only).
 func TestR15HealthAndReadiness(t *testing.T) {
 	s := startStack(t, stackOptions{})
 
@@ -24,22 +25,14 @@ func TestR15HealthAndReadiness(t *testing.T) {
 	if err != nil || st != http.StatusOK || h.Status != "ok" {
 		t.Errorf("/readyz: want 200 status ok, got %d %+v (%v)", st, h, err)
 	}
-	for _, dep := range []string{"mysql", "valkey"} {
-		if h.Checks[dep] != "up" {
-			t.Errorf("/readyz checks[%q]: want \"up\", got %q (checks %v)", dep, h.Checks[dep], h.Checks)
-		}
+	if h.Checks["mysql"] != "up" {
+		t.Errorf("/readyz checks[\"mysql\"]: want \"up\", got %q (checks %v)", h.Checks["mysql"], h.Checks)
 	}
 }
 
-// R15: Health check endpoint - "unready when the database or Valkey is down".
-func TestR15ReadyzValkeyDown(t *testing.T) {
-	s := startStack(t, stackOptions{})
-	p := newTCPProxy(t, shared(t).valkeyAddr)
-	peer := s.startServe(t, map[string]string{"APP_VALKEY_ADDR": p.Addr})
-	dependencyDown(t, peer, p, "valkey", "mysql")
-}
-
-// R15: Health check endpoint - "unready when the database or Valkey is down".
+// R15: Health check endpoint - "unready when the database ... is down"
+// (decision 0013 as changed 15 Nov 2026: Valkey down no longer makes the
+// instance unready; TestR15ReadyWithValkeyDownLiveUpdatesRefused covers it).
 func TestR15ReadyzMySQLDown(t *testing.T) {
 	s := startStack(t, stackOptions{})
 	mysqlAddr := shared(t).mysqlAddr
@@ -49,12 +42,12 @@ func TestR15ReadyzMySQLDown(t *testing.T) {
 		t.Fatalf("cannot point DSN %q at the proxy", s.DSN)
 	}
 	peer := s.startServe(t, map[string]string{"APP_DATABASE_DSN": dsn})
-	dependencyDown(t, peer, p, "mysql", "valkey")
+	dependencyDown(t, peer, p, "mysql")
 }
 
 // dependencyDown closes the proxy in front of dep and expects /readyz to turn
-// 503 unavailable with dep not up and other still up, while /healthz stays 200.
-func dependencyDown(t *testing.T, peer *stack, p *tcpProxy, dep, other string) {
+// 503 unavailable with dep not up, while /healthz stays 200.
+func dependencyDown(t *testing.T, peer *stack, p *tcpProxy, dep string) {
 	t.Helper()
 	st, h, err := peer.readyz()
 	if err != nil || st != http.StatusOK || h.Checks[dep] != "up" {
@@ -76,9 +69,6 @@ func dependencyDown(t *testing.T, peer *stack, p *tcpProxy, dep, other string) {
 	}
 	if last.Checks[dep] == "up" || last.Checks[dep] == "" {
 		t.Errorf("/readyz checks[%q]: want a value other than up, got %q (checks %v)", dep, last.Checks[dep], last.Checks)
-	}
-	if last.Checks[other] != "up" {
-		t.Errorf("/readyz checks[%q]: the other dependency should still be up, got %q", other, last.Checks[other])
 	}
 	consistently(t, 2*time.Second, func() bool {
 		st, h, err := peer.healthz()

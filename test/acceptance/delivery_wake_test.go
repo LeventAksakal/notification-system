@@ -3,13 +3,14 @@
 package acceptance
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
 )
@@ -39,8 +40,8 @@ func TestDeliveryR7FirstSendAfterIdleIsPrompt(t *testing.T) {
 	// reading) is not what is measured.
 	for _, ch := range chans {
 		n := s.create(t, msg(ch, "R7 wake warm-up "+ch))
-		if _, ok := dlWaitProviderRequest(s, n.ID, 30*time.Second); !ok {
-			t.Fatalf("warm-up %s: %s not delivered within 30 s", ch, n.ID)
+		if _, ok := dlWaitProviderRequest(s, n.Id.String(), 30*time.Second); !ok {
+			t.Fatalf("warm-up %s: %s not delivered within 30 s", ch, n.Id)
 		}
 	}
 
@@ -48,21 +49,18 @@ func TestDeliveryR7FirstSendAfterIdleIsPrompt(t *testing.T) {
 	for i := range samples {
 		dlWaitUntil(time.Now().Add(quiet))
 		ch := chans[i%channels]
-		r, err := s.send(http.MethodPost, "/v1/notifications", msg(ch, fmt.Sprintf("R7 wake sample %d", i)))
+		r, err := s.API.CreateNotificationWithResponse(t.Context(), nil, msg(ch, fmt.Sprintf("R7 wake sample %d", i)))
 		created := time.Now()
 		if err != nil {
 			t.Fatalf("sample %d: %v", i, err)
 		}
-		if r.Status != http.StatusCreated {
-			t.Fatalf("sample %d: want 201, got %d %s", i, r.Status, r.Body)
+		if r.StatusCode() != http.StatusCreated || r.JSON201 == nil || r.JSON201.Id == uuid.Nil {
+			t.Fatalf("sample %d: want 201 with an id, got %s", i, show(r))
 		}
-		var n apiNotification
-		if err := json.Unmarshal(r.Body, &n); err != nil || n.ID == "" {
-			t.Fatalf("sample %d: 201 without an id: %v %s", i, err, r.Body)
-		}
-		req, ok := dlWaitProviderRequest(s, n.ID, perSend)
+		id := r.JSON201.Id
+		req, ok := dlWaitProviderRequest(s, id.String(), perSend)
 		if !ok {
-			t.Fatalf("sample %d (%s): %s not delivered within %s", i, ch, n.ID, perSend)
+			t.Fatalf("sample %d (%s): %s not delivered within %s", i, ch, id, perSend)
 		}
 		lat = append(lat, req.ReceivedAt.Sub(created))
 	}
@@ -75,6 +73,63 @@ func TestDeliveryR7FirstSendAfterIdleIsPrompt(t *testing.T) {
 	}
 	if p95 > maxP95 {
 		t.Errorf("p95 %s, want <= %s (target p99 100 ms, doubled for a loaded machine)", p95, maxP95)
+	}
+}
+
+// R7: Process notifications asynchronously via queue workers ("POST returns
+// before delivery; workers deliver"), the scheduled-tail case of the
+// wake-hint work (adaptive send alignment, record 0009): a row posted right
+// after a lone send on an idle channel reaches the provider within 100 ms of
+// its POST (p99 over 30 pairs), where before the give-back it waited behind
+// the first group's unused reservation (about 200 ms plus the alignment).
+func TestGapDeliveryR7SecondRowAfterALoneSend(t *testing.T) {
+	const (
+		pairs   = 30
+		quiet   = 2 * time.Second
+		maxP99  = 100 * time.Millisecond
+		perSend = 5 * time.Second
+	)
+	s := startStack(t, stackOptions{Workers: 3})
+	chans := []string{"sms", "email", "push"}
+	post := func(t *testing.T, ch, content string) (uuid.UUID, time.Time) {
+		t.Helper()
+		r, err := s.API.CreateNotificationWithResponse(t.Context(), nil, msg(ch, content))
+		created := time.Now()
+		if err != nil {
+			t.Fatalf("%s: %v", content, err)
+		}
+		if r.StatusCode() != http.StatusCreated || r.JSON201 == nil || r.JSON201.Id == uuid.Nil {
+			t.Fatalf("%s: want 201 with an id, got %s", content, show(r))
+		}
+		return r.JSON201.Id, created
+	}
+	for _, ch := range chans {
+		id, _ := post(t, ch, "R7 tail warm-up "+ch)
+		if _, ok := dlWaitProviderRequest(s, id.String(), 30*time.Second); !ok {
+			t.Fatalf("warm-up %s: %s not delivered within 30 s", ch, id)
+		}
+	}
+
+	lat := make([]time.Duration, 0, pairs)
+	for i := range pairs {
+		dlWaitUntil(time.Now().Add(quiet))
+		ch := chans[i%len(chans)]
+		first, _ := post(t, ch, fmt.Sprintf("R7 tail lone %d", i))
+		if _, ok := dlWaitProviderRequest(s, first.String(), perSend); !ok {
+			t.Fatalf("pair %d (%s): the lone send %s not delivered within %s", i, ch, first, perSend)
+		}
+		second, created := post(t, ch, fmt.Sprintf("R7 tail second %d", i))
+		req, ok := dlWaitProviderRequest(s, second.String(), perSend)
+		if !ok {
+			t.Fatalf("pair %d (%s): the second row %s not delivered within %s", i, ch, second, perSend)
+		}
+		lat = append(lat, req.ReceivedAt.Sub(created))
+	}
+	slices.Sort(lat)
+	p50, p99 := dlNearestRank(lat, 50), dlNearestRank(lat, 99)
+	t.Logf("second row after a lone send, 201 -> provider, %d pairs: p50 %s, p99 %s, max %s", pairs, p50, p99, lat[len(lat)-1])
+	if p99 > maxP99 {
+		t.Errorf("p99 %s, want <= %s", p99, maxP99)
 	}
 }
 

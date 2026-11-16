@@ -107,6 +107,76 @@ func TestR14CorrelationIDOnLogsAndProvider(t *testing.T) {
 				t.Errorf("serve line about %s: correlation_id want the stored %q, got %q: %v", n.Id, stored, got, l)
 			}
 		}
+		// The request's own id still finds the request (decision 0019, As
+		// built): the cancel line names it as request_correlation_id, and the
+		// cancel's access line carries it as correlation_id.
+		cancelLine := false
+		for _, l := range about[before:] {
+			if fieldString(l, "msg") == "notification cancelled" {
+				cancelLine = true
+				if got := fieldString(l, "request_correlation_id"); got != other {
+					t.Errorf("cancel line about %s: request_correlation_id want the request's %q, got %q: %v", n.Id, other, got, l)
+				}
+			}
+		}
+		if !cancelLine {
+			t.Errorf("serve: no \"notification cancelled\" line about %s among %v", n.Id, about[before:])
+		}
+		var access []map[string]any
+		poll(5*time.Second, func() bool {
+			access = nil
+			for _, l := range s.Logs("serve") {
+				p := fieldString(l, "path")
+				if fieldString(l, "msg") == "request" && strings.HasSuffix(p, "/cancel") && strings.Contains(p, n.Id.String()) {
+					access = append(access, l)
+				}
+			}
+			return len(access) > 0
+		})
+		if len(access) != 1 {
+			t.Fatalf("serve: want one access line for the cancel of %s, got %d", n.Id, len(access))
+		}
+		if got := fieldString(access[0], "correlation_id"); got != other {
+			t.Errorf("cancel access line: correlation_id want the request's %q, got %q: %v", other, got, access[0])
+		}
+	})
+
+	// A replayed create (same Idempotency-Key and body, another
+	// X-Correlation-ID) logs the stored id as correlation_id and the
+	// replaying request's id as request_correlation_id.
+	t.Run("replayed create: the stored id, and the replay's id as request_correlation_id", func(t *testing.T) {
+		stored := "r14-first-" + randHex(16)
+		replay := "r14-replay-" + randHex(16)
+		key := "r14-key-" + randHex(16)
+		content := "r14-private-content-" + randHex(12)
+		contents = append(contents, content)
+		body := msg("sms", content)
+		body.ScheduledAt = ptr(time.Now().UTC().Add(3 * time.Hour).Truncate(time.Second))
+		n := s.create(t, body, idemKey(key), corrID(stored))
+		r := s.createResp(t, body, idemKey(key), corrID(replay))
+		if r.StatusCode() != 201 || r.JSON201 == nil || r.JSON201.Id != n.Id {
+			t.Fatalf("replay: want 201 with the same notification %s, got %s", n.Id, show(r))
+		}
+		var replayed []map[string]any
+		if !poll(10*time.Second, func() bool {
+			replayed = nil
+			for _, l := range linesAbout(s.Logs("serve"), n.Id.String()) {
+				if fieldString(l, "msg") == "notification create replayed" {
+					replayed = append(replayed, l)
+				}
+			}
+			return len(replayed) > 0
+		}) {
+			t.Fatalf("serve: no \"notification create replayed\" line about %s", n.Id)
+		}
+		for _, l := range replayed {
+			if got := fieldString(l, "correlation_id"); got != stored {
+				t.Errorf("replayed line: correlation_id want the stored %q, got %q: %v", stored, got, l)
+			}
+			if got := fieldString(l, "request_correlation_id"); got != replay {
+				t.Errorf("replayed line: request_correlation_id want the replay's %q, got %q: %v", replay, got, l)
+			}
+		}
 	})
 
 	t.Run("every line is JSON with time, level, msg and no content", func(t *testing.T) {

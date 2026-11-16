@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
@@ -226,5 +228,51 @@ func wantUnavailable(t *testing.T, r *response) {
 	ra := r.Header.Get("Retry-After")
 	if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err != nil || secs < 0 {
 		t.Errorf("Retry-After: want a whole number of seconds, got %q", ra)
+	}
+}
+
+// R15: Health check endpoint. The row in docs/REQUIREMENTS.md (owned by the
+// coordinator) still reads "unready when the database or Valkey is down";
+// decision 0013 as changed and accepted by the owner on 15 Nov 2026 narrows
+// readiness to MySQL: with the API's Valkey subscription down, /readyz answers
+// 200, create and read work, GET /v1/ws answers 503 unavailable; when Valkey
+// returns a new subscription upgrades and gets its snapshot.
+func TestR15ReadyWithValkeyDownLiveUpdatesRefused(t *testing.T) {
+	const limit = 5 * time.Second
+	const clientTimeout = 30 * time.Second
+	s, p := stackBehindValkeyProxy(t, 0)
+	before := s.create(t, msg("sms", "before the valkey outage"))
+	p.down(outageClosed)
+	a := waitFeedRefused(t, s, 20*time.Second, "after Valkey went away", "notificationId", before.Id.String())
+	t.Logf("GET /v1/ws with Valkey down: %s", a)
+	consistently(t, 2*time.Second, func() bool {
+		st, h, err := s.readyz()
+		return err == nil && st == http.StatusOK && h.Status == "ok" && h.Checks["mysql"] == "up"
+	}, "/readyz must stay 200 ok (mysql up) while only Valkey is down")
+
+	r, took := s.timedDo(t, "POST /v1/notifications", func(ctx context.Context) (*http.Response, error) {
+		return s.API.CreateNotification(ctx, nil, msg("email", "during the valkey outage"))
+	}, clientTimeout)
+	within(t, "POST /v1/notifications", r, took, http.StatusCreated, limit)
+	var n apiclient.Notification
+	r.decode(t, &n)
+	r, took = s.timedDo(t, "GET /v1/notifications/{id}", func(ctx context.Context) (*http.Response, error) {
+		return s.API.GetNotification(ctx, n.Id)
+	}, clientTimeout)
+	within(t, "GET /v1/notifications/{id}", r, took, http.StatusOK, limit)
+
+	if !p.up(t) {
+		t.Skipf("could not listen on %s again to bring Valkey back; recovery step skipped", p.Addr)
+	}
+	var sub *websocket.Conn
+	var status int
+	var err error
+	if !poll(30*time.Second, func() bool { sub, status, err = s.dialWS("notificationId", n.Id.String()); return err == nil }) {
+		t.Fatalf("GET /v1/ws?notificationId=%s still refused 30s after Valkey came back (HTTP %d): %v", n.Id, status, err)
+	}
+	t.Cleanup(func() { _ = sub.CloseNow() })
+	first, err := readEvent(sub, time.Now().Add(10*time.Second))
+	if err != nil || !isSnapshot(first) || first.NotificationId != n.Id || first.Status != "pending" {
+		t.Fatalf("first message after Valkey came back: want snapshot of %s pending, got %s (%v)", n.Id, eventString(first), err)
 	}
 }

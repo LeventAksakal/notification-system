@@ -24,11 +24,23 @@ const dlRetrySlack = time.Second
 // (transient provider failures are retried and end as sent; permanent ones fail
 // after one attempt; exhausted ones are kept and can be replayed; decision 0007).
 // Dials: APP_RETRY_BASE=100ms, APP_RETRY_CAP=1s, APP_MAX_ATTEMPTS=3,
-// APP_PROVIDER_TIMEOUT=500ms; breaker defaults (10 calls before it counts), so
-// the handful of failures here never opens it.
+// APP_PROVIDER_TIMEOUT=500ms, APP_BREAKER_FAILURES=5 (the default).
+// The "always 503 is exhausted" case holds only while APP_MAX_ATTEMPTS (3) <
+// APP_BREAKER_FAILURES (5): a lone message that always fails is otherwise a
+// provider outage by design (decision 0026: its K-th consecutive fault
+// declares it and is excused), and it would stay pending, probed once per
+// cool-down. With 3 < 5 its 3 failures are all counted and it is exhausted
+// before any outage. Each subtest uses its own channel's faults, and every
+// channel's consecutive faults stay below 5, so no outage is declared here.
 func TestDeliveryR12Retry(t *testing.T) {
-	const base, maxAttempts = 100 * time.Millisecond, 3
-	s := startStack(t, stackOptions{Workers: 1, Env: dlFastEnv(map[string]string{"APP_MAX_ATTEMPTS": "3"})})
+	const base, maxAttempts, breakerFailures = 100 * time.Millisecond, 3, 5
+	if maxAttempts >= breakerFailures {
+		t.Fatalf("dials: APP_MAX_ATTEMPTS=%d must stay below APP_BREAKER_FAILURES=%d for the exhausted case", maxAttempts, breakerFailures)
+	}
+	s := startStack(t, stackOptions{Workers: 1, Env: dlFastEnv(map[string]string{
+		"APP_MAX_ATTEMPTS":     fmt.Sprint(maxAttempts),
+		"APP_BREAKER_FAILURES": fmt.Sprint(breakerFailures),
+	})})
 
 	waitStatus := func(t *testing.T, id uuid.UUID, want string) apiclient.Notification {
 		t.Helper()
@@ -108,6 +120,11 @@ func TestDeliveryR12Retry(t *testing.T) {
 		if got.Attempts != maxAttempts {
 			t.Errorf("attempts: want %d, got %d", maxAttempts, got.Attempts)
 		}
+		// Exhaustion is budget_spent >= APP_MAX_ATTEMPTS; with no outage
+		// declared every failure counts, so the budget equals the calls.
+		if spent := s.count(t, "SELECT budget_spent FROM notifications WHERE id = ?", n.Id.String()); spent != maxAttempts {
+			t.Errorf("budget_spent: want %d, got %d", maxAttempts, spent)
+		}
 		if deref(got.LastError) == "" {
 			t.Error("lastError is empty on an exhausted notification")
 		}
@@ -186,18 +203,19 @@ func TestDeliveryR12Retry(t *testing.T) {
 // B1: Bonus: Failure Handling
 // (provider outage: the channel pauses, no attempts are burned, sending
 // resumes; decision 0008).
-// Dials: APP_BREAKER_WINDOW=2s, APP_BREAKER_MIN_REQUESTS=5,
-// APP_BREAKER_COOLDOWN=1s, APP_MAX_ATTEMPTS=3, APP_RETRY_BASE=100ms,
-// APP_RETRY_CAP=1s; rate 100/s with 5 % headroom (dlPacedRate, 95/s).
+// Dials: APP_BREAKER_FAILURES=5 (the default: 5 consecutive provider faults
+// fleet-wide declare the outage, decision 0026), APP_BREAKER_COOLDOWN=1s (5 s
+// by default; 1 s fits six cool-downs into the 6 s outage), APP_MAX_ATTEMPTS=3,
+// APP_RETRY_BASE=100ms, APP_RETRY_CAP=1s; rate 100/s with 5 % headroom
+// (dlPacedRate, 95/s).
 func TestDeliveryB1BreakerPausesChannel(t *testing.T) {
 	const perChannel = 300
 	const outage = 6 * time.Second
 	chans := []string{"sms", "email", "push"}
 	s := startStack(t, stackOptions{Workers: 0, Env: dlFastEnv(map[string]string{
-		"APP_BREAKER_WINDOW":       "2s",
-		"APP_BREAKER_MIN_REQUESTS": "5",
-		"APP_BREAKER_COOLDOWN":     "1s",
-		"APP_MAX_ATTEMPTS":         "3",
+		"APP_BREAKER_FAILURES": "5",
+		"APP_BREAKER_COOLDOWN": "1s",
+		"APP_MAX_ATTEMPTS":     "3",
 	})})
 	s.dlCreateMany(t, perChannel*3, func(i int) apiclient.NotificationCreate {
 		return msg(chans[i%3], fmt.Sprintf("B1 backlog %d", i))

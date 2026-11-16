@@ -4,11 +4,14 @@ package acceptance
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,9 +22,11 @@ import (
 	"github.com/LeventAksakal/notification-system/test/apiclient"
 )
 
-// Valkey outage: the API keeps answering promptly, WebSocket streams end
-// instead of going silent, and workers deliver nothing while the limiter
-// cannot be consulted. The app reaches Valkey only through linkProxy, a TCP
+// Valkey outage: the instance stays ready and the API keeps answering
+// promptly (decision 0013 as changed on 15 Nov 2026: /readyz checks MySQL
+// only). WebSocket streams end instead of going silent, new subscriptions are
+// refused with 503 until the feed is back, and workers deliver nothing while
+// the limiter cannot be consulted. The app reaches Valkey only through linkProxy, a TCP
 // proxy the test can close (the port refuses connections, as in the R15
 // readiness tests), turn unresponsive (connections are accepted and nothing
 // ever answers: a hung or partitioned Valkey), or bring back on the same port.
@@ -200,12 +205,74 @@ func waitReadyz(t *testing.T, s *stack, timeout time.Duration, what string, ok f
 	}
 }
 
-// valkeyDown takes Valkey away and waits (bounded) until /readyz stops
-// answering 200, so what follows runs while the app knows Valkey is down.
+// valkeyDown takes Valkey away and waits (bounded) until GET /v1/ws (no
+// filter) is refused with 503 unavailable, so what follows runs while the app
+// knows Valkey is down. /readyz is no signal: it checks MySQL only (decision 0013).
 func valkeyDown(t *testing.T, s *stack, p *linkProxy, o outage) {
 	t.Helper()
 	p.down(o)
-	waitReadyz(t, s, 20*time.Second, "kept answering 200 after Valkey went "+string(o), func(st int) bool { return st != http.StatusOK })
+	waitFeedRefused(t, s, 20*time.Second, "after Valkey went "+string(o))
+}
+
+// wsAnswer is the outcome of one GET /v1/ws handshake.
+type wsAnswer struct {
+	Status int    // 0 = no answer
+	Body   []byte // first 1 KiB of a refusal
+	Err    error
+}
+
+func (a wsAnswer) String() string {
+	e := "accepted"
+	if a.Err != nil {
+		e = a.Err.Error()
+	}
+	return "HTTP " + strconv.Itoa(a.Status) + " " + string(a.Body) + " (" + e + ")"
+}
+
+// refusedUnavailable reports a 503 with the Error body and code unavailable
+// (LiveUpdatesUnavailable in the contract).
+func (a wsAnswer) refusedUnavailable() bool {
+	var e apiclient.Error
+	return a.Err != nil && a.Status == http.StatusServiceUnavailable && json.Unmarshal(a.Body, &e) == nil && e.Code == "unavailable"
+}
+
+// tryWS performs one GET /v1/ws handshake (query name/value pairs) and closes
+// the socket at once if accepted. The generated client cannot speak
+// WebSocket, so the handshake is dialled directly, as dialWS does.
+func (s *stack) tryWS(kv ...string) wsAnswer {
+	q := url.Values{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		q.Set(kv[i], kv[i+1])
+	}
+	u := "ws" + strings.TrimPrefix(s.URL, "http") + "/v1/ws"
+	if len(q) > 0 {
+		u += "?" + q.Encode()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, res, err := websocket.Dial(ctx, u, nil) // on refusal coder/websocket leaves up to 1 KiB of body in res.Body
+	a := wsAnswer{Err: err}
+	if res != nil {
+		a.Status = res.StatusCode
+		if err != nil && res.Body != nil {
+			a.Body, _ = io.ReadAll(res.Body)
+			_ = res.Body.Close()
+		}
+	}
+	if c != nil {
+		_ = c.CloseNow()
+	}
+	return a
+}
+
+// waitFeedRefused polls GET /v1/ws until it is refused with 503 unavailable.
+func waitFeedRefused(t *testing.T, s *stack, timeout time.Duration, when string, kv ...string) wsAnswer {
+	t.Helper()
+	var last wsAnswer
+	if !poll(timeout, func() bool { last = s.tryWS(kv...); return last.refusedUnavailable() }) {
+		t.Fatalf("not within %s %s: GET /v1/ws %q want 503 with code unavailable, last %s", timeout, when, kv, last)
+	}
+	return last
 }
 
 // apiCall is one typed request (a method of the generated client without
@@ -253,7 +320,8 @@ func within(t *testing.T, what string, r *response, took time.Duration, want int
 var outages = []outage{outageClosed, outageUnresponsive}
 
 // R2: Support batch creation (up to 1000 notifications per request), and R15
-// (Valkey down makes the instance unready, it does not stall intake). CONTRACT
+// (decision 0013: Valkey down degrades live updates only, it does not stall
+// intake). CONTRACT
 // "Events": "Publishing never delays a response by more than one bounded wait
 // per request, whatever the number of events (a batch is one pipelined
 // publish with one deadline)."
@@ -296,8 +364,8 @@ func TestGapOutageBatchAcceptedPromptlyWithValkeyDown(t *testing.T) {
 
 // R1: Create notification requests with recipient, channel, content, and
 // priority - "POST returns an id; GET shows the same fields and a status",
-// while Valkey is down (R15: Valkey down makes the instance unready, not
-// unusable).
+// while Valkey is down (R15 and decision 0013: the instance stays ready;
+// create, read and cancel keep working, only live updates are refused).
 func TestGapOutageAPIServesWithValkeyDown(t *testing.T) {
 	const limit = 5 * time.Second
 	const clientTimeout = 30 * time.Second
@@ -372,41 +440,33 @@ func TestGapOutageWSClosedWhileFeedLost(t *testing.T) {
 		}
 		if err != nil {
 			var ce websocket.CloseError
-			if errors.As(err, &ce) {
-				t.Logf("stream ended after %s with close %d %q", time.Since(closedAt).Round(time.Millisecond), ce.Code, ce.Reason)
-			} else {
-				t.Logf("stream ended after %s: %v", time.Since(closedAt).Round(time.Millisecond), err)
+			if !errors.As(err, &ce) || ce.Code != websocket.StatusServiceRestart {
+				t.Fatalf("stream ended after %s with %v: want close 1012 service restart (decision 0013)", time.Since(closedAt).Round(time.Millisecond), err)
 			}
+			t.Logf("stream ended after %s with close %d %q", time.Since(closedAt).Round(time.Millisecond), ce.Code, ce.Reason)
 			break
 		}
 		t.Logf("event before the stream ended: %s", eventString(e))
 	}
 
-	// While the feed is lost a new handshake is refused with a 5xx.
-	waitReadyz(t, s, 20*time.Second, "kept answering 200 after Valkey went away", func(st int) bool { return st != http.StatusOK })
-	nc, status, err := s.dialWS()
-	if err == nil {
-		_ = nc.CloseNow()
-		t.Fatalf("GET /v1/ws while Valkey is down: handshake accepted (want it refused with 5xx)")
-	}
-	if status < 500 {
-		t.Fatalf("GET /v1/ws while Valkey is down: want HTTP >= 500, got %d (%v)", status, err)
-	}
-	t.Logf("GET /v1/ws while Valkey is down: refused with HTTP %d", status)
+	// While the feed is lost a new handshake is refused with 503 unavailable.
+	a := waitFeedRefused(t, s, 20*time.Second, "after Valkey went away")
+	t.Logf("GET /v1/ws while Valkey is down: %s", a)
 
 	// Valkey back: a new subscription works again, snapshot then live events.
 	if !p.up(t) {
 		t.Skipf("could not listen on %s again to bring Valkey back; recovery step skipped", p.Addr)
 	}
-	waitReadyz(t, s, 30*time.Second, "never answered 200 after Valkey came back", func(st int) bool { return st == http.StatusOK })
 
 	n := s.create(t, msg("push", "outage after recovery"))
 	var sub *websocket.Conn
-	if !poll(20*time.Second, func() bool {
+	var status int
+	var err error
+	if !poll(30*time.Second, func() bool {
 		sub, status, err = s.dialWS("notificationId", n.Id.String())
 		return err == nil
 	}) {
-		t.Fatalf("GET /v1/ws?notificationId=%s still refused 20s after /readyz was 200 again (HTTP %d): %v", n.Id, status, err)
+		t.Fatalf("GET /v1/ws?notificationId=%s still refused 30s after Valkey came back (HTTP %d): %v", n.Id, status, err)
 	}
 	t.Cleanup(func() { _ = sub.CloseNow() })
 

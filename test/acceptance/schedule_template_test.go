@@ -56,15 +56,49 @@ func TestB2ScheduleAtIntake(t *testing.T) {
 	})
 }
 
-// putTemplate stores a template, requires 200.
+// putTemplateResp sends PUT /v1/templates/{name}, with If-Match when ifMatch
+// is not empty; the caller checks the answer.
+func (s *stack) putTemplateResp(t *testing.T, name, body, ifMatch string) *apiclient.PutTemplateResponse {
+	t.Helper()
+	var p *apiclient.PutTemplateParams
+	if ifMatch != "" {
+		p = &apiclient.PutTemplateParams{IfMatch: &ifMatch}
+	}
+	r, err := s.API.PutTemplateWithResponse(t.Context(), name, p, apiclient.TemplateWrite{Body: body})
+	if err != nil {
+		t.Fatalf("PUT /v1/templates/%s (If-Match %q): %v", name, ifMatch, err)
+	}
+	return r
+}
+
+// putTemplate creates a template (PUT without If-Match), requires 201.
 func (s *stack) putTemplate(t *testing.T, name, body string) apiclient.Template {
 	t.Helper()
-	r, err := s.API.PutTemplateWithResponse(t.Context(), name, apiclient.TemplateWrite{Body: body})
-	if err != nil {
-		t.Fatalf("PUT /v1/templates/%s: %v", name, err)
+	r := s.putTemplateResp(t, name, body, "")
+	if r.StatusCode() != http.StatusCreated || r.JSON201 == nil {
+		t.Fatalf("PUT /v1/templates/%s (create): want 201, got %s", name, show(r))
 	}
+	return *r.JSON201
+}
+
+// replaceTemplate replaces an existing template: it reads the current ETag,
+// sends it as If-Match, and requires 200 and a version one higher.
+func (s *stack) replaceTemplate(t *testing.T, name, body string) apiclient.Template {
+	t.Helper()
+	g := answered(t)(s.API.GetTemplateWithResponse(t.Context(), name)).(*apiclient.GetTemplateResponse)
+	if g.StatusCode() != http.StatusOK || g.JSON200 == nil {
+		t.Fatalf("GET /v1/templates/%s before replacing: want 200, got %s", name, show(g))
+	}
+	etag := g.HTTPResponse.Header.Get("ETag")
+	if etag == "" {
+		t.Fatalf("GET /v1/templates/%s: no ETag header", name)
+	}
+	r := s.putTemplateResp(t, name, body, etag)
 	if r.StatusCode() != http.StatusOK || r.JSON200 == nil {
-		t.Fatalf("PUT /v1/templates/%s: want 200, got %s", name, show(r))
+		t.Fatalf("PUT /v1/templates/%s with If-Match %s: want 200, got %s", name, etag, show(r))
+	}
+	if r.JSON200.Version != g.JSON200.Version+1 {
+		t.Errorf("replace %s: version want %d, got %d", name, g.JSON200.Version+1, r.JSON200.Version)
 	}
 	return *r.JSON200
 }
@@ -121,7 +155,7 @@ func TestB3TemplateCRUD(t *testing.T) {
 		t.Errorf("list: want [receipt welcome] by name, got %v", names)
 	}
 
-	replaced := s.putTemplate(t, "welcome", "Hi {{name}}")
+	replaced := s.replaceTemplate(t, "welcome", "Hi {{name}}")
 	if replaced.Body != "Hi {{name}}" {
 		t.Errorf("replace: body %q", replaced.Body)
 	}
@@ -149,7 +183,7 @@ func TestB3CreateFromTemplate(t *testing.T) {
 	}
 
 	t.Run("replacing the template does not change an accepted notification", func(t *testing.T) {
-		s.putTemplate(t, "welcome", "Changed {{name}} {{code}}")
+		s.replaceTemplate(t, "welcome", "Changed {{name}} {{code}}")
 		if got := s.get(t, n.Id); got.Content != want {
 			t.Errorf("after replacing the template: want %q, got %q", want, got.Content)
 		}
@@ -157,7 +191,12 @@ func TestB3CreateFromTemplate(t *testing.T) {
 
 	t.Run("missing variable: 400 naming it", func(t *testing.T) {
 		r := s.postCreate(t, withTemplate("email", "welcome", map[string]string{"name": "Ada"}))
-		wantError(t, r, http.StatusBadRequest, "invalid_request", "template.variables.code")
+		e := wantError(t, r, http.StatusBadRequest, "invalid_request", "template.variables")
+		if !slices.ContainsFunc(deref(e.Details), func(d apiclient.ErrorDetail) bool {
+			return d.Field == "template.variables" && slices.Equal(deref(d.Missing), []string{"code"})
+		}) {
+			t.Errorf("details: want template.variables with missing [code], got %s", jsonOf(e.Details))
+		}
 	})
 
 	t.Run("unknown template: 400 naming template.name", func(t *testing.T) {

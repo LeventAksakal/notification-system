@@ -138,9 +138,7 @@ func startStack(t *testing.T, o stackOptions) *stack {
 		"APP_LEASE_DURATION":              "30s",
 		"APP_REAP_INTERVAL":               "5s",
 		"APP_WORKER_CONCURRENCY":          "32",
-		"APP_BREAKER_WINDOW":              "10s",
-		"APP_BREAKER_MIN_REQUESTS":        "10",
-		"APP_BREAKER_FAILURE_RATIO":       "0.5",
+		"APP_BREAKER_FAILURES":            "5", // the service default (design digest: Envoy's consecutive_5xx)
 		"APP_BREAKER_COOLDOWN":            "5s",
 		"APP_IDEMPOTENCY_RETENTION":       "24h",
 		"APP_WS_SEND_BUFFER":              "256",

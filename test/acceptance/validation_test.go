@@ -4,6 +4,7 @@ package acceptance
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"mime"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/getkin/kin-openapi/openapi3"
 
@@ -26,22 +28,55 @@ func emailOfLen(n int) string {
 	return local + "@" + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", rest) + ".com"
 }
 
+// atAndPast returns a string exactly at l, in l's unit, and one unit past it.
+// Multi-byte characters make bytes and characters disagree, so a check that
+// counts the wrong unit fails one of the two.
+func atAndPast(l notification.Limit) (at, past string) {
+	if l.Unit == notification.Bytes {
+		at = strings.Repeat("é", l.Max/2) + strings.Repeat("a", l.Max%2)
+		return at, at + "a"
+	}
+	at = strings.Repeat("é", l.Max)
+	return at, at + "é"
+}
+
+// whiteSpaceRunes lists Unicode's White_Space property, the set
+// notification.IsBlank treats as blank.
+func whiteSpaceRunes() []rune {
+	var rs []rune
+	for _, r16 := range unicode.White_Space.R16 {
+		for r := rune(r16.Lo); r <= rune(r16.Hi); r += rune(r16.Stride) {
+			rs = append(rs, r)
+		}
+	}
+	for _, r32 := range unicode.White_Space.R32 {
+		for r := rune(r32.Lo); r <= rune(r32.Hi); r += rune(r32.Stride) { //nolint:gosec // G115: Unicode table values are code points, below U+10FFFF
+			rs = append(rs, r)
+		}
+	}
+	return rs
+}
+
+// notWhiteSpace look like whitespace but are not White_Space: content made of
+// one of them alone is not blank.
+var notWhiteSpace = []rune{'\u200b', '\ufeff', '\u180e'}
+
 // R10: Content validation (character limits, required fields)
-// (over-limit or missing fields are refused with the field named).
+// (over-limit or missing fields are refused with the field named; each limit
+// counts in its standard's unit: sms characters, email and push bytes).
 func TestR10ContentLimitsPerChannel(t *testing.T) {
 	s := startStack(t, stackOptions{})
 
 	for _, ch := range notification.Channels {
-		limit := notification.MaxContentLenFor(ch)
+		limit := notification.ContentLimit(ch)
 		t.Run(string(ch), func(t *testing.T) {
-			// Multi-byte characters: the limit counts characters, not bytes.
-			at := strings.Repeat("é", limit)
+			at, past := atAndPast(limit)
 			n := s.create(t, msg(string(ch), at))
 			if got := s.get(t, n.Id); got.Content != at {
-				t.Errorf("content at the limit (%d characters) not stored intact: got %d characters",
-					limit, len([]rune(got.Content)))
+				t.Errorf("content at the limit (%d %s) not stored intact: got %d %s",
+					limit.Max, limit.Unit, limit.Unit.Len(got.Content), limit.Unit)
 			}
-			r := s.postCreate(t, msg(string(ch), at+"é"))
+			r := s.postCreate(t, msg(string(ch), past))
 			wantError(t, r, http.StatusBadRequest, "invalid_request", "content")
 		})
 	}
@@ -53,9 +88,15 @@ func TestR10RequiredAndMalformedFields(t *testing.T) {
 	s := startStack(t, stackOptions{})
 	requireIntake(t, s)
 
-	t.Run("email to at 254 characters accepted", func(t *testing.T) {
+	t.Run("email to at 254 bytes accepted", func(t *testing.T) {
 		body := msg("email", "hi")
-		body.To = emailOfLen(notification.MaxEmailRecipientLen)
+		body.To = emailOfLen(notification.MaxEmailRecipientBytes)
+		s.create(t, body)
+	})
+
+	t.Run("sms to of a country code and one digit accepted (E.164 sets no minimum)", func(t *testing.T) {
+		body := msg("sms", "hi")
+		body.To = "+12"
 		s.create(t, body)
 	})
 
@@ -75,9 +116,14 @@ func TestR10RequiredAndMalformedFields(t *testing.T) {
 			Template: &apiclient.TemplateRef{Name: "welcome", Variables: &map[string]string{"name": "Ada"}}}, ""},
 		{"empty content", create{To: smsTo, Channel: apiclient.Sms, Content: ptr("")}, "content"},
 		{"sms to not E.164", create{To: "05551234567", Channel: apiclient.Sms, Content: ptr("x")}, "to"},
-		{"sms to too short", create{To: "+123456", Channel: apiclient.Sms, Content: ptr("x")}, "to"},
-		{"email to over 254 characters", create{To: emailOfLen(notification.MaxEmailRecipientLen + 1), Channel: apiclient.Email, Content: ptr("x")}, "to"},
-		{"push to over 255 characters", create{To: strings.Repeat("t", notification.MaxRecipientLen+1), Channel: apiclient.Push, Content: ptr("x")}, "to"},
+		{"whitespace-only content", create{To: smsTo, Channel: apiclient.Sms, Content: ptr(" \t \u3000")}, "content"},
+		{"whitespace-only push to", create{To: " \t ", Channel: apiclient.Push, Content: ptr("x")}, "to"},
+		{"sms to with a country code starting 0", create{To: "+0123456", Channel: apiclient.Sms, Content: ptr("x")}, "to"},
+		{"sms to of 16 digits", create{To: "+1234567890123456", Channel: apiclient.Sms, Content: ptr("x")}, "to"},
+		{"sms to of a plus alone", create{To: "+", Channel: apiclient.Sms, Content: ptr("x")}, "to"},
+		{"email to over 254 bytes", create{To: emailOfLen(notification.MaxEmailRecipientBytes + 1), Channel: apiclient.Email, Content: ptr("x")}, "to"},
+		{"email to of 254 characters in 503 bytes", create{To: strings.Repeat("é", 249) + "@b.cd", Channel: apiclient.Email, Content: ptr("x")}, "to"},
+		{"push to over 255 characters", create{To: strings.Repeat("t", notification.MaxPushRecipientLen+1), Channel: apiclient.Push, Content: ptr("x")}, "to"},
 		{"unknown channel", create{To: smsTo, Channel: "fax", Content: ptr("x")}, "channel"},
 		{"unknown priority", create{To: smsTo, Channel: apiclient.Sms, Content: ptr("x"), Priority: ptr(apiclient.Priority("urgent"))}, "priority"},
 	}
@@ -96,6 +142,22 @@ func TestR10RequiredAndMalformedFields(t *testing.T) {
 			wantError(t, r, http.StatusBadRequest, "invalid_request", tc.field)
 		})
 	}
+
+	t.Run("template rendering to blank content: 400 naming content", func(t *testing.T) {
+		s.putTemplate(t, "blank-render", "{{x}}")
+		r := s.postCreate(t, withTemplate("sms", "blank-render", map[string]string{"x": " \u3000"}))
+		wantError(t, r, http.StatusBadRequest, "invalid_request", "content")
+	})
+
+	t.Run("whitespace-only template body: 400 naming body", func(t *testing.T) {
+		r := answered(t)(s.API.PutTemplateWithResponse(t.Context(), "blank-body", nil, apiclient.TemplateWrite{Body: " \t\n\u3000"}))
+		wantError(t, r, http.StatusBadRequest, "invalid_request", "body")
+	})
+
+	t.Run("template name outside the DNS label pattern: 400 naming name", func(t *testing.T) {
+		r := answered(t)(s.API.PutTemplateWithResponse(t.Context(), "welcome_1", nil, apiclient.TemplateWrite{Body: "Hi {{name}}"}))
+		wantError(t, r, http.StatusBadRequest, "invalid_request", "name")
+	})
 }
 
 // R10: Content validation (character limits, required fields) - a malformed
@@ -188,7 +250,7 @@ func TestR10LimitsAgreeSpecAndCore(t *testing.T) {
 		{"BatchCreate.notifications maxItems", u(prop(schema("BatchCreate"), "notifications").MaxItems), notification.MaxBatchSize},
 		{"NotificationCreate.content maxLength", u(prop(create, "content").MaxLength), notification.MaxContentLen},
 		{"NotificationCreate.to maxLength", u(prop(create, "to").MaxLength), notification.MaxRecipientLen},
-		{"TemplateWrite.body maxLength", u(prop(schema("TemplateWrite"), "body").MaxLength), notification.MaxTemplateBodyLen},
+		{"TemplateWrite.body maxLength", u(prop(schema("TemplateWrite"), "body").MaxLength), notification.MaxTemplateBodyBytes},
 		{"TemplateName maxLength", u(schema("TemplateName").MaxLength), notification.MaxTemplateNameLen},
 		{"TemplateRef.variables maxProperties", u(prop(tref, "variables").MaxProps), notification.MaxTemplateVariables},
 	}
@@ -202,7 +264,7 @@ func TestR10LimitsAgreeSpecAndCore(t *testing.T) {
 	if ap := prop(tref, "variables").AdditionalProperties.Schema; ap == nil || ap.Value == nil {
 		t.Error("TemplateRef.variables has no value schema")
 	} else {
-		checks = append(checks, check{"TemplateRef.variables value maxLength", u(ap.Value.MaxLength), notification.MaxTemplateVariableLen})
+		checks = append(checks, check{"TemplateRef.variables value maxLength", u(ap.Value.MaxLength), notification.MaxTemplateVariableBytes})
 	}
 	// limit and cursor, on both list endpoints.
 	for _, path := range []string{"/v1/notifications", "/v1/batches/{id}"} {
@@ -218,6 +280,16 @@ func TestR10LimitsAgreeSpecAndCore(t *testing.T) {
 	}
 	if p := schema("TemplateName").Pattern; p != notification.TemplateNamePattern {
 		t.Errorf("TemplateName pattern: spec %q, core %q", p, notification.TemplateNamePattern)
+	}
+	// Blank values are refused by one pattern in the spec, the service and the database.
+	for _, pc := range []struct{ what, got string }{
+		{"NotificationCreate.to pattern", prop(create, "to").Pattern},
+		{"NotificationCreate.content pattern", prop(create, "content").Pattern},
+		{"TemplateWrite.body pattern", prop(schema("TemplateWrite"), "body").Pattern},
+	} {
+		if pc.got != notification.NotBlankPattern {
+			t.Errorf("%s: spec %q, core %q", pc.what, pc.got, notification.NotBlankPattern)
+		}
 	}
 	for _, c := range checks {
 		if c.spec != c.cor {
@@ -246,21 +318,42 @@ func TestR10LimitsAgreeDatabaseAndCore(t *testing.T) {
 	}
 	var rows []row
 	for _, ch := range notification.Channels {
-		limit := notification.MaxContentLenFor(ch)
+		limit := notification.ContentLimit(ch)
+		at, past := atAndPast(limit)
+		c, to := string(ch), recipientFor(string(ch))
 		rows = append(rows,
-			row{string(ch) + " content at limit", string(ch), recipientFor(string(ch)), strings.Repeat("é", limit), true},
-			row{string(ch) + " content past limit", string(ch), recipientFor(string(ch)), strings.Repeat("é", limit+1), false},
-			row{string(ch) + " empty content", string(ch), recipientFor(string(ch)), "", false},
+			row{fmt.Sprintf("%s content at %d %s", c, limit.Max, limit.Unit), c, to, at, true},
+			row{fmt.Sprintf("%s content one %s past", c, strings.TrimSuffix(string(limit.Unit), "s")), c, to, past, false},
+			row{c + " empty content", c, to, "", false},
+			row{c + " whitespace-only content", c, to, " \t\n\u00a0\u3000", false},
 		)
 	}
+	for _, r := range whiteSpaceRunes() {
+		if !notification.IsBlank(string(r)) {
+			t.Errorf("IsBlank(%U) = false for a White_Space code point", r)
+		}
+		rows = append(rows, row{fmt.Sprintf("content of %U alone", r), "push", pushTo, string(r), false})
+	}
+	for _, r := range notWhiteSpace {
+		if notification.IsBlank(string(r)) {
+			t.Errorf("IsBlank(%U) = true outside White_Space", r)
+		}
+		rows = append(rows, row{fmt.Sprintf("content of %U alone", r), "push", pushTo, string(r), true})
+	}
 	rows = append(rows,
-		row{"email to at 254", "email", emailOfLen(notification.MaxEmailRecipientLen), "x", true},
-		row{"email to at 255", "email", emailOfLen(notification.MaxEmailRecipientLen + 1), "x", false},
-		row{"push to at 255", "push", strings.Repeat("t", notification.MaxRecipientLen), "x", true},
-		row{"push to at 256", "push", strings.Repeat("t", notification.MaxRecipientLen+1), "x", false},
+		row{"email to at 254 bytes", "email", emailOfLen(notification.MaxEmailRecipientBytes), "x", true},
+		row{"email to at 255 bytes", "email", emailOfLen(notification.MaxEmailRecipientBytes + 1), "x", false},
+		row{"email to of 254 characters in 503 bytes", "email", strings.Repeat("é", 249) + "@b.cd", "x", false},
+		row{"email to whitespace only", "email", " \t ", "x", false},
+		row{"push to at 255", "push", strings.Repeat("t", notification.MaxPushRecipientLen), "x", true},
+		row{"push to at 256", "push", strings.Repeat("t", notification.MaxPushRecipientLen+1), "x", false},
 		row{"push to empty", "push", "", "x", false},
+		row{"push to whitespace only", "push", " \t ", "x", false},
 		row{"sms to E.164", "sms", "+1234567", "x", true},
+		row{"sms to of a country code and one digit", "sms", "+12", "x", true},
 		row{"sms to not E.164", "sms", "1234567", "x", false},
+		row{"sms to with a country code starting 0", "sms", "+0123456", "x", false},
+		row{"sms to of 16 digits", "sms", "+1234567890123456", "x", false},
 	)
 	for _, r := range rows {
 		err := insertNotification(r.channel, r.to, r.body)
@@ -287,16 +380,22 @@ func TestR10LimitsAgreeDatabaseAndCore(t *testing.T) {
 		_, err := s.DB.ExecContext(ctx, `INSERT INTO templates (name, body) VALUES (?, ?)`, name, body)
 		return err
 	}
-	if err := tmpl(strings.Repeat("n", notification.MaxTemplateNameLen), strings.Repeat("é", notification.MaxTemplateBodyLen)); err != nil {
-		t.Errorf("template at both limits refused by the database: %v", err)
+	bodyAt, bodyPast := atAndPast(notification.Limit{Max: notification.MaxTemplateBodyBytes, Unit: notification.Bytes})
+	if err := tmpl(strings.Repeat("n", notification.MaxTemplateNameLen), bodyAt); err != nil {
+		t.Errorf("template at both limits (name %d characters, body %d bytes) refused by the database: %v",
+			notification.MaxTemplateNameLen, notification.MaxTemplateBodyBytes, err)
 	}
-	if err := tmpl(strings.Repeat("m", notification.MaxTemplateNameLen+1), "x"); err == nil {
-		t.Errorf("template name of %d characters accepted by the database", notification.MaxTemplateNameLen+1)
-	}
-	if err := tmpl("too-long-body", strings.Repeat("é", notification.MaxTemplateBodyLen+1)); err == nil {
-		t.Errorf("template body of %d characters accepted by the database", notification.MaxTemplateBodyLen+1)
-	}
-	if err := tmpl("Bad Name", "x"); err == nil {
-		t.Error("template name outside the pattern accepted by the database")
+	for _, tc := range []struct{ what, name, body string }{
+		{"a name of 64 characters", strings.Repeat("m", notification.MaxTemplateNameLen+1), "x"},
+		{"a body one byte past its limit", "too-long-body", bodyPast},
+		{"a whitespace-only body", "blank-body", " \n\u3000"},
+		{"a name with an underscore", "welcome_1", "x"},
+		{"a name with a capital", "Welcome", "x"},
+		{"a name ending with a hyphen", "welcome-", "x"},
+		{"a name with a space", "Bad Name", "x"},
+	} {
+		if err := tmpl(tc.name, tc.body); err == nil {
+			t.Errorf("template with %s accepted by the database", tc.what)
+		}
 	}
 }

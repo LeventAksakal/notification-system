@@ -3,8 +3,10 @@
 package acceptance
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,10 +25,12 @@ func TestDeliveryR11OnceUnderTimeoutsAndCrashes(t *testing.T) {
 
 	// Dials: APP_PROVIDER_TIMEOUT=500ms (the hang is 1500 ms, so every hung
 	// call times out), APP_MAX_ATTEMPTS=3, APP_RETRY_BASE=100ms,
-	// APP_BREAKER_MIN_REQUESTS=1000 (the timeouts must not open the breaker).
+	// APP_BREAKER_FAILURES=1000 (the timeouts must not declare a provider
+	// outage: with no outage every failure counts against the message, so
+	// calls made per key stay bounded by APP_MAX_ATTEMPTS).
 	timeoutEnv := dlFastEnv(map[string]string{
-		"APP_MAX_ATTEMPTS":         fmt.Sprint(maxAttempts),
-		"APP_BREAKER_MIN_REQUESTS": "1000",
+		"APP_MAX_ATTEMPTS":     fmt.Sprint(maxAttempts),
+		"APP_BREAKER_FAILURES": "1000",
 	})
 	hangThenSend := func(t *testing.T, s *stack, channel string, n int) []uuid.UUID {
 		t.Helper()
@@ -70,13 +74,19 @@ func TestDeliveryR11OnceUnderTimeoutsAndCrashes(t *testing.T) {
 		}
 	})
 
-	// Dials: APP_LEASE_DURATION=2s, APP_REAP_INTERVAL=500ms (the crashed
-	// worker's claims return after ~2.5 s), APP_PROVIDER_TIMEOUT=5s so the 3 s
-	// delay holds the sends instead of timing them out.
+	// Dials: APP_PROVIDER_TIMEOUT=5s so the 3 s delay holds the sends instead
+	// of timing them out; APP_LEASE_DURATION=8s, the smallest whole second
+	// config.Load accepts with that timeout (decision 0018: floor 7.35 s; the
+	// 2 s lease used before is refused); APP_REAP_INTERVAL=500ms, so the
+	// crashed worker's claims return after ~8.5 s.
+	// It also carries the R11 history assertion of decision 0005 ("attempts
+	// written before the call"): the call whose worker died stays in the
+	// history as unknown, followed by the accepted retry.
 	t.Run("worker killed while its sends are held: another worker finishes them, delivered once", func(t *testing.T) {
 		const n = 20
 		s := startStack(t, stackOptions{Workers: 0, Env: dlFastEnv(map[string]string{
 			"APP_PROVIDER_TIMEOUT": "5s",
+			"APP_LEASE_DURATION":   "8s",
 			"APP_MAX_ATTEMPTS":     fmt.Sprint(maxAttempts),
 		})})
 		ids := s.dlCreateMany(t, n, func(i int) apiclient.NotificationCreate {
@@ -110,7 +120,39 @@ func TestDeliveryR11OnceUnderTimeoutsAndCrashes(t *testing.T) {
 		if st.MaxRequestsPerKey > maxAttempts {
 			t.Errorf("maxRequestsPerKey: %d, want at most APP_MAX_ATTEMPTS=%d", st.MaxRequestsPerKey, maxAttempts)
 		}
+		// The crashed call stays in the history (read with SQL: the API does
+		// not list `unknown` attempts until owner item 0015).
+		for _, id := range ids {
+			if got := s.attemptHistory(t, id); got != "1 unknown, 2 accepted" {
+				t.Errorf("%s: attempt history %q, want %q", id, got, "1 unknown, 2 accepted")
+			}
+		}
 	})
+}
+
+// attemptHistory reads a notification's attempt rows as "1 unknown, 2 accepted".
+func (s *stack) attemptHistory(t *testing.T, id uuid.UUID) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rows, err := s.DB.QueryContext(ctx, "SELECT attempt_no, outcome FROM delivery_attempts WHERE notification_id = ? ORDER BY attempt_no", id.String())
+	if err != nil {
+		t.Fatalf("attempt history of %s: %v", id, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var no int
+		var outcome string
+		if err := rows.Scan(&no, &outcome); err != nil {
+			t.Fatalf("attempt history of %s: %v", id, err)
+		}
+		out = append(out, fmt.Sprintf("%d %s", no, outcome))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("attempt history of %s: %v", id, err)
+	}
+	return strings.Join(out, ", ")
 }
 
 // R5 (delivery half): Cancel pending notifications

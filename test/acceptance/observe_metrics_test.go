@@ -78,8 +78,9 @@ func TestR13MetricsDeliveryOutcomes(t *testing.T) {
 	start := time.Now()
 	s := startStack(t, stackOptions{
 		Workers: 1,
-		// Keep the breaker out of this test: it would only slow the email lane.
-		Env: map[string]string{"APP_BREAKER_MIN_REQUESTS": "1000"},
+		// Keep the shared provider health out of this test (no run of 1000
+		// consecutive provider faults can happen here): it would only slow the email lane.
+		Env: map[string]string{"APP_BREAKER_FAILURES": "1000"},
 	})
 	const k = 3 // email notifications the provider refuses (400 = permanent, one call each)
 	if err := s.Provider.SetFaults([]fakeprovider.Fault{
