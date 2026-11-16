@@ -39,6 +39,44 @@ func (s *stack) phBudgetSpent(t *testing.T, where string, args ...any) int {
 	return s.count(t, "SELECT CAST(COALESCE(SUM(budget_spent), 0) AS SIGNED) FROM notifications WHERE "+where, args...) //nolint:gosec // G202: where is a test-source constant, values are bound via args
 }
 
+// phIdlePoll is the worker's IdleMax, 250 ms: how often a channel whose health
+// check was refused asks again (internal/delivery/new_worker.go; a code
+// default, not an APP_ dial, so the test cannot read it from the env).
+const phIdlePoll = 250 * time.Millisecond
+
+// phEnvDuration parses the duration dial key of the stack's env map.
+func phEnvDuration(t *testing.T, env map[string]string, key string) time.Duration {
+	t.Helper()
+	d, err := time.ParseDuration(env[key])
+	if err != nil {
+		t.Fatalf("%s=%q: %v", key, env[key], err)
+	}
+	return d
+}
+
+// phReapedUnknown counts the delivery_attempts with outcome 'unknown' of the
+// notifications matching where: one budget unit each, charged by the lease
+// reaper (UnknownOnReap, decision 0026), not by a provider fault.
+func (s *stack) phReapedUnknown(t *testing.T, where string, args ...any) int {
+	t.Helper()
+	// where is always a constant condition written in the test source; values go through args.
+	return s.count(t, "SELECT COUNT(*) FROM delivery_attempts WHERE outcome = 'unknown' AND notification_id IN (SELECT id FROM notifications WHERE "+where+")", args...) //nolint:gosec // G202: where is a test-source constant, values are bound via args
+}
+
+// phAssertOutageBudget asserts that the budget spent by provider faults on the
+// notifications matching where is at most breakerFailures-1 (K-1).
+func (s *stack) phAssertOutageBudget(t *testing.T, breakerFailures int, where string, args ...any) {
+	t.Helper()
+	spent := s.phBudgetSpent(t, where, args...)
+	unknown := s.phReapedUnknown(t, where, args...)
+	t.Logf("budget: SUM(budget_spent) %d, reaped unknown calls %d, spent by provider faults %d", spent, unknown, spent-unknown)
+	// Reaped unknowns are excluded: the lease reaper charges them (UnknownOnReap, decision 0026) when a stalled worker loses its lease, not the outage rule.
+	if faults := spent - unknown; faults > breakerFailures-1 {
+		t.Errorf("budget spent by provider faults %d (SUM %d minus %d reaped unknown calls, charged by the lease reaper, decision 0026), want at most %d (K-1: only the faults before the outage was declared count)",
+			faults, spent, unknown, breakerFailures-1)
+	}
+}
+
 // phStream creates one notification from item every interval until stop is
 // closed, from its own goroutine; wait returns their ids and the first error.
 // It stops when the test ends at the latest.
@@ -170,9 +208,7 @@ func TestDeliveryB1SharedHealthLongOutage(t *testing.T) {
 	default:
 		t.Logf("first accepted sms %s after recovery", first.Sub(cleared).Round(time.Millisecond))
 	}
-	if spent := s.phBudgetSpent(t, "1=1"); spent > breakerFailures-1 {
-		t.Errorf("SUM(budget_spent) %d, want at most %d (K-1: only the faults before the outage was declared count)", spent, breakerFailures-1)
-	}
+	s.phAssertOutageBudget(t, breakerFailures, "1=1")
 	st := s.Provider.Stats()
 	for _, ch := range []string{"sms", "email", "push"} {
 		if m := st.Channels[ch].MaxRequestsPerSecond; m > dlRateLimit {
@@ -233,10 +269,30 @@ func TestDeliveryR12MessageSpecificFailureDeadLetters(t *testing.T) {
 // APP_MAX_ATTEMPTS equal to APP_BREAKER_FAILURES (the edge case of decision
 // 0026: its K-th fault declares the outage and is excused).
 // Dials: dgB1Env with APP_MAX_ATTEMPTS=5 (= APP_BREAKER_FAILURES=5); 1 worker.
+//
+// Bound on the first accepted send after recovery, from the dials:
+//   - 2 x APP_BREAKER_COOLDOWN (2 x 1 s = 2 s): an excused fault is due again
+//     at max(health wait, Retry-After) + a uniform spread over one cool-down
+//     (internal/delivery/failure_attribution.go, decide); the health wait is
+//     at most one cool-down and the double sends no Retry-After, so the row
+//     can be due up to 2 cool-downs after the last fault before clearing.
+//   - + the idle poll, 250 ms (phIdlePoll): a refused health check is asked
+//     again at least that often.
+//   - + the send alignment ceiling, APP_LEASE_DURATION / 8 (2 s / 8 = 250 ms):
+//     the probe's slot is reserved at most that far past its claim.
+//   - + a 500 ms scheduling margin: the fault's result, the claim and the
+//     Valkey round trips on a loaded machine.
+//
+// = 2 s + 250 ms + 250 ms + 500 ms = 3 s.
 func TestDeliveryB1LoneMessageOutlivesOutage(t *testing.T) {
 	const outage = 12 * time.Second
 	const breakerFailures = 5
-	s := startStack(t, stackOptions{Workers: 1, Env: dgB1Env(breakerFailures)})
+	const margin = 500 * time.Millisecond
+	env := dgB1Env(breakerFailures)
+	cooldown := phEnvDuration(t, env, "APP_BREAKER_COOLDOWN")
+	alignCeiling := phEnvDuration(t, env, "APP_LEASE_DURATION") / 8
+	sendBound := 2*cooldown + phIdlePoll + alignCeiling + margin
+	s := startStack(t, stackOptions{Workers: 1, Env: env})
 	s.dlFaults(t, fakeprovider.Fault{Channel: "sms", Mode: fakeprovider.ModeStatus, Status: http.StatusServiceUnavailable})
 	n := s.create(t, msg("sms", "B1 lone message"))
 	start := s.dgFirstArrival(t, "sms")
@@ -253,14 +309,13 @@ func TestDeliveryB1LoneMessageOutlivesOutage(t *testing.T) {
 	switch {
 	case !ok:
 		t.Errorf("no request of the lone message was accepted")
-	case first.Sub(cleared) > 2*time.Second:
-		t.Errorf("sent %s after recovery, want at most 2s", first.Sub(cleared).Round(time.Millisecond))
+	case first.Sub(cleared) > sendBound:
+		t.Errorf("sent %s after recovery, want at most %s (2 x cool-down %s + idle poll %s + alignment ceiling %s + margin %s)",
+			first.Sub(cleared).Round(time.Millisecond), sendBound, cooldown, phIdlePoll, alignCeiling, margin)
 	default:
 		t.Logf("sent %s after recovery after %d requests", first.Sub(cleared).Round(time.Millisecond), len(rs))
 	}
-	if spent := s.phBudgetSpent(t, "id = ?", n.Id.String()); spent > breakerFailures-1 {
-		t.Errorf("budget_spent %d, want at most %d", spent, breakerFailures-1)
-	}
+	s.phAssertOutageBudget(t, breakerFailures, "id = ?", n.Id.String())
 	got := s.get(t, n.Id)
 	if rows := s.count(t, "SELECT COUNT(*) FROM delivery_attempts WHERE notification_id = ?", n.Id.String()); got.Attempts != rows {
 		t.Errorf("attempts %d, want the number of delivery_attempts rows %d", got.Attempts, rows)
