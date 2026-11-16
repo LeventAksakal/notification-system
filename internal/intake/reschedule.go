@@ -42,7 +42,7 @@ func (s *Service) Reschedule(ctx context.Context, id string, at *time.Time) (Not
 	// values the row already holds (the same future schedule again) changes
 	// nothing. A row still unclaimed now was unclaimed
 	// then too (claim_version never goes back to 0), so it matched.
-	if changed == 0 && !(n.Notification.Status == sqlc.NotificationsStatusPending && n.ClaimVersion == 0) {
+	if changed == 0 && (n.Notification.Status != sqlc.NotificationsStatusPending || n.ClaimVersion != 0) {
 		return Notification{}, notReschedulable(n)
 	}
 	lctx := telemetry.WithNotification(ctx, n.ID, n.CorrelationID)

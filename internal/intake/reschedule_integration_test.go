@@ -66,14 +66,13 @@ func (f rescheduleFixture) claimAll(t *testing.T, p notification.Priority) []not
 
 func TestRescheduleMovesOnlyNotificationsNoWorkerPickedUp(t *testing.T) {
 	f := newRescheduleFixture(t)
-	ctx := t.Context()
 	now := f.dbNow(t)
 	inADay := now.Add(24 * time.Hour).Truncate(time.Millisecond)
 	inAWeek := now.Add(7 * 24 * time.Hour).Truncate(time.Millisecond)
 
 	t.Run("a scheduled notification moves to the new time", func(t *testing.T) {
 		n := f.create(t, notification.PriorityHigh, &inADay)
-		got, err := f.svc.Reschedule(ctx, n.ID, &inAWeek)
+		got, err := f.svc.Reschedule(t.Context(), n.ID, &inAWeek)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,7 +82,7 @@ func TestRescheduleMovesOnlyNotificationsNoWorkerPickedUp(t *testing.T) {
 	})
 	t.Run("null makes it due now and clears the schedule", func(t *testing.T) {
 		n := f.create(t, notification.PriorityHigh, &inADay)
-		got, err := f.svc.Reschedule(ctx, n.ID, nil)
+		got, err := f.svc.Reschedule(t.Context(), n.ID, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -94,7 +93,7 @@ func TestRescheduleMovesOnlyNotificationsNoWorkerPickedUp(t *testing.T) {
 	t.Run("a past time is kept and means due now", func(t *testing.T) {
 		n := f.create(t, notification.PriorityHigh, &inADay)
 		past := now.Add(-time.Hour).Truncate(time.Millisecond)
-		got, err := f.svc.Reschedule(ctx, n.ID, &past)
+		got, err := f.svc.Reschedule(t.Context(), n.ID, &past)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,7 +103,7 @@ func TestRescheduleMovesOnlyNotificationsNoWorkerPickedUp(t *testing.T) {
 	})
 	t.Run("a due notification not yet claimed can be put off", func(t *testing.T) {
 		n := f.create(t, notification.PriorityHigh, nil)
-		got, err := f.svc.Reschedule(ctx, n.ID, &inADay)
+		got, err := f.svc.Reschedule(t.Context(), n.ID, &inADay)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -117,7 +116,7 @@ func TestRescheduleMovesOnlyNotificationsNoWorkerPickedUp(t *testing.T) {
 	t.Run("the same schedule twice is accepted both times", func(t *testing.T) {
 		n := f.create(t, notification.PriorityHigh, &inADay)
 		for i := range 2 {
-			if _, err := f.svc.Reschedule(ctx, n.ID, &inADay); err != nil {
+			if _, err := f.svc.Reschedule(t.Context(), n.ID, &inADay); err != nil {
 				t.Fatalf("reschedule %d: %v", i+1, err)
 			}
 		}
@@ -125,12 +124,12 @@ func TestRescheduleMovesOnlyNotificationsNoWorkerPickedUp(t *testing.T) {
 	t.Run("beyond the horizon is refused naming scheduledAt", func(t *testing.T) {
 		n := f.create(t, notification.PriorityHigh, &inADay)
 		far := f.dbNow(t).Add(notification.ScheduleHorizon + time.Minute)
-		_, err := f.svc.Reschedule(ctx, n.ID, &far)
+		_, err := f.svc.Reschedule(t.Context(), n.ID, &far)
 		var ve *ValidationError
 		if !errors.As(err, &ve) || ve.Details[0].Field != "scheduledAt" {
 			t.Fatalf("got %v, want a ValidationError on scheduledAt", err)
 		}
-		got, _ := f.svc.Get(ctx, n.ID)
+		got, _ := f.svc.Get(t.Context(), n.ID)
 		if !got.DueAt.Equal(inADay) {
 			t.Fatalf("a refused reschedule changed dueAt to %v", got.DueAt)
 		}
@@ -138,12 +137,12 @@ func TestRescheduleMovesOnlyNotificationsNoWorkerPickedUp(t *testing.T) {
 	t.Run("just inside the horizon is accepted", func(t *testing.T) {
 		n := f.create(t, notification.PriorityHigh, &inADay)
 		edge := f.dbNow(t).Add(notification.ScheduleHorizon - time.Second)
-		if _, err := f.svc.Reschedule(ctx, n.ID, &edge); err != nil {
+		if _, err := f.svc.Reschedule(t.Context(), n.ID, &edge); err != nil {
 			t.Fatal(err)
 		}
 	})
 	t.Run("an unknown id is not found", func(t *testing.T) {
-		if _, err := f.svc.Reschedule(ctx, "01a1e115-35f4-713d-8d33-fbf2f9af0c3c", &inADay); !errors.Is(err, ErrNotFound) {
+		if _, err := f.svc.Reschedule(t.Context(), "01a1e115-35f4-713d-8d33-fbf2f9af0c3c", &inADay); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("got %v, want ErrNotFound", err)
 		}
 	})
@@ -151,12 +150,12 @@ func TestRescheduleMovesOnlyNotificationsNoWorkerPickedUp(t *testing.T) {
 	// The refusals, each from a state a worker or a client put the row in.
 	refused := func(t *testing.T, id, wantStatus string) {
 		t.Helper()
-		before, _ := f.svc.Get(ctx, id)
-		_, err := f.svc.Reschedule(ctx, id, &inAWeek)
+		before, _ := f.svc.Get(t.Context(), id)
+		_, err := f.svc.Reschedule(t.Context(), id, &inAWeek)
 		if !errors.Is(err, ErrNotReschedulable) {
 			t.Fatalf("got %v, want ErrNotReschedulable", err)
 		}
-		after, _ := f.svc.Get(ctx, id)
+		after, _ := f.svc.Get(t.Context(), id)
 		if after.Status() != wantStatus || !after.DueAt.Equal(before.DueAt) {
 			t.Fatalf("status %s dueAt %v after the refusal, want %s and dueAt %v unchanged", after.Status(), after.DueAt, wantStatus, before.DueAt)
 		}
@@ -174,7 +173,7 @@ func TestRescheduleMovesOnlyNotificationsNoWorkerPickedUp(t *testing.T) {
 		if len(jobs) != 1 {
 			t.Fatalf("claimed %d, want 1", len(jobs))
 		}
-		if err := f.q.Reschedule(ctx, jobs[0], notification.Attempt{StartedAt: time.Now(), Outcome: notification.OutcomeTransient, HTTPStatus: 503, Error: "busy"}, time.Now().Add(time.Hour)); err != nil {
+		if err := f.q.Reschedule(t.Context(), jobs[0], notification.Attempt{StartedAt: time.Now(), Outcome: notification.OutcomeTransient, HTTPStatus: 503, Error: "busy"}, time.Now().Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 		refused(t, n.ID, "pending")
@@ -187,14 +186,14 @@ func TestRescheduleMovesOnlyNotificationsNoWorkerPickedUp(t *testing.T) {
 		}
 		// A breaker-open release puts it back with attempts still 0, so the
 		// API shows it as scheduled; it still carries the release's due time.
-		if err := f.q.Release(ctx, jobs[0], time.Now().Add(time.Hour)); err != nil {
+		if err := f.q.Release(t.Context(), jobs[0], time.Now().Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 		refused(t, n.ID, "scheduled")
 	})
 	t.Run("a cancelled notification is refused", func(t *testing.T) {
 		n := f.create(t, notification.PriorityHigh, &inADay)
-		if _, err := f.svc.Cancel(ctx, n.ID); err != nil {
+		if _, err := f.svc.Cancel(t.Context(), n.ID); err != nil {
 			t.Fatal(err)
 		}
 		refused(t, n.ID, "cancelled")

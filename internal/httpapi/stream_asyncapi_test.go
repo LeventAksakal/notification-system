@@ -250,10 +250,15 @@ func TestADataMessageFromTheClientIsClosedAsDocumented(t *testing.T) {
 		<-conn.CloseRead(r.Context()).Done()
 	}))
 	defer srv.Close()
-	conn, _, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	conn, resp, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		if resp.Body != nil { // a successful dial leaves the body to the connection
+			_ = resp.Body.Close()
+		}
+	}()
 	defer func() { _ = conn.CloseNow() }()
 	if err := conn.Write(t.Context(), websocket.MessageText, []byte(`{}`)); err != nil {
 		t.Fatal(err)

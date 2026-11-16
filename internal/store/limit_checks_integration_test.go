@@ -36,7 +36,7 @@ func whiteSpaceRunes() []rune {
 		}
 	}
 	for _, r32 := range unicode.White_Space.R32 {
-		for r := rune(r32.Lo); r <= rune(r32.Hi); r += rune(r32.Stride) {
+		for r := rune(r32.Lo); r <= rune(r32.Hi); r += rune(r32.Stride) { //nolint:gosec // Unicode tables stop at U+10FFFF, inside rune's range
 			rs = append(rs, r)
 		}
 	}
