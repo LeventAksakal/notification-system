@@ -14,6 +14,10 @@ CREATE TABLE notifications (
   -- Final content: templates are rendered at intake (decision 0015).
   content MEDIUMTEXT NOT NULL,
   status ENUM('pending', 'processing', 'sent', 'failed', 'cancelled') NOT NULL DEFAULT 'pending',
+  -- The state this row last moved from, written only by the triggers below:
+  -- 'created' on insert, the old status on every status change. NULL only on
+  -- rows that existed before the triggers (decision 0005, "As built").
+  status_from ENUM('created', 'pending', 'processing', 'sent', 'failed', 'cancelled') NULL,
   failure_kind ENUM('permanent', 'exhausted') NULL,
   -- Provider calls made in the current attempt budget; reset by a replay.
   attempts INT UNSIGNED NOT NULL DEFAULT 0,
@@ -44,20 +48,47 @@ CREATE TABLE notifications (
   CONSTRAINT content_length CHECK ((((`channel` = _utf8mb4'sms') and (char_length(`content`) between 1 and 1600)) or ((`channel` = _utf8mb4'email') and (char_length(`content`) between 1 and 100000)) or ((`channel` = _utf8mb4'push') and (char_length(`content`) between 1 and 1024)))),
   CONSTRAINT failure_kind_only_when_failed CHECK ((status = 'failed') = (failure_kind IS NOT NULL)),
   CONSTRAINT budget_within_attempts CHECK ((`budget_spent` <= `attempts`)),
+  -- The state machine (internal/notification/status.go, transitions): every
+  -- (status_from, status) pair the triggers can produce must be an allowed
+  -- edge; 'created' -> pending is the only way in. store_rules_integration_test.go
+  -- asserts this list equals the Go map.
+  CONSTRAINT status_transition CHECK (((`status_from` is null) or ((`status_from`,`status`) in ((_utf8mb4'created',_utf8mb4'pending'),(_utf8mb4'pending',_utf8mb4'processing'),(_utf8mb4'pending',_utf8mb4'cancelled'),(_utf8mb4'processing',_utf8mb4'sent'),(_utf8mb4'processing',_utf8mb4'pending'),(_utf8mb4'processing',_utf8mb4'failed'),(_utf8mb4'failed',_utf8mb4'pending'))))),
+  CONSTRAINT finished_exactly_when_terminal CHECK (((`status` in (_utf8mb4'sent',_utf8mb4'failed',_utf8mb4'cancelled')) = (`finished_at` is not null))),
+  CONSTRAINT lease_only_while_processing CHECK (((`status` = _utf8mb4'processing') = (`lease_until` is not null))),
+  CONSTRAINT provider_id_only_when_sent CHECK (((`status` = _utf8mb4'sent') or (`provider_message_id` is null))),
+  CONSTRAINT attempted_before_sent_or_failed CHECK (((`status` not in (_utf8mb4'sent',_utf8mb4'failed')) or (`attempts` >= 1))),
+  CONSTRAINT batch_position_with_batch CHECK (((`batch_id` is null) = (`batch_index` is null))),
   -- The claim: WHERE status='pending' AND channel=? AND priority=? AND due_at<=NOW(3) ORDER BY due_at.
   KEY claim_idx (status, channel, priority, due_at),
   -- The reaper: WHERE status='processing' AND lease_until < NOW(3).
   KEY lease_idx (status, lease_until),
-  -- Batch items in request order.
-  KEY batch_idx (batch_id, batch_index),
+  -- Batch items in request order, one row per position.
+  UNIQUE KEY batch_position_idx (batch_id, batch_index),
   -- Lists newest first, filtered by channel or by status.
   KEY list_channel_idx (channel, id),
   KEY list_status_idx (status, id),
-  -- Metrics: what finished inside a window.
+  -- Metrics: what finished inside a window. Retention: WHERE finished_at < ? (decision 0025).
   KEY finished_idx (finished_at, status, channel)
 );
 
+-- Only the triggers write status_from, so status_transition sees every status
+-- change, whoever writes it (sqldef cannot parse SIGNAL, decision 0023, so the
+-- refusal is the CHECK, not the trigger).
+CREATE TRIGGER notifications_status_from_insert BEFORE INSERT ON notifications FOR EACH ROW BEGIN
+  SET NEW.status_from = 'created';
+END;
+
+CREATE TRIGGER notifications_status_from_update BEFORE UPDATE ON notifications FOR EACH ROW BEGIN
+  IF NOT (NEW.status <=> OLD.status) THEN
+    SET NEW.status_from = OLD.status;
+  ELSE
+    SET NEW.status_from = OLD.status_from;
+  END IF;
+END;
+
 -- One row per provider call (decision 0005); also feeds the metrics endpoint (0014).
+-- Written in flight and committed before the request leaves, then updated
+-- with the result, so a crash cannot lose a call from the history.
 CREATE TABLE delivery_attempts (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   notification_id CHAR(36) CHARACTER SET ascii NOT NULL,
@@ -65,16 +96,47 @@ CREATE TABLE delivery_attempts (
   attempt_no INT UNSIGNED NOT NULL,
   channel ENUM('sms', 'email', 'push') NOT NULL,
   started_at DATETIME(3) NOT NULL,
-  duration_ms INT UNSIGNED NOT NULL,
-  outcome ENUM('accepted', 'transient', 'permanent') NOT NULL,
+  -- 0 until a result is recorded.
+  duration_ms INT UNSIGNED NOT NULL DEFAULT 0,
+  outcome ENUM('accepted', 'transient', 'permanent', 'in_flight', 'unknown') NOT NULL,
+  -- Where the outcome last moved from, written only by the triggers below
+  -- ('created' on insert); NULL on rows older than the triggers.
+  outcome_from ENUM('created', 'accepted', 'transient', 'permanent', 'in_flight', 'unknown') NULL,
+  -- The claim that made the call (notifications.claim_version); NULL on rows
+  -- older than attempts written before the call.
+  claim_version BIGINT UNSIGNED NULL,
   -- NULL when no response arrived (timeout, connection error).
   http_status SMALLINT UNSIGNED NULL,
   error VARCHAR(1024) NULL,
   provider_message_id VARCHAR(255) NULL,
   PRIMARY KEY (id),
+  CONSTRAINT attempt_no_from_one CHECK ((`attempt_no` >= 1)),
+  -- The attempt's state machine (internal/notification/status.go, attemptTransitions).
+  CONSTRAINT attempt_outcome_transition CHECK (((`outcome_from` is null) or ((`outcome_from`,`outcome`) in ((_utf8mb4'created',_utf8mb4'in_flight'),(_utf8mb4'in_flight',_utf8mb4'accepted'),(_utf8mb4'in_flight',_utf8mb4'transient'),(_utf8mb4'in_flight',_utf8mb4'permanent'),(_utf8mb4'in_flight',_utf8mb4'unknown'),(_utf8mb4'unknown',_utf8mb4'accepted'),(_utf8mb4'unknown',_utf8mb4'transient'),(_utf8mb4'unknown',_utf8mb4'permanent'))))),
+  CONSTRAINT attempt_claim_known CHECK (((`outcome_from` is null) or (`claim_version` is not null))),
+  CONSTRAINT attempt_no_result_yet CHECK (((`outcome` not in (_utf8mb4'in_flight',_utf8mb4'unknown')) or ((`http_status` is null) and (`duration_ms` = 0)))),
+  CONSTRAINT attempt_provider_id_only_when_accepted CHECK (((`outcome` = _utf8mb4'accepted') or (`provider_message_id` is null))),
+  CONSTRAINT attempt_accepted_is_2xx CHECK (((`outcome` <> _utf8mb4'accepted') or ((`http_status` is not null) and (`http_status` between 200 and 299)))),
+  CONSTRAINT attempt_http_status_range CHECK ((`http_status` between 100 and 999)),
+  CONSTRAINT attempt_error_exactly_when_failed_or_unknown CHECK (((`outcome` in (_utf8mb4'accepted',_utf8mb4'in_flight')) = (`error` is null))),
   CONSTRAINT attempts_notification_fk FOREIGN KEY (notification_id) REFERENCES notifications (id),
   -- A notification's history, oldest first.
   KEY attempts_notification_idx (notification_id, id),
+  -- One provider call per claim; the result write finds its row here.
+  UNIQUE KEY attempts_claim_idx (notification_id, claim_version),
   -- Metrics: attempts started inside a window.
   KEY attempts_window_idx (started_at, channel, outcome)
 );
+
+CREATE TRIGGER delivery_attempts_outcome_from_insert BEFORE INSERT ON delivery_attempts FOR EACH ROW BEGIN
+  SET NEW.outcome_from = 'created';
+END;
+
+CREATE TRIGGER delivery_attempts_outcome_from_update BEFORE UPDATE ON delivery_attempts FOR EACH ROW BEGIN
+  IF NOT (NEW.outcome <=> OLD.outcome) THEN
+    SET NEW.outcome_from = OLD.outcome;
+  ELSE
+    SET NEW.outcome_from = OLD.outcome_from;
+  END IF;
+END;
+

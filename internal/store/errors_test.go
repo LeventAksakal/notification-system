@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/go-sql-driver/mysql"
+
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 func TestIsUnavailable(t *testing.T) {
@@ -44,6 +46,33 @@ func TestIsUnavailable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := IsUnavailable(tc.err); got != tc.want {
 				t.Fatalf("IsUnavailable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRefusedTransitionIsTheStateMachinesError(t *testing.T) {
+	check := func(name string) error {
+		return fmt.Errorf("finish x: %w", &mysql.MySQLError{Number: 3819, Message: "Check constraint '" + name + "' is violated."})
+	}
+	cases := []struct {
+		name           string
+		err            error
+		wantTransition bool
+	}{
+		{"the state machine's CHECK", check("status_transition"), true},
+		{"another CHECK", check("lease_only_while_processing"), false},
+		{"a duplicate key", &mysql.MySQLError{Number: 1062, Message: "Duplicate entry"}, false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RuleViolation(tc.err)
+			if errors.Is(got, notification.ErrInvalidTransition) != tc.wantTransition {
+				t.Fatalf("RuleViolation(%v) = %v; ErrInvalidTransition wanted: %v", tc.err, got, tc.wantTransition)
+			}
+			if tc.err != nil && !errors.Is(got, tc.err) {
+				t.Fatalf("RuleViolation dropped the original error: %v", got)
 			}
 		})
 	}

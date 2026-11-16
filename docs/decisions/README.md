@@ -26,4 +26,5 @@ Record 0004 in this folder is still `proposed` (the owner rejected it on 15 Nov 
 - [Packages are named for their role; contracts and settings sit at the root (0022)](0022-packages-by-role-contracts-at-the-root.md)
 - [schema/ is the desired state, diffed into goose migrations by sqldef (0023)](0023-schema-as-code-with-sqldef.md)
 - [The server's endpoint code owns the HTTP contract; the spec and clients are generated from it (0024)](0024-server-code-owns-the-http-contract.md)
+- [Finished notifications and their attempts are deleted after APP_NOTIFICATION_RETENTION (0025)](0025-finished-notifications-expire.md)
 - [Provider health is shared in Valkey per channel; a failure counts against a message only while its provider is believed healthy (0026)](0026-provider-health-shared-outages-spend-no-budget.md)

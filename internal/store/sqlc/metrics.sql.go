@@ -14,21 +14,26 @@ import (
 const metricsAttempts = `-- name: MetricsAttempts :many
 SELECT
   channel,
-  COUNT(*) AS attempts,
-  CAST(COALESCE(SUM(outcome <> 'accepted'), 0) AS SIGNED) AS failed_attempts
+  CAST(COALESCE(SUM(outcome IN ('accepted', 'transient', 'permanent')), 0) AS SIGNED) AS attempts,
+  CAST(COALESCE(SUM(outcome IN ('transient', 'permanent')), 0) AS SIGNED) AS failed_attempts,
+  CAST(COALESCE(SUM(outcome = 'unknown'), 0) AS SIGNED) AS unknown_attempts
 FROM delivery_attempts FORCE INDEX (attempts_window_idx)
 WHERE started_at >= ?
 GROUP BY channel
 `
 
 type MetricsAttemptsRow struct {
-	Channel        DeliveryAttemptsChannel
-	Attempts       int64
-	FailedAttempts int64
+	Channel         DeliveryAttemptsChannel
+	Attempts        int64
+	FailedAttempts  int64
+	UnknownAttempts int64
 }
 
 // Provider calls started in the window (since its start), per channel, from
-// attempts_window_idx (started_at, channel, outcome) alone.
+// attempts_window_idx (started_at, channel, outcome) alone. attempts are the
+// calls with a result (accepted, transient, permanent), as the API documents
+// them; a call still in flight counts nowhere; unknown (the result was never
+// recorded) is its own count, neither failed nor accepted.
 func (q *Queries) MetricsAttempts(ctx context.Context, since time.Time) ([]MetricsAttemptsRow, error) {
 	rows, err := q.db.QueryContext(ctx, metricsAttempts, since)
 	if err != nil {
@@ -38,7 +43,12 @@ func (q *Queries) MetricsAttempts(ctx context.Context, since time.Time) ([]Metri
 	var items []MetricsAttemptsRow
 	for rows.Next() {
 		var i MetricsAttemptsRow
-		if err := rows.Scan(&i.Channel, &i.Attempts, &i.FailedAttempts); err != nil {
+		if err := rows.Scan(
+			&i.Channel,
+			&i.Attempts,
+			&i.FailedAttempts,
+			&i.UnknownAttempts,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

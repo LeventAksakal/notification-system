@@ -231,6 +231,7 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		return serveHTTP(gctx, ln, &http.Server{Handler: h, ReadHeaderTimeout: cfg.ReadHeaderTimeout}, cfg.ShutdownTimeout)
 	})
 	g.Go(func() error { return svc.SweepIdempotencyKeys(gctx, cfg.IdempotencySweep) })
+	g.Go(func() error { return svc.SweepFinished(gctx, cfg.IdempotencySweep, cfg.NotificationRetention) })
 	g.Go(func() error { return hub.Run(gctx) })
 	g.Go(func() error {
 		<-gctx.Done()

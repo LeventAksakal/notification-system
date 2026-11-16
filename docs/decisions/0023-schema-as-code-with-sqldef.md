@@ -23,3 +23,6 @@ Option 2. `tools/schemadiff` concatenates `schema/`, diffs it against a scratch 
 
 ## Confirmation
 `task migrate:check` (CI job "static: lint, migration drift").
+
+## As built: the first triggers (15 Nov 2026)
+Decision 0005's database rules are the first triggers. The refusal is a CHECK fed by the triggers (sqldef still cannot parse `SIGNAL`), and three gaps showed up and are closed in `tools/schemadiff`: mysqldef never emits `DROP TRIGGER` for a MySQL trigger that `schema/` no longer declares (so Down, Up and `-check` now compare trigger names themselves); goose splits a trigger body on its semicolons (each `CREATE TRIGGER` is wrapped in `StatementBegin`/`StatementEnd`); and sqlc's MySQL parser rejects `CREATE TRIGGER`, so sqlc reads `internal/store/schema.gen.sql`, the migrated schema without triggers, written by `schemadiff -name` and checked by `-check`.

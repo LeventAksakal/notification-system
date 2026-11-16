@@ -54,7 +54,8 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 | `APP_BREAKER_FAILURES` | `5` | consecutive provider faults, fleet-wide, that declare an outage |
 | `APP_BREAKER_COOLDOWN` | `5s` | least time before the next probe, fleet-wide |
 | `APP_IDEMPOTENCY_RETENTION` | `24h` | how long a key is remembered |
-| `APP_IDEMPOTENCY_SWEEP_INTERVAL` | `1m` | how often expired keys are deleted |
+| `APP_IDEMPOTENCY_SWEEP_INTERVAL` | `1m` | how often expired keys and expired finished notifications are deleted |
+| `APP_NOTIFICATION_RETENTION` | `168h` | how long finished notifications and their attempts are kept (1h..365d, at least the key retention; decision 0025) |
 | `APP_WS_SEND_BUFFER` | `256` | events buffered per subscriber before it is dropped |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | pass-through, read by the OpenTelemetry SDK and validated by `config`; production `parentbased_traceidratio` (decision 0019) |
 | `OTEL_TRACES_SAMPLER_ARG` | `1` | pass-through; share of new traces kept by the `*traceidratio` samplers; production `0.02`, derived in decision 0019 |

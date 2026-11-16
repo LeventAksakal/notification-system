@@ -51,7 +51,10 @@ type Config struct {
 	BreakerCooldown      time.Duration
 	IdempotencyRetention time.Duration
 	IdempotencySweep     time.Duration
-	WSSendBuffer         int
+	// NotificationRetention is how long a finished notification and its
+	// attempts are kept after finished_at (decision 0025).
+	NotificationRetention time.Duration
+	WSSendBuffer          int
 }
 
 // ProviderURL returns the provider endpoint for a channel.
@@ -163,8 +166,12 @@ var Dials = []Dial{
 		func(c *Config) *time.Duration { return &c.BreakerCooldown }),
 	duration("APP_IDEMPOTENCY_RETENTION", "24h", "how long an Idempotency-Key is remembered", time.Second, 30*24*time.Hour,
 		func(c *Config) *time.Duration { return &c.IdempotencyRetention }),
-	duration("APP_IDEMPOTENCY_SWEEP_INTERVAL", "1m", "how often app serve deletes expired Idempotency-Keys", 10*time.Millisecond, time.Hour,
+	duration("APP_IDEMPOTENCY_SWEEP_INTERVAL", "1m", "how often app serve deletes expired Idempotency-Keys and notifications past APP_NOTIFICATION_RETENTION", 10*time.Millisecond, time.Hour,
 		func(c *Config) *time.Duration { return &c.IdempotencySweep }),
+	// At least the metrics window (an hour), so /metrics never counts a
+	// deleted row; at least APP_IDEMPOTENCY_RETENTION, checked in load.
+	duration("APP_NOTIFICATION_RETENTION", "168h", "how long sent, failed and cancelled notifications and their attempts are kept after they finish; a failed one can be replayed only while kept", time.Hour, 365*24*time.Hour,
+		func(c *Config) *time.Duration { return &c.NotificationRetention }),
 	integer("APP_WS_SEND_BUFFER", "256", "events buffered per WebSocket subscriber before it is dropped", 1, 65_536,
 		func(c *Config) *int { return &c.WSSendBuffer }),
 }
@@ -255,6 +262,10 @@ func load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 	}
 	if len(errs) == 0 && c.RetryCap < c.RetryBase {
 		errs = append(errs, fmt.Errorf("APP_RETRY_CAP %s is below APP_RETRY_BASE %s", c.RetryCap, c.RetryBase))
+	}
+	if len(errs) == 0 && c.NotificationRetention < c.IdempotencyRetention {
+		// A keyed retry must find the notification or batch its key names.
+		errs = append(errs, fmt.Errorf("APP_NOTIFICATION_RETENTION %s is below APP_IDEMPOTENCY_RETENTION %s", c.NotificationRetention, c.IdempotencyRetention))
 	}
 	return c, settings, errs
 }

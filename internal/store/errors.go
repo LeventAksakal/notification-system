@@ -5,10 +5,14 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"net"
+	"regexp"
 	"syscall"
 
 	"github.com/go-sql-driver/mysql"
+
+	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
 // MySQL server error numbers the services branch on.
@@ -20,7 +24,39 @@ const (
 	erLockWaitTimeout      = 1205
 	erLockDeadlock         = 1213
 	erClientInteractionEnd = 4031 // the server closed an idle connection
+	erCheckViolated        = 3819 // a CHECK constraint refused the row
 )
+
+// statusTransitionCheck is the CHECK that holds the state machine in the
+// database (schema/notifications.sql); the triggers feed it status_from.
+const statusTransitionCheck = "status_transition"
+
+// checkNameRE reads the constraint name out of error 3819's message.
+var checkNameRE = regexp.MustCompile(`Check constraint '([^']+)' is violated`)
+
+// CheckViolated returns the name of the CHECK constraint that refused a write.
+func CheckViolated(err error) (string, bool) {
+	var me *mysql.MySQLError
+	if !errors.As(err, &me) || me.Number != erCheckViolated {
+		return "", false
+	}
+	m := checkNameRE.FindStringSubmatch(me.Message)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// RuleViolation maps a status change the database refused to
+// notification.ErrInvalidTransition, so a refused transition is the same error
+// whichever layer caught it; the MySQL error stays in the chain. Any other
+// error is returned as it is.
+func RuleViolation(err error) error {
+	if name, ok := CheckViolated(err); ok && name == statusTransitionCheck {
+		return fmt.Errorf("%w (refused by the database): %w", notification.ErrInvalidTransition, err)
+	}
+	return err
+}
 
 // IsDuplicateKey reports whether err is a primary or unique key violation.
 func IsDuplicateKey(err error) bool { return isMySQLError(err, erDupEntry) }

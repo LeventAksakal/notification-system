@@ -17,9 +17,13 @@ import (
 )
 
 // The Docker client of the integration tests (testcontainers on Windows)
-// starts one process-wide IO completion goroutine that never ends.
+// starts one process-wide IO completion goroutine that never ends, and the
+// MySQL server shared by the process (test/support) keeps its Ryuk
+// connection until the process exits.
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m, goleak.IgnoreAnyFunction("github.com/Microsoft/go-winio.ioCompletionProcessor"))
+	goleak.VerifyTestMain(m,
+		goleak.IgnoreAnyFunction("github.com/Microsoft/go-winio.ioCompletionProcessor"),
+		goleak.IgnoreAnyFunction("github.com/testcontainers/testcontainers-go.(*Reaper).connect.func1"))
 }
 
 // memQueue is an in-memory notification.Queue with the same fencing rules.
@@ -96,14 +100,17 @@ func (q *memQueue) finish(job notification.Job, a *notification.Attempt, to noti
 		return notification.ErrLeaseLost
 	}
 	r.status, r.kind, r.due = to, kind, due
-	if a != nil {
+	switch {
+	case a == nil:
+		q.released++
+	case a.Outcome == "":
+		// Failed without a call (the budget was spent): counts unchanged.
+	default:
 		r.job.Attempts++
 		if to == notification.StatusFailed || a.Counted && to == notification.StatusPending {
 			r.job.BudgetSpent++ // as the store: a failure counts when Counted, a final failure always
 		}
 		q.results[job.ID] = append(q.results[job.ID], a.Outcome)
-	} else {
-		q.released++
 	}
 	return nil
 }
@@ -401,11 +408,53 @@ func TestWorkerShutdownReleasesUnsentWork(t *testing.T) {
 	if err := stop(); err != nil {
 		t.Fatal(err)
 	}
+	// The requests had left: each call is an unknown attempt (decision 0005),
+	// not counted against the budget (0026), and the notification goes back
+	// to pending for a retry.
 	q.mu.Lock()
-	released, results := q.released, len(q.results)
-	q.mu.Unlock()
-	if released != 3 || results != 0 || q.count(notification.StatusPending) != 3 {
-		t.Errorf("want 3 released, no attempts, 3 pending; got released %d, attempts on %d, pending %d", released, results, q.count(notification.StatusPending))
+	defer q.mu.Unlock()
+	for id, outcomes := range q.results {
+		if fmt.Sprint(outcomes) != "[unknown]" {
+			t.Errorf("%s: outcomes %v, want [unknown]", id, outcomes)
+		}
+	}
+	pending := 0
+	for _, r := range q.rows {
+		if r.status == notification.StatusPending && r.job.Attempts == 1 && r.job.BudgetSpent == 0 {
+			pending++
+		}
+	}
+	// A retry claimed again before the loop stopped is released unsent,
+	// which changes neither its attempts nor its outcomes.
+	if len(q.results) != 3 || pending != 3 {
+		t.Errorf("want 3 unknown attempts and 3 pending after 1 uncounted attempt; got attempts on %d, pending %d", len(q.results), pending)
+	}
+}
+
+func TestWorkerFailsANotificationWhoseBudgetUnknownCallsSpent(t *testing.T) {
+	q := newMemQueue()
+	q.add(1, notification.ChannelPush, notification.PriorityHigh)
+	id := "push-high-0"
+	budget := testConfig().MaxAttempts
+	q.rows[id].job.Attempts, q.rows[id].job.BudgetSpent = budget+2, budget // the reaper counted unknown calls
+	var mu sync.Mutex
+	calls := 0
+	send := func(context.Context, provider.Message) (provider.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		return provider.Response{Status: 202, MessageID: "m"}, nil
+	}
+	stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{send}}))
+	waitFor(t, "a final status", func() bool { return q.row(id).status == notification.StatusFailed })
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if r := q.row(id); calls != 0 || r.kind != notification.FailureExhausted || r.job.Attempts != budget+2 || r.job.BudgetSpent != budget {
+		t.Errorf("got %d calls, %s after %d attempts (%d counted); want no call, exhausted after %d (%d counted)",
+			calls, r.kind, r.job.Attempts, r.job.BudgetSpent, budget+2, budget)
 	}
 }
 

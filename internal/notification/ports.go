@@ -51,23 +51,36 @@ type Attempt struct {
 type Queue interface {
 	// Claim leases up to n due pending notifications of one channel and
 	// priority for the lease duration, oldest due time first. Rows locked by
-	// another claimer are skipped, never waited for.
+	// another claimer are skipped, never waited for. Each claimed job's
+	// provider call is recorded as an in-flight attempt in the same commit,
+	// so a crash cannot lose a call from the history (decision 0005); one
+	// claim makes at most one call.
 	Claim(ctx context.Context, channel Channel, priority Priority, n int, lease time.Duration) ([]Job, error)
-	// MarkSent records the accepted attempt and ends the notification as sent.
+	// MarkSent records the claim's attempt as accepted and ends the
+	// notification as sent. The three result writes record the attempt even
+	// when the lease was lost (then they return ErrLeaseLost and leave the
+	// notification alone).
 	MarkSent(ctx context.Context, job Job, attempt Attempt) error
 	// Reschedule records the failed attempt and returns the notification to
 	// pending, due again at dueAt (a retry is a stored due time, decision 0007).
 	// It adds 1 to the budget spent only when attempt.Counted (decision 0026).
 	Reschedule(ctx context.Context, job Job, attempt Attempt, dueAt time.Time) error
 	// MarkFailed records the failed attempt and ends the notification as
-	// failed; the failure always counts against the budget.
+	// failed; the failure always counts against the budget. An attempt
+	// without an Outcome means no call was made: unknown calls already spent
+	// the budget; the notification fails as exhausted, its counts stay as
+	// they are and the claim's in-flight attempt goes.
 	MarkFailed(ctx context.Context, job Job, attempt Attempt, kind FailureKind) error
-	// Release returns a claimed notification to pending without recording an
-	// attempt, due again at dueAt: the worker could not send it (provider
-	// outage declared, shutdown), so no attempt is burned (decision 0026).
+	// Release returns a claimed notification to pending, due again at dueAt,
+	// when its call was never made (provider outage declared, slot missed,
+	// shutdown; decision 0026): no attempt is burned; the claim's in-flight
+	// attempt is removed. A call that may have left is a result (unknown),
+	// not a release.
 	Release(ctx context.Context, job Job, dueAt time.Time) error
 	// ReapExpired returns notifications whose lease ran out to pending and
-	// reports them, so the caller can publish the change (decision 0018). Of
+	// reports them, so the caller can publish the change (decision 0018); an
+	// attempt still in flight on such a lease becomes unknown and counts,
+	// against the budget too (decision 0005). Of
 	// each Job only ID, BatchID, Channel, Attempts and CorrelationID are set.
 	ReapExpired(ctx context.Context) ([]Job, error)
 	// NextDue reports, for each priority of the channel that has pending

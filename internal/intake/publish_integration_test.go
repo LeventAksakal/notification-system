@@ -185,8 +185,16 @@ func TestIntakeWakesWorkersAfterEveryCommitThatMakesWorkPending(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.ExecContext(t.Context(), `UPDATE notifications SET status = 'failed', failure_kind = 'permanent', finished_at = NOW(3) WHERE id = ?`, n.ID); err != nil {
-			t.Fatal(err)
+		// Through the allowed changes, with the call a failure needs: the
+		// database refuses anything else (decision 0005).
+		for _, stmt := range []string{
+			`UPDATE notifications SET status = 'processing', lease_until = NOW(3) + INTERVAL 1 MINUTE WHERE id = ?`,
+			`UPDATE notifications SET status = 'failed', failure_kind = 'permanent', finished_at = NOW(3), lease_until = NULL,
+				attempts = 1, budget_spent = 1 WHERE id = ?`,
+		} {
+			if _, err := db.ExecContext(t.Context(), stmt, n.ID); err != nil {
+				t.Fatal(err)
+			}
 		}
 		w.hints, w.seen = nil, nil
 		before := time.Now()

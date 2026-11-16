@@ -1,7 +1,7 @@
 version: "2"
 sql:
   - engine: mysql
-    schema: migrations # the goose files generated from schema/ (tools/schemadiff); sqlc skips the Down sections
+    schema: internal/store/schema.gen.sql # written by tools/schemadiff from migrations/, without triggers (sqlc cannot parse them)
     queries: internal/store/queries
     gen:
       go:

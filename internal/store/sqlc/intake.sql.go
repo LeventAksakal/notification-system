@@ -131,7 +131,7 @@ func (q *Queries) GetIdempotencyKey(ctx context.Context, idemKey string) (Idempo
 }
 
 const getNotification = `-- name: GetNotification :one
-SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.failure_kind, notifications.attempts, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at, notifications.budget_spent,
+SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.status_from, notifications.failure_kind, notifications.attempts, notifications.budget_spent, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
   CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
 FROM notifications
 WHERE id = ?
@@ -154,8 +154,10 @@ func (q *Queries) GetNotification(ctx context.Context, id string) (GetNotificati
 		&i.Notification.Priority,
 		&i.Notification.Content,
 		&i.Notification.Status,
+		&i.Notification.StatusFrom,
 		&i.Notification.FailureKind,
 		&i.Notification.Attempts,
+		&i.Notification.BudgetSpent,
 		&i.Notification.DueAt,
 		&i.Notification.ScheduledAt,
 		&i.Notification.LeaseUntil,
@@ -167,7 +169,6 @@ func (q *Queries) GetNotification(ctx context.Context, id string) (GetNotificati
 		&i.Notification.CreatedAt,
 		&i.Notification.UpdatedAt,
 		&i.Notification.FinishedAt,
-		&i.Notification.BudgetSpent,
 		&i.IsScheduled,
 	)
 	return i, err
@@ -276,7 +277,7 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 }
 
 const listBatchItems = `-- name: ListBatchItems :many
-SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.failure_kind, notifications.attempts, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at, notifications.budget_spent,
+SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.status_from, notifications.failure_kind, notifications.attempts, notifications.budget_spent, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
   CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
 FROM notifications
 WHERE batch_id = ? AND CAST(batch_index AS SIGNED) > ?
@@ -295,7 +296,7 @@ type ListBatchItemsRow struct {
 	IsScheduled  int64
 }
 
-// One page of a batch in request order (batch_idx); after_index -1 starts at the first item.
+// One page of a batch in request order (batch_position_idx); after_index -1 starts at the first item.
 func (q *Queries) ListBatchItems(ctx context.Context, arg ListBatchItemsParams) ([]ListBatchItemsRow, error) {
 	rows, err := q.db.QueryContext(ctx, listBatchItems, arg.BatchID, arg.AfterIndex, arg.Limit)
 	if err != nil {
@@ -314,8 +315,10 @@ func (q *Queries) ListBatchItems(ctx context.Context, arg ListBatchItemsParams) 
 			&i.Notification.Priority,
 			&i.Notification.Content,
 			&i.Notification.Status,
+			&i.Notification.StatusFrom,
 			&i.Notification.FailureKind,
 			&i.Notification.Attempts,
+			&i.Notification.BudgetSpent,
 			&i.Notification.DueAt,
 			&i.Notification.ScheduledAt,
 			&i.Notification.LeaseUntil,
@@ -327,7 +330,6 @@ func (q *Queries) ListBatchItems(ctx context.Context, arg ListBatchItemsParams) 
 			&i.Notification.CreatedAt,
 			&i.Notification.UpdatedAt,
 			&i.Notification.FinishedAt,
-			&i.Notification.BudgetSpent,
 			&i.IsScheduled,
 		); err != nil {
 			return nil, err
@@ -372,10 +374,12 @@ func (q *Queries) ListBatchNotificationIDs(ctx context.Context, batchID sql.Null
 }
 
 const listDeliveryAttempts = `-- name: ListDeliveryAttempts :many
-SELECT id, notification_id, attempt_no, channel, started_at, duration_ms, outcome, http_status, error, provider_message_id FROM delivery_attempts WHERE notification_id = ? ORDER BY id
+SELECT id, notification_id, attempt_no, channel, started_at, duration_ms, outcome, outcome_from, claim_version, http_status, error, provider_message_id FROM delivery_attempts WHERE notification_id = ? AND outcome IN ('accepted', 'transient', 'permanent') ORDER BY id
 `
 
-// Oldest first (attempts_notification_idx).
+// Oldest first (attempts_notification_idx). Only calls with a result: the API
+// contract's outcome enum has no in_flight or unknown (owner item 0015); an
+// unknown call shows as the gap in attempt_no.
 func (q *Queries) ListDeliveryAttempts(ctx context.Context, notificationID string) ([]DeliveryAttempt, error) {
 	rows, err := q.db.QueryContext(ctx, listDeliveryAttempts, notificationID)
 	if err != nil {
@@ -393,6 +397,8 @@ func (q *Queries) ListDeliveryAttempts(ctx context.Context, notificationID strin
 			&i.StartedAt,
 			&i.DurationMs,
 			&i.Outcome,
+			&i.OutcomeFrom,
+			&i.ClaimVersion,
 			&i.HttpStatus,
 			&i.Error,
 			&i.ProviderMessageID,

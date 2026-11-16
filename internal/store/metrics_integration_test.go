@@ -52,10 +52,13 @@ func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 	// Attempts spread over two days, so the window is a small part of the index.
 	for i := range 200 {
 		if _, err := db.ExecContext(t.Context(), `INSERT INTO delivery_attempts
-			(notification_id, attempt_no, channel, started_at, duration_ms, outcome)
-			SELECT id, 1, channel, NOW(3) - INTERVAL ? MINUTE, 5, 'accepted' FROM notifications LIMIT 1`, i*15); err != nil {
+			(notification_id, attempt_no, channel, started_at, outcome, claim_version)
+			SELECT id, 1, channel, NOW(3) - INTERVAL ? MINUTE, 'in_flight', ? FROM notifications LIMIT 1`, i*15, i+1); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := db.ExecContext(t.Context(), `UPDATE delivery_attempts SET outcome = 'accepted', duration_ms = 5, http_status = 202`); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(t.Context(), `ANALYZE TABLE notifications, delivery_attempts`); err != nil {
 		t.Fatal(err)
@@ -124,7 +127,9 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 	exec(`UPDATE notifications SET due_at = NOW(3) + INTERVAL 1 HOUR WHERE id = ?`, later[0])
 	retry := insertListed(t, db, 1, notification.ChannelSMS, notification.StatusPending) // backing off: scheduled in the queue, pending in totals
 	exec(`UPDATE notifications SET due_at = NOW(3) + INTERVAL 1 HOUR, attempts = 1 WHERE id = ?`, retry[0])
-	insertListed(t, db, 1, notification.ChannelEmail, notification.StatusProcessing)
+	processing := insertListed(t, db, 1, notification.ChannelEmail, notification.StatusProcessing)
+	attemptIn(t, db, processing[0], 1, notification.OutcomeInFlight) // counts nowhere
+	attemptIn(t, db, retry[0], 1, notification.OutcomeUnknown)       // counts, apart from failures
 	sent := insertListed(t, db, 4, notification.ChannelPush, notification.StatusSent)
 	// Latency runs from the first due time: the creation, or the schedule when
 	// later. due_at, moved by retries and releases, does not count.
@@ -138,13 +143,11 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 		exec(`UPDATE notifications SET created_at = NOW(3) - INTERVAL ? MICROSECOND,
 			scheduled_at = NOW(3) - INTERVAL ? MICROSECOND, due_at = NOW(3) - INTERVAL 5000 MICROSECOND,
 			finished_at = NOW(3) WHERE id = ?`, firstDue[i].createdAgoUs, firstDue[i].scheduledAgoUs, id)
-		exec(`INSERT INTO delivery_attempts (notification_id, attempt_no, channel, started_at, duration_ms, outcome)
-			VALUES (?, 1, 'push', NOW(3), 5, 'accepted')`, id)
+		attemptIn(t, db, id, 1, notification.OutcomeAccepted)
 	}
 	failed := insertListed(t, db, 1, notification.ChannelEmail, notification.StatusFailed)
 	exec(`UPDATE notifications SET finished_at = NOW(3) WHERE id = ?`, failed[0])
-	exec(`INSERT INTO delivery_attempts (notification_id, attempt_no, channel, started_at, duration_ms, outcome)
-		VALUES (?, 1, 'email', NOW(3), 5, 'permanent')`, failed[0])
+	attemptIn(t, db, failed[0], 1, notification.OutcomePermanent)
 	old := insertListed(t, db, 1, notification.ChannelEmail, notification.StatusSent) // outside the window
 	exec(`UPDATE notifications SET finished_at = NOW(3) - INTERVAL 2 HOUR WHERE id = ?`, old[0])
 
@@ -177,7 +180,7 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 		}
 	}
 	d := m.Delivery
-	if d.Sent != 4 || d.Failed != 1 || d.Attempts != 5 || d.FailedAttempts != 1 {
+	if d.Sent != 4 || d.Failed != 1 || d.Attempts != 5 || d.FailedAttempts != 1 || d.UnknownAttempts != 1 {
 		t.Errorf("delivery: %+v", d)
 	}
 	if d.SuccessRate() != 0.8 || d.FailureRate() != 0.2 {

@@ -23,8 +23,10 @@ FROM notifications
 WHERE id = ?;
 
 -- name: ListDeliveryAttempts :many
--- Oldest first (attempts_notification_idx).
-SELECT * FROM delivery_attempts WHERE notification_id = ? ORDER BY id;
+-- Oldest first (attempts_notification_idx). Only calls with a result: the API
+-- contract's outcome enum has no in_flight or unknown (owner item 0015); an
+-- unknown call shows as the gap in attempt_no.
+SELECT * FROM delivery_attempts WHERE notification_id = ? AND outcome IN ('accepted', 'transient', 'permanent') ORDER BY id;
 
 -- ListNotifications is built in Go (store.ListNotificationsQuery): the WHERE
 -- holds only the filters a request sets, so each filter keeps its index.
@@ -54,7 +56,7 @@ WHERE batch_id = ?
 GROUP BY api_status;
 
 -- name: ListBatchItems :many
--- One page of a batch in request order (batch_idx); after_index -1 starts at the first item.
+-- One page of a batch in request order (batch_position_idx); after_index -1 starts at the first item.
 SELECT sqlc.embed(notifications),
   CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
 FROM notifications

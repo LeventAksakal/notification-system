@@ -39,6 +39,11 @@ linters:
     generated: strict
     presets: [std-error-handling, common-false-positives]
     rules:
+      # The database-rule tests write SQL that bypasses the store on purpose,
+      # built from fixed SET fragments in the file; no input reaches it.
+      - path: ^internal/store/rules_integration_test\.go$
+        linters: [gosec]
+        text: G202
       # main hands os.Getenv to config.Load; that is the one allowed read.
       - path: ^cmd/app/main\.go$
         linters: [forbidigo]

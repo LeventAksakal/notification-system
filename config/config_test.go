@@ -62,19 +62,21 @@ func TestDeliveryDialsDefaultToTheContractTable(t *testing.T) {
 
 func TestBrokenDeliveryDialsAreRefused(t *testing.T) {
 	for name, kv := range map[string][2]string{
-		"two weights":              {"APP_PRIORITY_WEIGHTS", "70,30"},
-		"weight over 100":          {"APP_PRIORITY_WEIGHTS", "101,0,0"},
-		"weights sum to zero":      {"APP_PRIORITY_WEIGHTS", "0,0,0"},
-		"breaker failures zero":    {"APP_BREAKER_FAILURES", "0"},
-		"breaker failures a ratio": {"APP_BREAKER_FAILURES", "0.5"},
-		"provider URL no host":     {"APP_PROVIDER_URL_SMS", "send"},
-		"retry cap below base":     {"APP_RETRY_CAP", "10ms"},
-		"zero concurrency":         {"APP_WORKER_CONCURRENCY", "0"},
-		"horizon above 2s":         {"APP_RATE_LIMIT_HORIZON", "3s"},
-		"horizon below 10ms":       {"APP_RATE_LIMIT_HORIZON", "5ms"},
-		"lease below 1s":           {"APP_LEASE_DURATION", "500ms"},
-		"request timeout below 1s": {"APP_REQUEST_TIMEOUT", "500ms"},
-		"request timeout above 5m": {"APP_REQUEST_TIMEOUT", "6m"},
+		"two weights":               {"APP_PRIORITY_WEIGHTS", "70,30"},
+		"weight over 100":           {"APP_PRIORITY_WEIGHTS", "101,0,0"},
+		"weights sum to zero":       {"APP_PRIORITY_WEIGHTS", "0,0,0"},
+		"breaker failures zero":     {"APP_BREAKER_FAILURES", "0"},
+		"breaker failures a ratio":  {"APP_BREAKER_FAILURES", "0.5"},
+		"provider URL no host":      {"APP_PROVIDER_URL_SMS", "send"},
+		"retry cap below base":      {"APP_RETRY_CAP", "10ms"},
+		"zero concurrency":          {"APP_WORKER_CONCURRENCY", "0"},
+		"horizon above 2s":          {"APP_RATE_LIMIT_HORIZON", "3s"},
+		"horizon below 10ms":        {"APP_RATE_LIMIT_HORIZON", "5ms"},
+		"lease below 1s":            {"APP_LEASE_DURATION", "500ms"},
+		"request timeout below 1s":  {"APP_REQUEST_TIMEOUT", "500ms"},
+		"request timeout above 5m":  {"APP_REQUEST_TIMEOUT", "6m"},
+		"retention below an hour":   {"APP_NOTIFICATION_RETENTION", "30m"},
+		"retention below the key's": {"APP_NOTIFICATION_RETENTION", "2h"}, // the key's default is 24h
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(env(map[string]string{"APP_DATABASE_DSN": "x", kv[0]: kv[1]}))

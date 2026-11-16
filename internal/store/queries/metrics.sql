@@ -49,11 +49,15 @@ GROUP BY channel;
 
 -- name: MetricsAttempts :many
 -- Provider calls started in the window (since its start), per channel, from
--- attempts_window_idx (started_at, channel, outcome) alone.
+-- attempts_window_idx (started_at, channel, outcome) alone. attempts are the
+-- calls with a result (accepted, transient, permanent), as the API documents
+-- them; a call still in flight counts nowhere; unknown (the result was never
+-- recorded) is its own count, neither failed nor accepted.
 SELECT
   channel,
-  COUNT(*) AS attempts,
-  CAST(COALESCE(SUM(outcome <> 'accepted'), 0) AS SIGNED) AS failed_attempts
+  CAST(COALESCE(SUM(outcome IN ('accepted', 'transient', 'permanent')), 0) AS SIGNED) AS attempts,
+  CAST(COALESCE(SUM(outcome IN ('transient', 'permanent')), 0) AS SIGNED) AS failed_attempts,
+  CAST(COALESCE(SUM(outcome = 'unknown'), 0) AS SIGNED) AS unknown_attempts
 FROM delivery_attempts FORCE INDEX (attempts_window_idx)
 WHERE started_at >= sqlc.arg(since)
 GROUP BY channel;

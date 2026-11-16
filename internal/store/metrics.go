@@ -24,9 +24,12 @@ type Latency struct{ P50, P95, P99 int }
 
 // Delivery is what happened in the window, for one channel or for all.
 type Delivery struct {
-	Sent, Failed             int
-	Attempts, FailedAttempts int
-	Latency                  Latency
+	Sent, Failed int
+	// Attempts counts calls with an outcome (not in flight); FailedAttempts
+	// the transient and permanent ones; UnknownAttempts those whose result was
+	// never recorded (decision 0005), which are neither.
+	Attempts, FailedAttempts, UnknownAttempts int
+	Latency                                   Latency
 }
 
 // SuccessRate is sent / (sent + failed); 0 when both are 0.
@@ -175,7 +178,7 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 	}
 	for _, a := range attempts {
 		if d := by[notification.Channel(a.Channel)]; d != nil {
-			d.Attempts, d.FailedAttempts = int(a.Attempts), int(a.FailedAttempts)
+			d.Attempts, d.FailedAttempts, d.UnknownAttempts = int(a.Attempts), int(a.FailedAttempts), int(a.UnknownAttempts)
 		}
 	}
 	if err := latency(ctx, tx, since, by, &m.Delivery.Latency); err != nil {
@@ -188,6 +191,7 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 		m.Delivery.Failed += d.Failed
 		m.Delivery.Attempts += d.Attempts
 		m.Delivery.FailedAttempts += d.FailedAttempts
+		m.Delivery.UnknownAttempts += d.UnknownAttempts
 	}
 	return m, nil
 }

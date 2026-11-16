@@ -101,27 +101,28 @@ func TestQueueWritesRetryALockConflict(t *testing.T) {
 		},
 	}
 	for name, write := range writes {
-		for _, failOn := range []string{"UPDATE", "INSERT"} {
+		for _, failOn := range []string{"UPDATE notifications", "UPDATE delivery_attempts"} {
 			t.Run(name+"/deadlock on "+failOn, func(t *testing.T) {
 				q, d := newLockQueue(t, failOn, 1)
 				j, a := lockJob()
 				if err := write(q, j, a); err != nil {
 					t.Fatalf("%s after one deadlock: %v, want nil", name, err)
 				}
-				// The whole transaction ran twice: update and insert each
-				// again, the first transaction rolled back, one commit.
+				// The whole transaction ran twice: the notification update
+				// again, the attempt's result write again unless the first
+				// run failed before it, one commit.
 				if d.begins != 2 || d.commits != 1 {
 					t.Errorf("begins %d commits %d, want 2 and 1", d.begins, d.commits)
 				}
 				if d.execs["UPDATE notifications"] != 2 {
 					t.Errorf("update ran %d times, want 2 (the whole transaction again)", d.execs["UPDATE notifications"])
 				}
-				wantInserts := 1
-				if failOn == "INSERT" {
-					wantInserts = 2
+				wantAttemptWrites := 1
+				if failOn == "UPDATE delivery_attempts" {
+					wantAttemptWrites = 2
 				}
-				if d.execs["INSERT INTO"] != wantInserts {
-					t.Errorf("insert ran %d times, want %d", d.execs["INSERT INTO"], wantInserts)
+				if d.execs["UPDATE delivery_attempts"] != wantAttemptWrites {
+					t.Errorf("attempt result write ran %d times, want %d", d.execs["UPDATE delivery_attempts"], wantAttemptWrites)
 				}
 			})
 		}
@@ -132,8 +133,10 @@ func TestQueueWritesRetryALockConflict(t *testing.T) {
 		if err := q.Release(context.Background(), j, time.Now()); err != nil {
 			t.Fatalf("Release after one deadlock: %v, want nil", err)
 		}
-		if d.execs["UPDATE notifications"] != 2 {
-			t.Errorf("release ran %d times, want 2", d.execs["UPDATE notifications"])
+		// Its transaction gives the lease back, then removes an attempt begun
+		// but never sent; the first lease update failed, then both ran.
+		if d.execs["UPDATE notifications"] != 2 || d.execs["DELETE FROM"] != 1 || d.begins != 2 || d.commits != 1 {
+			t.Errorf("updates %d deletes %d begins %d commits %d, want 2, 1, 2, 1", d.execs["UPDATE notifications"], d.execs["DELETE FROM"], d.begins, d.commits)
 		}
 	})
 	t.Run("Release after a lock wait timeout", func(t *testing.T) {

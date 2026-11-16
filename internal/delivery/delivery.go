@@ -773,6 +773,9 @@ func (w *Worker) announce(ctx context.Context, jobs []notification.Job, inflight
 // generation gen. Its result is published after announced is closed (nil:
 // at once).
 func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job notification.Job, announced <-chan struct{}, at time.Time, tk health.Ticket, tolerance time.Duration, gen uint64) {
+	if w.spent(jctx, cr, job, announced, tk) {
+		return
+	}
 	sleep(ctx, time.Until(at))
 	if ctx.Err() != nil {
 		w.cancel(ctx, cr, tk)
@@ -1065,22 +1068,29 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 	cancelCall()
 	elapsed := time.Since(start)
 	callDone()
+	var v provider.Verdict
+	var nx next
 	if err != nil && ctx.Err() != nil {
-		// Shutdown aborted the call: not an attempt; give the job back.
+		// Shutdown aborted the call after the request may have left: an
+		// unknown attempt (decision 0005), due again at once. It says nothing
+		// about the provider or the message, so the shared health learns
+		// nothing and the budget is not spent (0026). No response: no
+		// duration or status is kept.
 		w.cancelGate(ctx, gate, tk)
-		span.SetStatus(codes.Error, "aborted by shutdown")
-		w.release(ctx, job, announced, "shutdown aborted the call")
-		return
+		v = provider.Verdict{Outcome: notification.OutcomeUnknown, Error: "shutdown aborted the call"}
+		res, elapsed = provider.Response{}, 0
+		nx = next{status: notification.StatusPending, budgetSpent: job.BudgetSpent}
+	} else {
+		if err != nil && cut {
+			// No answer within the lease: a timeout, recorded now, while the
+			// claim still holds.
+			err = fmt.Errorf("%w: %w (%s before its end)", provider.ErrTimeout, errLeaseCut, leaseMargin)
+		}
+		v = provider.Classify(res.Status, err, res.Header)
+		healthy, healthWait := w.reportHealth(ctx, job.Channel, gate, tk, v)
+		nx = decide(v, healthy, healthWait, job.BudgetSpent, w.cfg, w.deps.Rand)
 	}
-	if err != nil && cut {
-		// No answer within the lease: a timeout, recorded now, while the
-		// claim still holds.
-		err = fmt.Errorf("%w: %w (%s before its end)", provider.ErrTimeout, errLeaseCut, leaseMargin)
-	}
-	v := provider.Classify(res.Status, err, res.Header)
-	healthy, healthWait := w.reportHealth(ctx, job.Channel, gate, tk, v)
 	w.m.attempt(ctx, job.Channel, v.Outcome, elapsed.Seconds())
-	nx := decide(v, healthy, healthWait, job.BudgetSpent, w.cfg, w.deps.Rand)
 	a := notification.Attempt{
 		StartedAt: start, Duration: elapsed, Outcome: v.Outcome, HTTPStatus: res.Status,
 		Error: v.Error, ProviderMessageID: res.MessageID, Counted: nx.counted,

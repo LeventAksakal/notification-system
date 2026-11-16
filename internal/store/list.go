@@ -45,7 +45,7 @@ FROM notifications`
 //
 // The index that yields id order is named: list_status_idx (status, id),
 // list_channel_idx (channel, id), or the primary key. A batch filter is left
-// to the optimizer: batch_idx narrows to at most MaxBatchSize rows.
+// to the optimizer: batch_position_idx narrows to at most MaxBatchSize rows.
 //
 // A date range also becomes an id range. Ids are UUIDv7 and created_at is the
 // id's millisecond (intake sets both from one value), so the smallest UUIDv7

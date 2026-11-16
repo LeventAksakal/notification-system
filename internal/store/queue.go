@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"time"
 	"unicode/utf8"
 
@@ -73,12 +75,21 @@ func (s *Queue) claimOnce(ctx context.Context, channel notification.Channel, pri
 	}
 	affected, err := q.LeaseNotifications(ctx, sqlc.LeaseNotificationsParams{LeaseUs: lease.Microseconds(), Ids: ids})
 	if err != nil {
-		return nil, fmt.Errorf("claim: lease: %w", err)
+		return nil, fmt.Errorf("claim: lease: %w", RuleViolation(err))
 	}
 	if affected != int64(len(ids)) {
 		// Cannot happen while the row locks are held; never report a lease
 		// that was not taken.
 		return nil, fmt.Errorf("claim: %d of %d locked rows leased", affected, len(ids))
+	}
+	// Each claimed call is in the history before any request can leave
+	// (decision 0005): committed with the lease, in the same round trips.
+	begun, err := q.BeginAttempts(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("claim: attempts: %w", RuleViolation(err))
+	}
+	if begun != int64(len(ids)) {
+		return nil, fmt.Errorf("claim: %d of %d attempts begun", begun, len(ids))
 	}
 	jobs := make([]notification.Job, 0, len(rows))
 	for _, r := range rows {
@@ -140,6 +151,9 @@ func (s *Queue) Reschedule(ctx context.Context, job notification.Job, a notifica
 
 // MarkFailed records the failed attempt and ends the notification as failed.
 func (s *Queue) MarkFailed(ctx context.Context, job notification.Job, a notification.Attempt, kind notification.FailureKind) error {
+	if a.Outcome == "" {
+		return s.failSpent(ctx, job, a.Error)
+	}
 	return s.finish(ctx, job, a, notification.StatusFailed, func(q *sqlc.Queries) (int64, error) {
 		return q.FinishFailed(ctx, sqlc.FinishFailedParams{
 			LastError:    nullString(cut(a.Error, notification.MaxErrorLen)),
@@ -170,52 +184,64 @@ func (s *Queue) finishOnce(ctx context.Context, job notification.Job, a notifica
 	q := s.q.WithTx(tx)
 	affected, err := update(q)
 	if err != nil {
-		return fmt.Errorf("finish %s as %s: %w", job.ID, to, err)
+		return fmt.Errorf("finish %s as %s: %w", job.ID, to, RuleViolation(err))
 	}
-	if affected == 0 {
-		return fmt.Errorf("finish %s as %s: %w", job.ID, to, notification.ErrLeaseLost)
-	}
-	var status sql.NullInt16
-	if a.HTTPStatus > 0 {
-		status = sql.NullInt16{Int16: int16(min(a.HTTPStatus, 999)), Valid: true} //nolint:gosec // bounded
-	}
-	err = q.InsertDeliveryAttempt(ctx, sqlc.InsertDeliveryAttemptParams{
-		NotificationID:    job.ID,
-		AttemptNo:         uint32(job.Attempts + 1), //nolint:gosec // attempts are small and non-negative
-		Channel:           sqlc.DeliveryAttemptsChannel(job.Channel),
-		StartedAt:         a.StartedAt.UTC(),
-		DurationMs:        uint32(max(a.Duration.Milliseconds(), 0)), //nolint:gosec // non-negative, bounded by the timeout
-		Outcome:           sqlc.DeliveryAttemptsOutcome(a.Outcome),
-		HttpStatus:        status,
-		Error:             nullString(cut(a.Error, notification.MaxErrorLen)),
-		ProviderMessageID: nullString(cut(a.ProviderMessageID, maxProviderIDLen)),
-	})
+	// The attempt row (written in flight by the claim) gets its result
+	// even when the lease was lost: the call happened either way.
+	found, err := finishAttempt(ctx, q, job, a)
 	if err != nil {
-		return fmt.Errorf("finish %s: insert attempt: %w", job.ID, err)
+		return fmt.Errorf("finish %s: attempt: %w", job.ID, err)
+	}
+	switch {
+	case !found && affected == 0:
+		return fmt.Errorf("finish %s as %s: %w", job.ID, to, notification.ErrLeaseLost)
+	case !found:
+		return fmt.Errorf("finish %s: %w", job.ID, errNoAttempt)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("finish %s: commit: %w", job.ID, err)
 	}
+	if affected == 0 {
+		return fmt.Errorf("finish %s as %s (attempt recorded): %w", job.ID, to, notification.ErrLeaseLost)
+	}
 	return nil
 }
 
-// Release returns a claimed notification to pending without an attempt.
+// errNoAttempt: a result arrived for a claim whose attempt was never begun.
+var errNoAttempt = errors.New("no attempt was begun for this claim")
+
+// Release returns a claimed notification to pending without an attempt: the
+// call was never made, so an attempt the claim began is removed.
 func (s *Queue) Release(ctx context.Context, job notification.Job, dueAt time.Time) error {
 	if err := notification.Transition(notification.StatusProcessing, notification.StatusPending); err != nil {
 		return err
 	}
-	// One autocommit statement: a deadlock or lock wait timeout rolled it
-	// back, so trying it again cannot apply it twice.
-	return retryLockConflict(ctx, func() error {
-		affected, err := s.q.ReleaseLease(ctx, sqlc.ReleaseLeaseParams{DelayUs: delayUs(dueAt), ID: job.ID, ClaimVersion: job.ClaimVersion})
-		if err != nil {
-			return fmt.Errorf("release %s: %w", job.ID, err)
-		}
-		if affected == 0 {
-			return fmt.Errorf("release %s: %w", job.ID, notification.ErrLeaseLost)
-		}
-		return nil
-	})
+	return retryLockConflict(ctx, func() error { return s.releaseOnce(ctx, job, dueAt) })
+}
+
+// releaseOnce gives the lease back, then removes the claim's in-flight
+// attempt, in one READ COMMITTED transaction.
+func (s *Queue) releaseOnce(ctx context.Context, job notification.Job, dueAt time.Time) error {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("release %s: begin: %w", job.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := s.q.WithTx(tx)
+	affected, err := q.ReleaseLease(ctx, sqlc.ReleaseLeaseParams{DelayUs: delayUs(dueAt), ID: job.ID, ClaimVersion: job.ClaimVersion})
+	if err != nil {
+		return fmt.Errorf("release %s: %w", job.ID, RuleViolation(err))
+	}
+	if affected == 0 {
+		return fmt.Errorf("release %s: %w", job.ID, notification.ErrLeaseLost)
+	}
+	if _, err := q.DeleteUnsentAttempt(ctx, sqlc.DeleteUnsentAttemptParams{NotificationID: job.ID, ClaimVersion: nullClaim(job.ClaimVersion)}); err != nil {
+		return fmt.Errorf("release %s: attempt: %w", job.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("release %s: commit: %w", job.ID, err)
+	}
+	return nil
 }
 
 // NextDue reports how long until each priority's earliest pending
@@ -289,9 +315,24 @@ func (s *Queue) reapOnce(ctx context.Context) ([]notification.Job, error) {
 			Attempts: int(r.Attempts), CorrelationID: r.CorrelationID,
 		}
 	}
+	// An attempt in flight on an expired lease becomes unknown and counts.
+	inFlight, err := q.InFlightOf(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("reap: attempts in flight: %w", err)
+	}
+	if len(inFlight) > 0 {
+		if _, err := q.UnknownOnReap(ctx, ids); err != nil {
+			return nil, fmt.Errorf("reap: unknown attempts: %w", RuleViolation(err))
+		}
+		for i := range jobs {
+			if slices.Contains(inFlight, jobs[i].ID) {
+				jobs[i].Attempts++
+			}
+		}
+	}
 	n, err := q.ReapLeases(ctx, ids)
 	if err != nil {
-		return nil, fmt.Errorf("reap: update: %w", err)
+		return nil, fmt.Errorf("reap: update: %w", RuleViolation(err))
 	}
 	if n != int64(len(ids)) {
 		// Cannot happen while the row locks are held; report nothing rather than a wrong list.
@@ -357,4 +398,15 @@ func cut(s string, n int) string {
 	}
 	r := []rune(s)
 	return string(r[:n])
+}
+
+func nullInt16(status int) sql.NullInt16 {
+	if status <= 0 {
+		return sql.NullInt16{}
+	}
+	return sql.NullInt16{Int16: int16(min(status, 999)), Valid: true} //nolint:gosec // bounded
+}
+
+func nullClaim(v uint64) sql.NullInt64 {
+	return sql.NullInt64{Int64: int64(v), Valid: true} //nolint:gosec // claim versions stay far below 2^63
 }

@@ -60,6 +60,8 @@ const (
 	DeliveryAttemptsOutcomeAccepted  DeliveryAttemptsOutcome = "accepted"
 	DeliveryAttemptsOutcomeTransient DeliveryAttemptsOutcome = "transient"
 	DeliveryAttemptsOutcomePermanent DeliveryAttemptsOutcome = "permanent"
+	DeliveryAttemptsOutcomeInFlight  DeliveryAttemptsOutcome = "in_flight"
+	DeliveryAttemptsOutcomeUnknown   DeliveryAttemptsOutcome = "unknown"
 )
 
 func (e *DeliveryAttemptsOutcome) Scan(src interface{}) error {
@@ -95,6 +97,52 @@ func (ns NullDeliveryAttemptsOutcome) Value() (driver.Value, error) {
 		return nil, nil
 	}
 	return string(ns.DeliveryAttemptsOutcome), nil
+}
+
+type DeliveryAttemptsOutcomeFrom string
+
+const (
+	DeliveryAttemptsOutcomeFromCreated   DeliveryAttemptsOutcomeFrom = "created"
+	DeliveryAttemptsOutcomeFromAccepted  DeliveryAttemptsOutcomeFrom = "accepted"
+	DeliveryAttemptsOutcomeFromTransient DeliveryAttemptsOutcomeFrom = "transient"
+	DeliveryAttemptsOutcomeFromPermanent DeliveryAttemptsOutcomeFrom = "permanent"
+	DeliveryAttemptsOutcomeFromInFlight  DeliveryAttemptsOutcomeFrom = "in_flight"
+	DeliveryAttemptsOutcomeFromUnknown   DeliveryAttemptsOutcomeFrom = "unknown"
+)
+
+func (e *DeliveryAttemptsOutcomeFrom) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = DeliveryAttemptsOutcomeFrom(s)
+	case string:
+		*e = DeliveryAttemptsOutcomeFrom(s)
+	default:
+		return fmt.Errorf("unsupported scan type for DeliveryAttemptsOutcomeFrom: %T", src)
+	}
+	return nil
+}
+
+type NullDeliveryAttemptsOutcomeFrom struct {
+	DeliveryAttemptsOutcomeFrom DeliveryAttemptsOutcomeFrom
+	Valid                       bool // Valid is true if DeliveryAttemptsOutcomeFrom is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullDeliveryAttemptsOutcomeFrom) Scan(value interface{}) error {
+	if value == nil {
+		ns.DeliveryAttemptsOutcomeFrom, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.DeliveryAttemptsOutcomeFrom.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullDeliveryAttemptsOutcomeFrom) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.DeliveryAttemptsOutcomeFrom), nil
 }
 
 type IdempotencyKeysResourceKind string
@@ -312,6 +360,52 @@ func (ns NullNotificationsStatus) Value() (driver.Value, error) {
 	return string(ns.NotificationsStatus), nil
 }
 
+type NotificationsStatusFrom string
+
+const (
+	NotificationsStatusFromCreated    NotificationsStatusFrom = "created"
+	NotificationsStatusFromPending    NotificationsStatusFrom = "pending"
+	NotificationsStatusFromProcessing NotificationsStatusFrom = "processing"
+	NotificationsStatusFromSent       NotificationsStatusFrom = "sent"
+	NotificationsStatusFromFailed     NotificationsStatusFrom = "failed"
+	NotificationsStatusFromCancelled  NotificationsStatusFrom = "cancelled"
+)
+
+func (e *NotificationsStatusFrom) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = NotificationsStatusFrom(s)
+	case string:
+		*e = NotificationsStatusFrom(s)
+	default:
+		return fmt.Errorf("unsupported scan type for NotificationsStatusFrom: %T", src)
+	}
+	return nil
+}
+
+type NullNotificationsStatusFrom struct {
+	NotificationsStatusFrom NotificationsStatusFrom
+	Valid                   bool // Valid is true if NotificationsStatusFrom is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullNotificationsStatusFrom) Scan(value interface{}) error {
+	if value == nil {
+		ns.NotificationsStatusFrom, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.NotificationsStatusFrom.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullNotificationsStatusFrom) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.NotificationsStatusFrom), nil
+}
+
 type Batch struct {
 	ID            string
 	Total         uint32
@@ -327,6 +421,8 @@ type DeliveryAttempt struct {
 	StartedAt         time.Time
 	DurationMs        uint32
 	Outcome           DeliveryAttemptsOutcome
+	OutcomeFrom       NullDeliveryAttemptsOutcomeFrom
+	ClaimVersion      sql.NullInt64
 	HttpStatus        sql.NullInt16
 	Error             sql.NullString
 	ProviderMessageID sql.NullString
@@ -349,8 +445,10 @@ type Notification struct {
 	Priority          NotificationsPriority
 	Content           string
 	Status            NotificationsStatus
+	StatusFrom        NullNotificationsStatusFrom
 	FailureKind       NullNotificationsFailureKind
 	Attempts          uint32
+	BudgetSpent       uint32
 	DueAt             time.Time
 	ScheduledAt       sql.NullTime
 	LeaseUntil        sql.NullTime
@@ -362,7 +460,6 @@ type Notification struct {
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	FinishedAt        sql.NullTime
-	BudgetSpent       uint32
 }
 
 type Template struct {

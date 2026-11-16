@@ -11,6 +11,14 @@ import (
 )
 
 type Querier interface {
+	// Attempts are written before the provider call (decision 0005): in flight,
+	// committed with the claim, then given their result. One claim makes at most
+	// one call (attempts_claim_idx).
+	// Runs in the claim's transaction, after LeaseNotifications: each claimed row's
+	// call, in flight, numbered from the notification's count and carrying the new
+	// claim_version. One statement per claim, however many rows; the claim's row
+	// locks are held, so no reaper or release can interleave.
+	BeginAttempts(ctx context.Context, ids []string) (int64, error)
 	// ListNotifications is built in Go (store.ListNotificationsQuery): the WHERE
 	// holds only the filters a request sets, so each filter keeps its index.
 	// The only way out of pending to cancelled; a lost race changes nothing.
@@ -25,9 +33,27 @@ type Querier interface {
 	ClaimCandidates(ctx context.Context, arg ClaimCandidatesParams) ([]ClaimCandidatesRow, error)
 	// Counts per API status (scheduled is a view of pending).
 	CountBatchByStatus(ctx context.Context, batchID sql.NullString) ([]CountBatchByStatusRow, error)
+	// The attempts of the rows locked by RetentionCandidates (attempts_notification_idx).
+	DeleteAttemptsOf(ctx context.Context, ids []string) (int64, error)
 	// Forget one key older than the retention, so it can be used again.
 	DeleteExpiredIdempotencyKey(ctx context.Context, arg DeleteExpiredIdempotencyKeyParams) (int64, error)
+	// The rows locked by RetentionCandidates, after their attempts.
+	DeleteNotifications(ctx context.Context, ids []string) (int64, error)
 	DeleteTemplate(ctx context.Context, name string) (int64, error)
+	// The claim's call was never made (a release: the job missed its slot, the
+	// an outage was declared, shutdown came first; or FailSpent), so its in-flight
+	// attempt is removed, not counted. Runs after the notification's update in
+	// the same transaction.
+	DeleteUnsentAttempt(ctx context.Context, arg DeleteUnsentAttemptParams) (int64, error)
+	// processing -> failed without a call: unknown calls (counted by the reaper)
+	// have already spent the attempt budget.
+	FailSpent(ctx context.Context, arg FailSpentParams) (int64, error)
+	// started_at stays the claim's time (at most the reservation horizon before
+	// the request): rewriting it would move the row in attempts_window_idx a
+	// second time on every send.
+	// The result of the claim's call (attempts_claim_idx); a result may replace
+	// unknown when it arrives after the lease ran out.
+	FinishAttempt(ctx context.Context, arg FinishAttemptParams) (int64, error)
 	// processing -> failed (permanent refusal or an exhausted budget); both count.
 	FinishFailed(ctx context.Context, arg FinishFailedParams) (int64, error)
 	// processing -> pending, due again after delay_us (a retry is a stored due time, decision 0007).
@@ -40,6 +66,8 @@ type Querier interface {
 	GetIdempotencyKey(ctx context.Context, idemKey string) (IdempotencyKey, error)
 	GetNotification(ctx context.Context, id string) (GetNotificationRow, error)
 	GetTemplate(ctx context.Context, name string) (Template, error)
+	// Which of the reaper's locked rows have an attempt in flight on their current claim.
+	InFlightOf(ctx context.Context, ids []string) ([]string, error)
 	InsertBatch(ctx context.Context, arg InsertBatchParams) error
 	InsertDeliveryAttempt(ctx context.Context, arg InsertDeliveryAttemptParams) error
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
@@ -52,15 +80,20 @@ type Querier interface {
 	// pending -> processing for the rows locked by ClaimCandidates in the same
 	// transaction, in one statement (one round trip, however many rows).
 	LeaseNotifications(ctx context.Context, arg LeaseNotificationsParams) (int64, error)
-	// One page of a batch in request order (batch_idx); after_index -1 starts at the first item.
+	// One page of a batch in request order (batch_position_idx); after_index -1 starts at the first item.
 	ListBatchItems(ctx context.Context, arg ListBatchItemsParams) ([]ListBatchItemsRow, error)
 	// Every id of a batch in request order; rebuilds a replayed BatchCreated.
 	ListBatchNotificationIDs(ctx context.Context, batchID sql.NullString) ([]string, error)
-	// Oldest first (attempts_notification_idx).
+	// Oldest first (attempts_notification_idx). Only calls with a result: the API
+	// contract's outcome enum has no in_flight or unknown (owner item 0015); an
+	// unknown call shows as the gap in attempt_no.
 	ListDeliveryAttempts(ctx context.Context, notificationID string) ([]DeliveryAttempt, error)
 	ListTemplates(ctx context.Context) ([]Template, error)
 	// Provider calls started in the window (since its start), per channel, from
-	// attempts_window_idx (started_at, channel, outcome) alone.
+	// attempts_window_idx (started_at, channel, outcome) alone. attempts are the
+	// calls with a result (accepted, transient, permanent), as the API documents
+	// them; a call still in flight counts nowhere; unknown (the result was never
+	// recorded) is its own count, neither failed nor accepted.
 	MetricsAttempts(ctx context.Context, since time.Time) ([]MetricsAttemptsRow, error)
 	// Notifications that reached sent or failed in the window (since its
 	// start), per channel, from finished_idx (finished_at, status, channel) alone.
@@ -99,9 +132,27 @@ type Querier interface {
 	ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error)
 	// A dead letter goes back to pending with a fresh attempt budget; history is kept.
 	ReplayNotification(ctx context.Context, id string) (int64, error)
+	// Retention (decision 0025): finished notifications, their attempts and their
+	// batches are deleted once they are older than the retention, on the database
+	// clock, in bounded batches.
+	// Runs inside a READ COMMITTED transaction: up to LIMIT finished notifications
+	// past the retention, oldest first, through finished_idx (finished_at, status,
+	// channel). The rows are locked, so a replay waits for the delete (and then
+	// finds nothing) instead of reviving a row whose history is being deleted;
+	// rows another sweeper or a replay holds are skipped.
+	RetentionCandidates(ctx context.Context, arg RetentionCandidatesParams) ([]string, error)
+	// Up to LIMIT batches older than the retention none of whose notifications is
+	// left (batches_created_idx, then batch_position_idx per batch). A batch's
+	// notifications are inserted with it, so an old batch never gains one.
+	SweepBatches(ctx context.Context, arg SweepBatchesParams) (int64, error)
 	// Forget up to 1000 keys older than the retention, on the database clock (the
 	// clock that set created_at), through idempotency_created_idx.
 	SweepIdempotencyKeys(ctx context.Context, retentionMs interface{}) (int64, error)
+	// The reaper's rows: an attempt in flight on an expired lease becomes unknown
+	// and counts toward the notification's attempts (the request may have left)
+	// and against its budget: the reaper cannot tell an outage from a message
+	// that kills its worker, and the second must end (decision 0026).
+	UnknownOnReap(ctx context.Context, ids []string) (int64, error)
 	UpsertTemplate(ctx context.Context, arg UpsertTemplateParams) error
 }
 
