@@ -18,6 +18,9 @@ import (
 // The script must keep the same rules as MemoryState, on Valkey's clock.
 // Time moves for real here, so advance sleeps; the contract's durations are
 // kept short for that.
+// valkeyClockMargin: see advance below.
+const valkeyClockMargin = 20 * time.Millisecond
+
 func TestValkeyStateKeepsTheContract(t *testing.T) {
 	addr := support.Valkey(t)
 	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}, DisableCache: true})
@@ -29,8 +32,14 @@ func TestValkeyStateKeepsTheContract(t *testing.T) {
 	runStateContract(t, func(t *testing.T) fixture {
 		prefix := fmt.Sprintf("health-test-%d:", n.Add(1)) // a fresh state per case
 		return fixture{
-			state:   health.NewValkey(client, contractCfg, prefix),
-			advance: time.Sleep, // Valkey's clock cannot be moved
+			state: health.NewValkey(client, contractCfg, prefix),
+			// Valkey's clock cannot be moved, so advance sleeps, a little past d:
+			// Valkey runs in Docker's VM, whose clock can trail the host's, and
+			// a sleep of exactly the cool-down then lands just before it on
+			// Valkey's clock (seen once on a two-core run, 16 Nov 2026). 20 ms is
+			// over one Windows timer tick (15.6 ms) and under every gap the
+			// contract asserts (a 100 ms probe lease, a 400 ms Retry-After).
+			advance: func(d time.Duration) { time.Sleep(d + valkeyClockMargin) },
 			wipe: func() health.State {
 				if err := client.Do(t.Context(), client.B().Flushall().Build()).Error(); err != nil {
 					t.Fatal(err)
