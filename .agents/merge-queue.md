@@ -13,6 +13,8 @@ Integration branch: `refs/heads/integration/decision-review`, checked out in `C:
 | 5eb668f | db-rules-retention (0005, 0025): state machine in MySQL, write-ahead attempts, retention |
 | 34bc20d | reschedule (0016): PATCH reschedule, horizon on the database clock |
 | 341630c | realtime-seq (0013): status_seq ordering, MySQL-only readiness, 503/1012 in the contract |
+| c488661 | template-versioning (0015): versions with If-Match, detailed variables error, template origin on notifications |
+| aaeb893 | adaptive-align (0009): alignment follows measured claim latency |
 
 ## Protocol for every lane
 1. Finish your work and your verifier on your own branch, as briefed. Do not merge other lanes into your branch.
@@ -43,4 +45,5 @@ Don't route around the guard. Write the tests you would add to `.agents/pr/<lane
 - After realtime-seq lands, update the R15 row in `docs/REQUIREMENTS.md`: `/readyz` checks MySQL only, and while Valkey is down `/v1/ws` answers 503 and open streams close with 1012.
 - Flaky on a loaded host, to re-run on a quiet one: `TestWorkersAcrossSmallLimiterClockSteps` (also on main under `-race`), and the delivery rate floor `TestWorkersHoldTheRateAtTheProvider`.
 - `test/acceptance/delivery_wake_test.go:42` uses `n.ID` where the generated client field is `Id`; `go vet -tags integration ./test/...` fails on integration. Test-writer fixes it with the held tests.
+- adaptive-align reports lint failures in other lanes' code on the integration tip; fix at the gate.
 - Realtime commit `46aefb6` doesn't build on its own; squashing covers it.
