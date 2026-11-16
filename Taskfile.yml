@@ -93,7 +93,7 @@ tasks:
     # alone, because their rate floors need the machine to themselves.
     cmds:
       - '{{.T}} gotestsum --format pkgname -- -tags integration {{.CLI_ARGS | default "./internal/..."}}'
-      - '{{if not .CLI_ARGS}}{{.T}} gotestsum --format pkgname -- -tags integration ./test/...{{end}}'
+      - '{{if not .CLI_ARGS}}{{.T}} gotestsum --format pkgname -- -tags integration -timeout 30m ./test/...{{end}}'
 
   test:all:
     desc: Unit tests, then integration tests

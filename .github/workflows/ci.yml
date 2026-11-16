@@ -1,6 +1,7 @@
-# Six jobs in parallel, none waiting for another: each failure names its own
-# job and step, and the wall time is the slowest job (acceptance, about 4 min
-# with a warm cache) instead of the sum (18 to 21 min as one job). The cost is
+# Six jobs in parallel (acceptance split into four shards), none waiting for
+# another: each failure names its own job and step, and the wall time is the
+# slowest job (an acceptance shard, about 4 to 5 min with a warm cache)
+# instead of the sum (18 to 21 min as one job). The cost is
 # per-job setup (about 25 s: Go download, cache restore) and per-job rounding
 # up to the minute. Nothing waits for the static jobs: of the last four failed
 # runs three failed in the integration tests, so a `needs:` would slow every
@@ -125,19 +126,37 @@ jobs:
   # time to 10 ms; this runner has two cores, so only the cap (never more
   # than 100 in a second) and a sanity floor are asserted here. The strict
   # floors run with `task test:all` on a developer machine.
+  # Four shards: the suite takes 843 s of test time on two cores (82 tests,
+  # measured 16 Nov 2026 pinned to two cores), over go test's 10 min default
+  # and this file's 4 min target. Shard i runs every test whose position in
+  # the sorted `go test -list` output is i modulo 4, so a new test always lands
+  # in exactly one shard; on that run the shards held 214, 215, 217 and 197 s.
+  # Cost: four setups (about 25 s each) and four jobs rounded up to the minute,
+  # about 20 billed minutes against one 15 min job that no longer fits.
   acceptance:
-    name: "acceptance tests (built binary, MySQL, Valkey, provider double)"
+    name: "acceptance tests ${{ matrix.shard }}/4 (built binary, MySQL, Valkey, provider double)"
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/go
         with:
           cache-key: acceptance
-      - name: Acceptance tests
+      - name: Acceptance tests, shard ${{ matrix.shard }} of 4
         env:
           ACCEPTANCE_RATE_FLOOR: "40"
-        run: go test -tags integration ./test/...
+          SHARD: ${{ matrix.shard }}
+        run: |
+          tests=$(go test -tags integration -list '.*' ./test/acceptance | grep '^Test' | sort | awk -v n=4 -v i="$SHARD" '(NR-1)%n==i' | paste -sd'|' -)
+          test -n "$tests"
+          go test -tags integration -timeout 14m -run "^(${tests})\$" ./test/acceptance
+      - name: Test support package
+        if: matrix.shard == 0
+        run: go test -tags integration ./test/support
 
   # No Go on the runner: the image compiles inside Docker. No layer cache
   # either: the compile layer (70 s) re-runs on every commit, and the layers a
