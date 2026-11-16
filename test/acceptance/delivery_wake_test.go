@@ -7,11 +7,14 @@ import (
 	"math"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/LeventAksakal/notification-system/config"
+	"github.com/LeventAksakal/notification-system/internal/delivery/leasebudget"
 	"github.com/LeventAksakal/notification-system/internal/fakeprovider"
 )
 
@@ -82,15 +85,41 @@ func TestDeliveryR7FirstSendAfterIdleIsPrompt(t *testing.T) {
 // after a lone send on an idle channel reaches the provider within 100 ms of
 // its POST (p99 over 30 pairs), where before the give-back it waited behind
 // the first group's unused reservation (about 200 ms plus the alignment).
+//
+// Pairs: 30. Nearest-rank p99 over 30 samples is the largest, so every pair
+// must meet the bound.
+//
+// Quiet: each pair must start on an idle channel. Each channel has its own
+// slot grid and loop, so only the same channel's previous pair matters; the
+// test waits for that channel only, measured from when its previous pair's
+// second row reached the double. The wait is the sum of three parts, all
+// computed from the stack's own settings by dwQuiet:
+//   - one refill: a worker that lost the row to another claimer asks again
+//     one refill after its claim (settleEmpty's dueNow in internal/delivery),
+//     so the channel's last Take can come that long after the pair;
+//   - lead + horizon: the latest slot that Take can reserve
+//     (notification.Limiter.Take: none later than Lead+Horizon);
+//   - one refill: the worker's pause after a Take before it is idle again
+//     (channelLoop's pause).
+//
+// The lead used is its floor, leasebudget.AlignFloor. The lead stays at the
+// floor while this worker's claims on the channel stay under it
+// (claimLatency); on this idle stack they do: the start-up claims take about
+// 170 ms (record 0009), later claims tens of ms. A slower claim raises the
+// lead, and horizon = max(APP_RATE_LIMIT_HORIZON, lead) rises with it, so
+// the reservation grows by twice the rise. A quiet that is then too short
+// starts the pair on a channel that is not idle. That changes the case being
+// measured, so the quiet is logged.
 func TestGapDeliveryR7SecondRowAfterALoneSend(t *testing.T) {
 	const (
 		pairs   = 30
-		quiet   = 2 * time.Second
 		maxP99  = 100 * time.Millisecond
 		perSend = 5 * time.Second
 	)
 	s := startStack(t, stackOptions{Workers: 3})
+	quiet := s.dwQuiet(t)
 	chans := []string{"sms", "email", "push"}
+	lastPair := map[string]time.Time{} // per channel: when its last pair's final row reached the double
 	post := func(t *testing.T, ch, content string) (uuid.UUID, time.Time) {
 		t.Helper()
 		r, err := s.API.CreateNotificationWithResponse(t.Context(), nil, msg(ch, content))
@@ -108,12 +137,13 @@ func TestGapDeliveryR7SecondRowAfterALoneSend(t *testing.T) {
 		if _, ok := dlWaitProviderRequest(s, id.String(), 30*time.Second); !ok {
 			t.Fatalf("warm-up %s: %s not delivered within 30 s", ch, id)
 		}
+		lastPair[ch] = time.Now()
 	}
 
 	lat := make([]time.Duration, 0, pairs)
 	for i := range pairs {
-		dlWaitUntil(time.Now().Add(quiet))
 		ch := chans[i%len(chans)]
+		dlWaitUntil(lastPair[ch].Add(quiet))
 		first, _ := post(t, ch, fmt.Sprintf("R7 tail lone %d", i))
 		if _, ok := dlWaitProviderRequest(s, first.String(), perSend); !ok {
 			t.Fatalf("pair %d (%s): the lone send %s not delivered within %s", i, ch, first, perSend)
@@ -123,14 +153,41 @@ func TestGapDeliveryR7SecondRowAfterALoneSend(t *testing.T) {
 		if !ok {
 			t.Fatalf("pair %d (%s): the second row %s not delivered within %s", i, ch, second, perSend)
 		}
+		lastPair[ch] = time.Now()
 		lat = append(lat, req.ReceivedAt.Sub(created))
 	}
 	slices.Sort(lat)
 	p50, p99 := dlNearestRank(lat, 50), dlNearestRank(lat, 99)
-	t.Logf("second row after a lone send, 201 -> provider, %d pairs: p50 %s, p99 %s, max %s", pairs, p50, p99, lat[len(lat)-1])
+	t.Logf("second row after a lone send, 201 -> provider, %d pairs, %s per-channel quiet: p50 %s, p99 %s, max %s",
+		pairs, quiet, p50, p99, lat[len(lat)-1])
 	if p99 > maxP99 {
 		t.Errorf("p99 %s, want <= %s", p99, maxP99)
 	}
+}
+
+// dwQuiet is how long a channel must be left alone after a pair before the
+// next pair finds it idle (see TestGapDeliveryR7SecondRowAfterALoneSend):
+// refill + lead + horizon + refill, with the lead at its floor. The horizon
+// comes from config.Load over the stack's own environment, so it is the value
+// the workers run with (the harness leaves APP_RATE_LIMIT_HORIZON at its
+// default). refill is half the horizon, as internal/delivery's refill
+// computes it.
+func (s *stack) dwQuiet(t *testing.T) time.Duration {
+	t.Helper()
+	vars := map[string]string{}
+	for _, kv := range s.env {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			vars[k] = v
+		}
+	}
+	cfg, err := config.Load(func(k string) string { return vars[k] })
+	if err != nil {
+		t.Fatalf("config.Load over the stack's environment: %v", err)
+	}
+	lead := leasebudget.AlignFloor
+	horizon := max(cfg.RateLimitHorizon, lead) // internal/delivery's Worker.horizon
+	refill := cfg.RateLimitHorizon / 2         // internal/delivery's refill
+	return refill + lead + horizon + refill
 }
 
 // dlWaitProviderRequest polls the provider double every 5 ms until it has a

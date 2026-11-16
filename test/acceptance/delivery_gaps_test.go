@@ -243,12 +243,36 @@ func TestGapDeliveryR12AttemptsAccountedExactly(t *testing.T) {
 		}
 	}
 	outcomes := s.dgGroupCount(t, "SELECT outcome, COUNT(*) FROM delivery_attempts GROUP BY outcome")
-	t.Logf("double responses %v; stored outcomes %v", responses, outcomes)
-	if responses[202] != outcomes["accepted"] {
-		t.Errorf("202 responses %d != accepted rows %d", responses[202], outcomes["accepted"])
+	// Rows by what the worker heard: the HTTP status it recorded, or
+	// "timeout" for a transient row with no status (the call ended without a
+	// response in hand).
+	heard := s.dgGroupCount(t, "SELECT CASE WHEN http_status IS NULL THEN 'timeout' ELSE CAST(http_status AS CHAR) END, COUNT(*) "+
+		"FROM delivery_attempts WHERE outcome = 'transient' GROUP BY 1")
+	t.Logf("double responses %v; stored outcomes %v; transient rows by status %v", responses, outcomes, heard)
+	// Decision 0005: a call that may have been sent is one attempt. A call
+	// whose timer fires after its request was written (a descheduled worker
+	// under load) reaches the double and is answered 202 or 503, while the
+	// worker records a timeout: transient with no HTTP status. Responses and
+	// rows can then differ by such timeouts, and only by them. The exact
+	// per-notification rows == requests check above is unchanged. Here no
+	// row records an answer the double did not give, and every answer the
+	// worker did not record is a timeout row, or an unknown row (a lease
+	// that ran out mid-call, which 0005 also counts as an attempt).
+	if outcomes["accepted"] > responses[202] {
+		t.Errorf("accepted rows %d > 202 responses %d", outcomes["accepted"], responses[202])
 	}
-	if responses[503] != outcomes["transient"] {
-		t.Errorf("503 responses %d != transient rows %d", responses[503], outcomes["transient"])
+	if heard["503"] > responses[503] {
+		t.Errorf("transient rows with HTTP 503 %d > 503 responses %d", heard["503"], responses[503])
+	}
+	unheard := responses[202] - outcomes["accepted"] + responses[503] - heard["503"]
+	if heard["timeout"]+outcomes["unknown"] != unheard {
+		t.Errorf("timeout rows %d + unknown rows %d != responses the worker did not record %d (202: %d - %d accepted; 503: %d - %d transient with HTTP 503)",
+			heard["timeout"], outcomes["unknown"], unheard, responses[202], outcomes["accepted"], responses[503], heard["503"])
+	}
+	for st, k := range heard {
+		if st != "503" && st != "timeout" {
+			t.Errorf("%d transient rows with HTTP status %s; only 503 or none was expected", k, st)
+		}
 	}
 	if responses[503] == 0 {
 		t.Errorf("no 503 was injected; the fault did not fire")
