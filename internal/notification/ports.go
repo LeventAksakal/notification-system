@@ -129,14 +129,37 @@ type Grant struct {
 // interval apart across all workers, so the provider sees an even stream
 // whatever the workers' own timing is.
 type Limiter interface {
-	// Take reserves up to n consecutive send slots on a channel, none further
-	// ahead than the limiter's horizon. A slot that is not used is lost; a
-	// request must never leave before its slot, nor more than one interval
-	// after it, whatever the reply's delay was. An error means the limiter is
-	// unreachable: the caller sends nothing (fail closed). With n = 0 nothing
-	// is reserved and the grant still carries At: a reading of the limiter's
-	// clock that costs no slot.
-	Take(ctx context.Context, channel Channel, n int) (Grant, error)
+	// Take reserves up to r.N consecutive send slots on a channel, none later
+	// than r.Lead+r.Horizon after the limiter's now. A slot that is not used is lost; a request
+	// must never leave before its slot, nor more than one interval after it,
+	// whatever the reply's delay was. An error means the limiter is
+	// unreachable: the caller sends nothing (fail closed). With r.N = 0
+	// nothing is reserved and the grant still carries At: a reading of the
+	// limiter's clock that costs no slot.
+	Take(ctx context.Context, channel Channel, r SlotRequest) (Grant, error)
+	// GiveBack returns what is left of grant g from the moment from (on the
+	// limiter's clock) on: if no slot was reserved on the channel after g,
+	// the channel's next free slot moves back to from, so the next Take
+	// gets it, or finds the grid free since then when it has passed. The
+	// caller sends nothing at or after from on g's account, and every
+	// request it did send on g leaves before from. It reports whether the
+	// slots were given back; false or an error only leaves them unused.
+	GiveBack(ctx context.Context, channel Channel, g Grant, from time.Time) (bool, error)
+}
+
+// SlotRequest is what one Take asks for.
+type SlotRequest struct {
+	// N is the most slots wanted.
+	N int
+	// Lead is the time the caller needs between asking and sending (its
+	// claim of rows for the slots). A free grid (no slot reserved after now)
+	// restarts at now+Lead; a busy grid continues at its next free slot even
+	// when that is sooner, since skipping ahead would leave a gap the other
+	// callers cannot fill. Slots are send moments, so callers with different
+	// leads still share one grid one interval apart.
+	Lead time.Duration
+	// Horizon is how far past Lead slots may be reserved.
+	Horizon time.Duration
 }
 
 // Event is one committed status change, as subscribers see it (decision 0013).

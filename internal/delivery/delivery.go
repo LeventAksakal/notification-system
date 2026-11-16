@@ -6,8 +6,9 @@
 // its slot. It classifies the answer and writes the result.
 //
 // Timing of one job: the slot comes from the limiter (Valkey's clock, exactly
-// one interval apart across all workers); the request leaves at slot +
-// SendAlign, never earlier. The slot is mapped to the local clock through the
+// one interval apart across all workers), reserved a lead ahead that follows
+// the worker's measured claim time (lead); the request leaves at its slot,
+// never earlier. The slot is mapped to the local clock through the
 // offset learnt from every Take's round trip (clockMap), never from the moment
 // the reply arrived, so a late reply does not shift its group late. A job that
 // cannot leave within one interval of that moment (slow claim, no free
@@ -23,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 
@@ -63,16 +65,14 @@ type Config struct {
 	ShutdownTimeout time.Duration // APP_SHUTDOWN_TIMEOUT
 	Weights         [3]int        // APP_PRIORITY_WEIGHTS
 	Channels        []notification.Channel
-	// Horizon is APP_RATE_LIMIT_HORIZON: how far ahead slots are reserved;
-	// the limiter is built with the same value. Default 200ms.
+	// Horizon is APP_RATE_LIMIT_HORIZON: the least span of slots one Take
+	// reserves past the lead (see horizon). Default 200ms.
 	Horizon time.Duration
-	// SendAlign is added to every slot (default DefaultSendAlign). It is the
-	// time a claim may take: slots are reserved before the claim, so the
-	// first slot of a group can be due at once; without the offset a claim of
-	// 16 ms (50 ms at p99, 170 ms at start-up on the Docker setup) would miss
-	// most first slots. Every request is shifted by the same amount, so the
-	// spacing at the provider stays the limiter's.
-	SendAlign time.Duration
+	// AlignFloor and AlignCeiling bound the send alignment, the lead a
+	// group's first slot is reserved with (see lead). Defaults alignFloor and
+	// alignCeiling(Lease). Not operator dials: tests fix the alignment by
+	// setting both to one value.
+	AlignFloor, AlignCeiling time.Duration
 	// IdleMin and IdleMax bound the retry waits of a channel that cannot
 	// reserve now: IdleMin while all its provider calls are in flight (a call
 	// place frees within a call's time), and the clock probe's back-off from
@@ -94,9 +94,6 @@ type Config struct {
 	// themselves (decision 0026). 0: no spread.
 	HealthCooldown time.Duration
 }
-
-// DefaultSendAlign is SendAlign's default: above the claim's start-up p99.
-const DefaultSendAlign = 200 * time.Millisecond
 
 // Deps are the worker's collaborators.
 type Deps struct {
@@ -152,12 +149,16 @@ func New(cfg Config, deps Deps) *Worker {
 	if cfg.IdleMin <= 0 {
 		cfg.IdleMin = 50 * time.Millisecond
 	}
-	if cfg.SendAlign <= 0 {
-		cfg.SendAlign = DefaultSendAlign
-	}
 	if cfg.Horizon <= 0 {
 		cfg.Horizon = 200 * time.Millisecond
 	}
+	if cfg.AlignFloor <= 0 {
+		cfg.AlignFloor = alignFloor
+	}
+	if cfg.AlignCeiling <= 0 {
+		cfg.AlignCeiling = alignCeiling(cfg.Lease)
+	}
+	cfg.AlignCeiling = max(cfg.AlignCeiling, cfg.AlignFloor)
 	if cfg.IdleMax < cfg.IdleMin {
 		cfg.IdleMax = max(250*time.Millisecond, cfg.IdleMin)
 	}
@@ -186,7 +187,9 @@ func New(cfg Config, deps Deps) *Worker {
 	for _, ch := range cfg.Channels {
 		gates[ch] = health.NewGate(deps.Health, ch)
 	}
-	return &Worker{cfg: cfg, deps: deps, gates: gates, clock: newClockMap(time.Now(), clockWindow, time.Second+cfg.Horizon+cfg.SendAlign), m: newMetrics(deps.Meter)}
+	// A placed slot waits at most the lead plus the horizon, both at their largest.
+	span := time.Second + cfg.AlignCeiling + max(cfg.Horizon, cfg.AlignCeiling)
+	return &Worker{cfg: cfg, deps: deps, gates: gates, clock: newClockMap(time.Now(), clockWindow, span), m: newMetrics(deps.Meter)}
 }
 
 // storeTimeout bounds one result write; it is not cut short by shutdown, so a
@@ -272,6 +275,9 @@ type channelRun struct {
 	// backlog would hand the last rows to later slots and leave earlier ones
 	// empty.
 	claiming chan struct{}
+	// latency is this worker's measured claim time on the channel: written
+	// by the claim in flight, read by the loop before each reservation.
+	latency claimLatency
 	// wake cuts the channel loop's idle wait short when a hint arrives.
 	wake chan struct{}
 
@@ -326,11 +332,6 @@ func (p callPlaces) take(ctx context.Context, deadline time.Time) (func(), bool)
 	}
 	return nil, false
 }
-
-// refill is how long after a reservation the next is asked for: by then half
-// the horizon can be reserved again, so one call reserves about Horizon/2 of
-// slots, and the reserved time never runs out while one worker is alive.
-func (w *Worker) refill() time.Duration { return max(w.cfg.Horizon/2, time.Millisecond) }
 
 // channelLoop reserves slots and hands each group to a claim task. It
 // reserves nothing while every priority is known to be empty, while the
@@ -394,7 +395,7 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			// a Take of no slots, which costs the other workers nothing, and
 			// reserve only once the offset is known well enough.
 			sent := time.Now()
-			g, err := w.deps.Limiter.Take(ctx, cr.ch, 0)
+			g, err := w.deps.Limiter.Take(ctx, cr.ch, notification.SlotRequest{})
 			got := time.Now()
 			if err != nil {
 				if ctx.Err() != nil {
@@ -460,13 +461,17 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			w.cancel(ctx, cr, first)
 			return
 		}
-		want := int(w.cfg.Horizon/interval) + 1
+		sent := time.Now()
+		lead := w.lead(cr)
+		horizon := w.horizon(lead)
+		want := int(horizon/interval) + 1
 		if first.Probe() {
 			want = 1 // the probe is one call
 		}
-		sent := time.Now()
-		g, err := w.deps.Limiter.Take(ctx, cr.ch, want)
+		g, err := w.deps.Limiter.Take(ctx, cr.ch, notification.SlotRequest{N: want, Lead: lead, Horizon: horizon})
 		got := time.Now()
+		slog.DebugContext(ctx, "send slots reserved", "channel", cr.ch, "lead_ms", lead.Milliseconds(), "horizon_ms", horizon.Milliseconds(),
+			"asked", want, "reserved", g.N, "first_ms", g.First.Milliseconds(), "wait_ms", g.Wait.Milliseconds())
 		if err != nil {
 			<-cr.claiming
 			w.cancel(ctx, cr, first)
@@ -481,7 +486,7 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		if g.Interval > 0 {
 			interval = g.Interval
 		}
-		pause := g.Wait + w.refill()
+		pause := g.Wait + refill(w.cfg.Horizon)
 		if first.Probe() {
 			pause = g.Wait
 		}
@@ -556,23 +561,25 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		for i := range tickets {
 			tickets[i] = first
 		}
-		base := w.clock.toLocal(g.At.Add(g.First), upper).Add(w.cfg.SendAlign)
+		base := w.clock.toLocal(g.At.Add(g.First), upper)
 		slots := make([]time.Time, len(tickets))
 		for i := range slots {
 			slots[i] = base.Add(time.Duration(i) * g.Interval)
 		}
 		tolerance := g.Interval - uncertainty // > 0: checked above
-		// The grid was free for SendAlign plus an interval: every request
-		// of an earlier slot left more than an interval before this group's
-		// first slot, lateness and clock offset included (see group.flex).
-		flex := g.Idle >= w.cfg.SendAlign+g.Interval
+		// The grid was free for an interval: every request of an earlier
+		// slot left more than an interval before the limiter's now of this
+		// grant, lateness and clock offset included (see group.flex).
+		notBefore := w.clock.toLocal(g.At, upper)
+		flex := g.Idle >= g.Interval
 		deferClaim := woke && !flex
 		woke = false
 		inflight.Add(1)
 		go func() { // owned by Run through inflight
 			defer inflight.Done()
 			defer func() { <-cr.claiming }()
-			w.claimGroup(ctx, sendCtx, cr, group{slots: slots, tickets: tickets, tolerance: tolerance, gen: gen, flex: flex, deferClaim: deferClaim}, inflight)
+			w.claimGroup(ctx, sendCtx, cr, group{slots: slots, tickets: tickets, tolerance: tolerance, gen: gen,
+				asked: sent, lead: lead, horizon: horizon, notBefore: notBefore, flex: flex, deferClaim: deferClaim, grant: g}, inflight)
 		}()
 		sleep(ctx, time.Until(got.Add(pause)))
 	}
@@ -595,60 +602,71 @@ func (w *Worker) logClockStep(ctx context.Context, ch notification.Channel, r cl
 }
 
 // group is one grant's slots as placed on the local clock: their moments,
-// health tickets, how late each may leave, and the clock mapping's
-// generation they were placed under.
+// health tickets, how late each may leave, the clock mapping's generation
+// they were placed under, and when they were asked for (where the claim time
+// that claimLatency measures starts).
 type group struct {
 	slots     []time.Time
 	tickets   []health.Ticket
 	tolerance time.Duration
 	gen       uint64
-	// flex: the limiter's grid had been free for at least SendAlign plus one
-	// interval before this grant (Grant.Idle), so the group may leave as soon
-	// as it is claimed instead of SendAlign after its slots, never before
-	// them. It does so only when its claim found fewer rows than slots: the
-	// backlog ended within the group, and the slots after its rows go unused
-	// either way. A full group keeps its moments, because the next grant
-	// (Idle 0) keeps SendAlign, and moving the full group earlier would leave
-	// a hole of up to SendAlign between the two on a channel with a backlog
-	// (measured: R9 low alone fell to 91.6/s against its floor of 93). Why the
-	// cap holds, all times on Valkey's clock (V), I the
-	// interval, A SendAlign, T the TAT before this grant:
+	asked     time.Time
+	// grant is the limiter's grant the slots come from: slot k is its slot
+	// k. The slots no row went to are given back through it (giveBack).
+	grant notification.Grant
+	// lead and horizon are what the grant was asked with.
+	lead, horizon time.Duration
+	// notBefore is the limiter's now of the grant on the local clock, placed
+	// like the slots (never early on Valkey's clock): no flex send leaves
+	// before it.
+	notBefore time.Time
+	// flex: the limiter's grid had been free for at least one interval
+	// before this grant (Grant.Idle), so the group may leave as soon as it
+	// is claimed instead of at its slots, never before notBefore. On a free
+	// grid the first slot is the lead after the limiter's now, and the lead
+	// is the p95 of this worker's claims, so most claims return before it:
+	// flex sends them on at once. It does so only when its claim found fewer
+	// rows than slots: the backlog ended within the group, and the slots
+	// after its rows go unused either way. A full group keeps its moments,
+	// because the next grant continues the busy grid right after them, and
+	// moving the full group earlier would leave a hole of up to the lead
+	// between the two on a channel with a backlog (measured with the fixed
+	// 200 ms alignment: R9 low alone fell to 91.6/s against its floor of
+	// 93). Why the cap holds, all times on Valkey's clock (V), I the
+	// interval, T the TAT before this grant, N the limiter's now of it:
 	//  - Allowed lateness and clock offset. A worker places a slot with the
 	//    upper bound of its offset to V (clockMap), so on V it is never early
 	//    and at most that worker's uncertainty u late; the send then leaves
 	//    within its tolerance, I - u. So a request of slot s leaves in
-	//    [s+A, s+A+I) on V, whichever worker sends it and whatever its
-	//    offset, as long as the offset lies in the bounds clockMap keeps
-	//    (a step outside them voids the generation, as before). The offset
-	//    is inside the margin by construction.
+	//    [s, s+I) on V, whichever worker sends it and whatever its offset, as
+	//    long as the offset lies in the bounds clockMap keeps (a step outside
+	//    them voids the generation, as before). notBefore is placed the same
+	//    way, so a flex send is never before N on V.
 	//  - Earlier grants: their last slot is at most T-I, so every request of
-	//    theirs has left before T+A on V, the latest one included.
-	//  - Idle is now-T, both read by the limiter on V: no worker clock in it.
-	//    Idle >= A+I puts this group's first slot at T+A+I or later on V, and
-	//    the group never leaves before its slots: the first flex send comes
-	//    more than I after the last earlier send. The unbroken grid only
+	//    theirs has left before T on V, the latest one included.
+	//  - Idle is N-T, both read by the limiter on V: no worker clock in it.
+	//    Idle >= I puts N, and so the first flex send, at T+I or later: more
+	//    than I after the last earlier send. The unbroken grid only
 	//    guarantees a gap above 0 between neighbours (a late send, then its
 	//    successor on time); the seam is sparser than the grid, so no second
-	//    holds more than on a busy channel. A threshold of A+2I would buy a
-	//    gap above 2I that nothing needs.
+	//    holds more than on a busy channel.
 	//  - Within the group the slots move together, I apart, and each still
 	//    leaves in [slot, slot+I) on V. Later grants' slots start I after
 	//    this group's last unmoved slot; this group only left earlier, so
 	//    the gap grows, and a later flex grant repeats this argument with
 	//    this group as the earlier one (its sends end before its unmoved
-	//    slots + A + I, the same bound).
+	//    last slot + I, the TAT that grant sees).
 	flex bool
 	// deferClaim: the group is not flex but its worker has just woken from
-	// idle, so another worker woken by the same hint holds the flex group
-	// just ahead of it (19 slots of 10.5 ms end 10 us past the 200 ms
-	// horizon, so the next taker gets one slot right after them). Both would
-	// claim at once and SKIP LOCKED gives the row to whichever locks first:
-	// measured on the harness, the hinted row then left with this group
-	// SendAlign later (~400 ms) in about half the samples. Its claim waits
-	// until its first slot, which still leaves SendAlign (the time a claim
-	// may take) before its first send, so the flex worker claims first. Its
-	// own sends keep their moments; a busy channel never defers (woke is
-	// false).
+	// idle, so another worker woken by the same hint may hold the flex group
+	// just ahead of it, ending a few microseconds past its horizon, so the
+	// next taker gets the slots right after them. Both would claim at once
+	// and SKIP LOCKED gives the row to whichever locks first: measured on the
+	// harness with the fixed 200 ms alignment, the hinted row then left with
+	// this group about 400 ms after its creation in about half the samples.
+	// Its claim waits until its first slot less its lead (the time its
+	// claims take), so the flex worker claims first. Its own sends keep
+	// their moments; a busy channel never defers (woke is false).
 	deferClaim bool
 }
 
@@ -671,7 +689,8 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr gro
 		return true
 	}
 	if gr.deferClaim {
-		sleep(ctx, time.Until(slots[0].Add(-w.cfg.SendAlign)))
+		sleep(ctx, time.Until(slots[0].Add(-gr.lead)))
+		gr.asked = time.Now() // the wait is not claim time (claimLatency)
 	}
 	if stepped() {
 		return
@@ -685,26 +704,38 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr gro
 		w.m.gaveUp(ctx, cr.ch, giveUpSlotMissed, i-from)
 	}
 	skipMissed(time.Now())
-	jobs, drained, r, err := w.claim(ctx, cr, len(slots)-i)
+	jobs, drained, polled, r, queried, err := w.claim(ctx, cr, len(slots)-i)
 	if err != nil && ctx.Err() == nil {
 		slog.ErrorContext(ctx, "claim failed", "channel", cr.ch, "err", err)
 		cr.pause(time.Now().Add(w.cfg.IdleMax))
 	}
+	if queried && err == nil {
+		cr.latency.observe(time.Since(gr.asked))
+	}
+	var moved time.Duration // how much earlier than its slots the group leaves
 	if gr.flex && len(jobs) > 0 && len(jobs) < len(slots)-i {
 		// The backlog ended within this group: leave right after the
-		// claim, never before the slot (group.flex).
-		now := time.Now()
-		if d := slots[i].Sub(later(slots[i].Add(-w.cfg.SendAlign), now)); d > 0 {
+		// claim, never before notBefore (group.flex).
+		if d := slots[i].Sub(later(gr.notBefore, time.Now())); d > 0 {
+			moved = d
 			for k := i; k < len(slots); k++ {
 				slots[k] = slots[k].Add(-d)
 			}
 		}
 	}
 	skipMissed(time.Now())
+	slog.DebugContext(ctx, "group claimed", "channel", cr.ch, "since_asked_ms", time.Since(gr.asked).Milliseconds(),
+		"slots", len(slots), "slots_missed", i, "rows", len(jobs), "flex", gr.flex)
 	if len(drained) > 0 && err == nil {
 		// After the sends are started, so the database read costs them
 		// nothing; still inside the round (claiming is held).
-		defer w.settleEmpty(ctx, cr, drained, r, w.refill())
+		defer w.settleEmpty(ctx, cr, drained, r, refill(w.cfg.Horizon))
+	}
+	if len(polled) > 0 && err == nil {
+		// The priorities the claim did not ask (claim): asked when their
+		// next row is due, also after the sends are started, and claimed by
+		// the next round if one is due now.
+		defer w.settleEmpty(ctx, cr, polled, r, 0)
 	}
 	voided := stepped() // the claimed rows then all go back below
 	// The group's claims are announced in one publish, beside the sends: a
@@ -745,6 +776,12 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr gro
 			defer inflight.Done()
 			w.sendAt(ctx, jctx, cr, job, announced, at, tk, tolerance, gr.gen)
 		}()
+	}
+	if !voided && i < gr.grant.N {
+		// Slot i is the first no request went to: every request sent on
+		// this grant leaves before it, moved as the group was.
+		from := gr.grant.At.Add(gr.grant.First + time.Duration(i)*gr.grant.Interval - moved)
+		w.giveBack(ctx, cr, gr.grant, from, gr.grant.N-i)
 	}
 	for ; i < len(slots); i++ {
 		w.cancel(ctx, cr, tickets[i])
@@ -824,6 +861,9 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job notificat
 		w.release(jctx, job, announced, "provider outage declared before the send")
 		return
 	}
+	// Slot and leaving moment on this process's clock: beside the provider's
+	// arrival times they tell a dense grid from requests bunched in transit.
+	slog.DebugContext(jctx, "request leaving", "channel", cr.ch, "id", job.ID, "slot_us", at.UnixMicro(), "leave_us", time.Now().UnixMicro())
 	w.deliver(jctx, job, announced, cr.gate, tk, callDone)
 }
 
@@ -842,30 +882,44 @@ func (cr *channelRun) pause(until time.Time) {
 // low goes up to the priorities that may have more. It returns the priorities
 // that returned fewer rows than asked (drained) and the round they belong to:
 // the caller settles them with settleEmpty once the sends are started.
-func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]notification.Job, []int, round, error) {
+// queried reports whether the database was asked at all.
+//
+// A priority is not asked only to fill slots another could not use when it
+// is known to be empty, its safety poll is due, or it was never answered for
+// (selector.known: a priority with no weight is reached only that way). Each
+// such ask is one more claim query in the same claim, and while the database
+// is slow (owner item 0011: 1.6 s a query) one short priority tripled the
+// claim time, every worker missed its whole group at once and the channel
+// stopped for 4 s. Those priorities are returned in polled instead: the
+// caller asks Queue.NextDue for them after the sends are started, and the
+// next round claims one that has a row due.
+func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) (jobs []notification.Job, drained, polled []int, r round, queried bool, err error) {
 	if n <= 0 {
-		return nil, nil, round{}, nil
+		return nil, nil, nil, round{}, false, nil
 	}
 	now := time.Now()
 	cr.mu.Lock()
-	r := cr.sel.beginRound()
+	r = cr.sel.beginRound()
 	counts := cr.sel.plan(n, now)
-	var empty [3]bool
+	var empty, unknown [3]bool
 	for i := range empty {
 		empty[i] = cr.sel.empty(i, now)
+		unknown[i] = !cr.sel.known[i]
 	}
+	_, polled = cr.sel.due(now) // safety polls due: NextDue, not claimed
 	cr.mu.Unlock()
 
-	var jobs []notification.Job
-	var drained [3]bool // asked and got fewer than asked
+	var short [3]bool // asked and got fewer than asked
 	ask := func(i, k int) (int, error) {
+		queried = true
+		unknown[i] = false
 		got, err := w.deps.Queue.Claim(ctx, cr.ch, priorityName(i), k, w.cfg.Lease)
 		if err != nil {
 			return 0, err
 		}
 		jobs = append(jobs, got...)
 		if len(got) < k {
-			drained[i] = true
+			short[i] = true
 		} else {
 			cr.mu.Lock()
 			cr.sel.markBusy(i)
@@ -873,8 +927,14 @@ func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]notificati
 		}
 		return len(got), nil
 	}
+	// lookUp records that a borrowed slot skipped priority i because it was
+	// never answered for: NextDue answers it after the claim.
+	lookUp := func(i int) {
+		if !slices.Contains(polled, i) {
+			polled = append(polled, i)
+		}
+	}
 	carry := 0
-	var err error
 	for i := range 3 {
 		k := counts[i] + carry
 		carry = 0
@@ -885,6 +945,11 @@ func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]notificati
 			carry = k
 			continue
 		}
+		if counts[i] == 0 && unknown[i] {
+			carry = k
+			lookUp(i)
+			continue
+		}
 		var got int
 		if got, err = ask(i, k); err != nil {
 			break
@@ -892,7 +957,11 @@ func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]notificati
 		carry = k - got
 	}
 	for i := 2; err == nil && i >= 0 && carry > 0; i-- {
-		if empty[i] || drained[i] {
+		if empty[i] || short[i] {
+			continue
+		}
+		if unknown[i] {
+			lookUp(i)
 			continue
 		}
 		var got int
@@ -901,13 +970,12 @@ func (w *Worker) claim(ctx context.Context, cr *channelRun, n int) ([]notificati
 		}
 		carry -= got
 	}
-	var short []int
-	for i, d := range drained {
+	for i, d := range short {
 		if d {
-			short = append(short, i)
+			drained = append(drained, i)
 		}
 	}
-	return jobs, short, r, err
+	return jobs, drained, polled, r, queried, err
 }
 
 // settleEmpty asks the database when the channel's next notification of each
@@ -1277,6 +1345,27 @@ func sleep(ctx context.Context, d time.Duration) {
 
 // String is for logs of a worker's configuration.
 func (c Config) String() string {
-	return fmt.Sprintf("concurrency=%d max_attempts=%d weights=%v horizon=%s send_align=%s",
-		c.Concurrency, c.MaxAttempts, c.Weights, c.Horizon, c.SendAlign)
+	return fmt.Sprintf("concurrency=%d max_attempts=%d weights=%v horizon=%s send_align=[%s,%s]",
+		c.Concurrency, c.MaxAttempts, c.Weights, c.Horizon, c.AlignFloor, c.AlignCeiling)
+}
+
+// giveBack returns the unused slots of grant g, n of them, from the moment
+// from on (the limiter's clock) to the limiter, when the claim found fewer
+// rows than slots, or none: the next
+// Take, of any worker, then gets them instead of slots up to a horizon
+// further out, and a row due right after a backlog ended finds the grid free
+// (group.flex) rather than behind the unused reservation. It is one Valkey
+// call per group that ended a backlog, made while the channel's claiming
+// place is still held, so this worker's next Take sees its effect. A failure
+// only leaves the slots unused, as they were before.
+// A group sent early (group.flex) gives back from where its sends ended, not
+// from its unused slot: a row due right after a lone send then waits about
+// one interval, not a lead plus a horizon.
+func (w *Worker) giveBack(ctx context.Context, cr *channelRun, g notification.Grant, from time.Time, n int) {
+	ok, err := w.deps.Limiter.GiveBack(ctx, cr.ch, g, from)
+	if err != nil && ctx.Err() == nil {
+		slog.WarnContext(ctx, "giving unused send slots back failed", "channel", cr.ch, "slots", n, "err", err)
+		return
+	}
+	slog.DebugContext(ctx, "unused send slots given back", "channel", cr.ch, "slots", n, "given_back", ok)
 }

@@ -173,19 +173,23 @@ type delayedLimiter struct {
 	// reportIdle passes the grid's Grant.Idle on; false reports a busy grid.
 	reportIdle bool
 
-	mu    sync.Mutex
-	k     int
-	slots []time.Time
+	mu     sync.Mutex
+	k      int
+	slots  []time.Time
+	grants []int // slots of each grant that reserved any, in order
 }
 
-func (l *delayedLimiter) Take(ctx context.Context, ch notification.Channel, n int) (notification.Grant, error) {
-	g, err := l.grid.Take(ctx, ch, n)
+func (l *delayedLimiter) Take(ctx context.Context, ch notification.Channel, r notification.SlotRequest) (notification.Grant, error) {
+	g, err := l.grid.Take(ctx, ch, r)
 	if err != nil {
 		return g, err
 	}
 	l.mu.Lock()
 	for i := range g.N {
 		l.slots = append(l.slots, l.grid.local(g.At.Add(g.First+time.Duration(i)*g.Interval)))
+	}
+	if g.N > 0 {
+		l.grants = append(l.grants, g.N)
 	}
 	d := l.delays[l.k%len(l.delays)]
 	l.k++
@@ -195,12 +199,16 @@ func (l *delayedLimiter) Take(ctx context.Context, ch notification.Channel, n in
 		return notification.Grant{}, err // as the real limiter: a cut call has no reply
 	}
 	if !l.reportIdle {
-		// A grid that is never idle keeps every group on the fixed SendAlign
+		// A grid that is never idle keeps every group at its slots, which
 		// these tests measure against; groups sent early after an idle grid
 		// are tested on their own (TestAGroupSentEarlyAfterIdleKeepsSendsOneIntervalApart).
 		g.Idle = 0
 	}
 	return g, nil
+}
+
+func (l *delayedLimiter) GiveBack(ctx context.Context, ch notification.Channel, g notification.Grant, from time.Time) (bool, error) {
+	return l.grid.GiveBack(ctx, ch, g, from)
 }
 
 func (l *delayedLimiter) handedOut() []time.Time {
@@ -231,7 +239,7 @@ func (s *timedSender) times() []time.Time {
 }
 
 // R8 under a late limiter reply: every request leaves at or after its slot
-// (+ SendAlign) and at most one interval after it, however late the reply
+// and at most one interval after it, however late the reply
 // carrying the slot arrived.
 func TestWorkerSendsWithinOneIntervalOfItsSlotWhateverTheReplyDelay(t *testing.T) {
 	const interval, delay = 20 * time.Millisecond, 80 * time.Millisecond
@@ -245,7 +253,7 @@ func TestWorkerSendsWithinOneIntervalOfItsSlotWhateverTheReplyDelay(t *testing.T
 	cfg := testConfig()
 	cfg.Channels = []notification.Channel{notification.ChannelSMS}
 	cfg.Horizon = 100 * time.Millisecond
-	cfg.SendAlign = 150 * time.Millisecond // above the delay: late groups lose no slot
+	cfg.AlignFloor, cfg.AlignCeiling = 150*time.Millisecond, 150*time.Millisecond // above the delay: late groups lose no slot
 	stop := run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: snd}))
 	waitFor(t, "all 40 sent", func() bool { return q.count(notification.StatusSent) == 40 })
 	if err := stop(); err != nil {
@@ -255,28 +263,30 @@ func TestWorkerSendsWithinOneIntervalOfItsSlotWhateverTheReplyDelay(t *testing.T
 	sends, slots := snd.times(), lim.handedOut()
 	slices.SortFunc(sends, func(a, b time.Time) int { return a.Compare(b) })
 	slices.SortFunc(slots, func(a, b time.Time) int { return a.Compare(b) })
-	// Match each send to the earliest unused slot whose window [slot+align,
-	// slot+align+interval+margin] holds it; slots whose window passed unused
+	// Match each send to the earliest unused slot whose window [slot,
+	// slot+interval+margin] holds it; slots whose window passed unused
 	// were given up. Equal windows make the greedy match exact.
 	j := 0
 	var worst time.Duration
 	for n, s := range sends {
-		for j < len(slots) && s.After(slots[j].Add(cfg.SendAlign+interval+margin)) {
+		for j < len(slots) && s.After(slots[j].Add(interval+margin)) {
 			j++
 		}
-		if j == len(slots) || s.Before(slots[j].Add(cfg.SendAlign)) {
+		if j == len(slots) || s.Before(slots[j]) {
 			t.Fatalf("send %d at %s has no slot: it left early or later than one interval (+%s) after every free slot",
 				n, s.Sub(sends[0]), margin)
 		}
-		worst = max(worst, s.Sub(slots[j].Add(cfg.SendAlign)))
+		worst = max(worst, s.Sub(slots[j]))
 		j++
 	}
-	t.Logf("%d sends on %d slots; latest send %s after its slot + SendAlign (interval %s)", len(sends), len(slots), worst, interval)
+	t.Logf("%d sends on %d slots; latest send %s after its slot (interval %s)", len(sends), len(slots), worst, interval)
 }
 
 // R8 with a group sent early after an idle grid (group.flex): no request
-// leaves before its slot, and the requests are no denser than the grid allows,
-// the early group and the fixed-alignment groups of the burst right behind it
+// leaves before its grant was made (its slot less the lead: on a free grid the
+// first slot is the lead after the limiter's now), and the requests are no
+// denser than the grid allows,
+// the early group and the groups of the burst right behind it
 // alike, whether the limiter's reply is prompt or late. The grid's guarantee
 // is that each request leaves within one interval of its own moment, and the
 // moments are an interval apart: so a request leaves more than one interval
@@ -295,7 +305,7 @@ func TestAGroupSentEarlyAfterIdleKeepsSendsOneIntervalApart(t *testing.T) {
 			cfg := idleConfig()
 			cfg.Channels = []notification.Channel{notification.ChannelSMS}
 			cfg.Horizon = 100 * time.Millisecond
-			cfg.SendAlign = 150 * time.Millisecond // above the delay: late groups lose no slot
+			cfg.AlignFloor, cfg.AlignCeiling = 150*time.Millisecond, 150*time.Millisecond // a lead above the delay: late groups lose no slot
 			start := time.Now()
 			stop := run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: snd, Wakes: fw}))
 			waitFor(t, "the first send", func() bool { return len(snd.times()) > 0 })
@@ -308,19 +318,36 @@ func TestAGroupSentEarlyAfterIdleKeepsSendsOneIntervalApart(t *testing.T) {
 			sends, slots := snd.times(), lim.handedOut()
 			slices.SortFunc(sends, func(a, b time.Time) int { return a.Compare(b) })
 			slices.SortFunc(slots, func(a, b time.Time) int { return a.Compare(b) })
-			if first := sends[0].Sub(start); first >= cfg.SendAlign {
-				t.Fatalf("first send after %s: the idle grid's group should leave before SendAlign (%s)", first, cfg.SendAlign)
+			if first := sends[0].Sub(start); first >= cfg.AlignFloor {
+				t.Fatalf("first send after %s: the idle grid's group should leave before its first slot, the lead (%s) out", first, cfg.AlignFloor)
 			}
 			for i := 2; i < len(sends); i++ {
 				if gap := sends[i].Sub(sends[i-2]); gap < interval-margin {
 					t.Fatalf("sends %d and %d are %s apart, want more than one interval (%s, less %s jitter) between a send and the one two before it", i-2, i, gap, interval, margin)
 				}
 			}
-			// Each send is matched to a distinct slot at or before it.
+			// The first grant is the flex group's (the three rows there at
+			// start): its sends leave before their slots, never before the
+			// grant. Every later send is matched to a distinct slot of the
+			// later grants at or before it.
+			lim.mu.Lock()
+			flexN := lim.grants[0]
+			lim.mu.Unlock()
+			flexSlots, later := slots[:0:0], lim.handedOut()[flexN:]
+			flexSlots = append(flexSlots, lim.handedOut()[:3]...)
+			slices.SortFunc(later, func(a, b time.Time) int { return a.Compare(b) })
+			for n, s := range sends[:3] {
+				if s.Before(flexSlots[n].Add(-cfg.AlignFloor)) {
+					t.Fatalf("flex send %d at %s: before its grant", n, s.Sub(start))
+				}
+			}
 			j := 0
-			for n, s := range sends {
-				if j == len(slots) || s.Before(slots[j]) {
-					t.Fatalf("send %d at %s: before its slot", n, s.Sub(start))
+			for n, s := range sends[3:] {
+				for j < len(later) && later[j].After(s) {
+					t.Fatalf("send %d at %s: before its slot (%s)", n+3, s.Sub(start), later[j].Sub(start))
+				}
+				if j == len(later) {
+					t.Fatalf("send %d at %s: no slot left for it", n+3, s.Sub(start))
 				}
 				j++
 			}
@@ -330,13 +357,14 @@ func TestAGroupSentEarlyAfterIdleKeepsSendsOneIntervalApart(t *testing.T) {
 
 // R9 after an idle grid: the first group of a backlog finds a row for every
 // slot, so it keeps its moments and the grid stays in use from it to the next
-// group. Sent early, it would leave a hole of up to SendAlign before the next
-// group, which keeps SendAlign (measured on the stack: low alone fell to 91.6
-// requests per second against R9's floor of 93).
+// group. Sent early, it would leave a hole of up to the lead before the next
+// group, which continues the grid at its slots (measured on the stack with the
+// fixed 200 ms alignment: low alone fell to 91.6 requests per second against
+// R9's floor of 93).
 func TestABacklogAfterAnIdleGridLeavesNoSlotUnused(t *testing.T) {
 	const interval = 20 * time.Millisecond
 	// A slot missed under load leaves a gap of an interval or two; the hole
-	// this test is about is SendAlign long.
+	// this test is about is the lead long (150 ms).
 	const hole = 150 * time.Millisecond / 2
 	q := newMemQueue()
 	q.add(30, notification.ChannelSMS, notification.PriorityLow)
@@ -345,7 +373,7 @@ func TestABacklogAfterAnIdleGridLeavesNoSlotUnused(t *testing.T) {
 	cfg := testConfig()
 	cfg.Channels = []notification.Channel{notification.ChannelSMS}
 	cfg.Horizon = 100 * time.Millisecond
-	cfg.SendAlign = 150 * time.Millisecond
+	cfg.AlignFloor, cfg.AlignCeiling = 150*time.Millisecond, 150*time.Millisecond
 	stop := run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: snd}))
 	waitFor(t, "all 30 sent", func() bool { return q.count(notification.StatusSent) == 30 })
 	if err := stop(); err != nil {
@@ -355,7 +383,7 @@ func TestABacklogAfterAnIdleGridLeavesNoSlotUnused(t *testing.T) {
 	slices.SortFunc(sends, func(a, b time.Time) int { return a.Compare(b) })
 	for i := 1; i < len(sends); i++ {
 		if gap := sends[i].Sub(sends[i-1]); gap >= hole {
-			t.Fatalf("sends %d and %d are %s apart (interval %s): a hole of half SendAlign or more, the slots between them went unused", i-1, i, gap, interval)
+			t.Fatalf("sends %d and %d are %s apart (interval %s): a hole of half the lead or more, the slots between them went unused", i-1, i, gap, interval)
 		}
 	}
 }
@@ -542,11 +570,15 @@ type recordingLimiter struct {
 	ns    []int
 }
 
-func (l *recordingLimiter) Take(ctx context.Context, ch notification.Channel, n int) (notification.Grant, error) {
+func (l *recordingLimiter) Take(ctx context.Context, ch notification.Channel, r notification.SlotRequest) (notification.Grant, error) {
 	l.mu.Lock()
-	l.ns = append(l.ns, n)
+	l.ns = append(l.ns, r.N)
 	l.mu.Unlock()
-	return l.inner.Take(ctx, ch, n)
+	return l.inner.Take(ctx, ch, r)
+}
+
+func (l *recordingLimiter) GiveBack(ctx context.Context, ch notification.Channel, g notification.Grant, from time.Time) (bool, error) {
+	return l.inner.GiveBack(ctx, ch, g, from)
 }
 
 func (l *recordingLimiter) asked() []int {
@@ -556,8 +588,8 @@ func (l *recordingLimiter) asked() []int {
 }
 
 // steppingLimiter is the Valkey limiter over a clock the test controls: GCRA
-// with burst 1 (consecutive slots one interval apart, at most horizon ahead;
-// a schedule found stale restarts at now). Its clock runs on the local
+// with burst 1 (consecutive slots one interval apart, at most lead+horizon
+// ahead; a schedule found stale restarts at now+lead). Its clock runs on the local
 // monotonic clock plus an offset that step moves, as Valkey's TIME does when
 // the VM it runs in catches its clock up after a stall.
 type steppingLimiter struct {
@@ -579,26 +611,27 @@ func (l *steppingLimiter) step(d time.Duration) {
 	l.offset += d
 }
 
-func (l *steppingLimiter) Take(_ context.Context, ch notification.Channel, n int) (notification.Grant, error) {
+func (l *steppingLimiter) Take(_ context.Context, ch notification.Channel, r notification.SlotRequest) (notification.Grant, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := remoteBase.Add(time.Since(l.start) + l.offset)
-	tat := l.tat[ch]
-	if tat.Before(now) {
-		tat = now // stale: the schedule restarts at now
-	}
-	first := tat.Sub(now)
-	k := 0
-	if first <= l.horizon {
-		k = min(int((l.horizon-first)/l.interval)+1, n)
-	}
-	tat = tat.Add(time.Duration(k) * l.interval)
+	// A stale schedule restarts at now+lead.
+	k, first, wait, tat, _ := gcraTake(l.tat[ch], now, l.interval, r, l.horizon)
 	l.tat[ch] = tat
-	var wait time.Duration
-	if k < n {
-		wait = max(tat.Sub(now)-l.horizon, 0)
-	}
 	return notification.Grant{N: k, At: now, First: first, Interval: l.interval, Wait: wait}, nil
+}
+
+// GiveBack moves the schedule back to from if it still ends at g, as the
+// Valkey limiter's script does.
+func (l *steppingLimiter) GiveBack(_ context.Context, ch notification.Channel, g notification.Grant, from time.Time) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	end := g.At.Add(g.First + time.Duration(g.N)*g.Interval)
+	if g.N <= 0 || !from.Before(end) || !l.tat[ch].Equal(end) {
+		return false, nil
+	}
+	l.tat[ch] = from
+	return true, nil
 }
 
 // busiestFrom is the most sends in any sliding second (sends sorted) and the
@@ -640,7 +673,7 @@ func TestWorkersHoldTheRateAcrossALimiterClockStep(t *testing.T) {
 	cfg := testConfig()
 	cfg.Channels = chans
 	cfg.Horizon = 100 * time.Millisecond
-	cfg.SendAlign = 100 * time.Millisecond
+	cfg.AlignFloor, cfg.AlignCeiling = 100*time.Millisecond, 100*time.Millisecond
 	var stops []func() error
 	for range 2 {
 		stops = append(stops, run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: snd, Meter: mp})))
@@ -764,7 +797,7 @@ func TestWorkersAcrossSmallLimiterClockSteps(t *testing.T) {
 			cfg := testConfig()
 			cfg.Channels = chans
 			cfg.Horizon = 100 * time.Millisecond
-			cfg.SendAlign = 100 * time.Millisecond
+			cfg.AlignFloor, cfg.AlignCeiling = 100*time.Millisecond, 100*time.Millisecond
 			var stops []func() error
 			for range 2 {
 				stops = append(stops, run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: snd, Meter: mp})))

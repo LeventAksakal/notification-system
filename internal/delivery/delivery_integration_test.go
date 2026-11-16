@@ -84,7 +84,7 @@ func TestWorkersHoldTheRateAtTheProvider(t *testing.T) {
 			Weights: [3]int{70, 20, 10}, Horizon: 200 * time.Millisecond,
 		}, delivery.Deps{
 			Queue:   &timedQueue{Queue: store.NewQueue(db), start: start},
-			Limiter: limiter.New(vk, limit, headroom, 200*time.Millisecond, "rate:"),
+			Limiter: limiter.New(vk, limit, headroom, "rate:"),
 			Sender:  provider.New(urls, 500*time.Millisecond, 32),
 			Health:  hs,
 		})

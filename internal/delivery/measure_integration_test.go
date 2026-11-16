@@ -145,7 +145,7 @@ func (r *rig) worker(t *testing.T, mp *sdkmetric.MeterProvider, lease time.Durat
 	}
 	deps := delivery.Deps{
 		Queue:   q,
-		Limiter: limiter.New(vk, 100, 5, 200*time.Millisecond, r.prefix),
+		Limiter: limiter.New(vk, 100, 5, r.prefix),
 		Sender:  provider.New(urls, 500*time.Millisecond, 32),
 		Health:  health.NewValkey(vk, health.Config{Failures: 5, Cooldown: 5 * time.Second}, r.prefix+"health:"),
 	}

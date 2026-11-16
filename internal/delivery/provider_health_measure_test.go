@@ -118,12 +118,12 @@ func TestMeasureProviderHealth(t *testing.T) {
 		defer vk.Close()
 		deps := measureVariant.deps(vk)
 		deps.Queue = store.NewQueue(db)
-		deps.Limiter = limiter.New(vk, 100, 5, 200*time.Millisecond, "rate:")
+		deps.Limiter = limiter.New(vk, 100, 5, "rate:")
 		deps.Sender = loggingSender{next: provider.New(urls, 5*time.Second, 32), worker: i, log: log}
 		cfg := delivery.Config{
 			Concurrency: 32, MaxAttempts: measureVariant.maxAttempts, RetryBase: time.Second, RetryCap: 5 * time.Minute,
 			Lease: 30 * time.Second, ReapInterval: 5 * time.Second, ShutdownTimeout: 5 * time.Second,
-			Weights: [3]int{70, 20, 10}, Horizon: 200 * time.Millisecond, SendAlign: delivery.DefaultSendAlign,
+			Weights: [3]int{70, 20, 10}, Horizon: 200 * time.Millisecond,
 		}
 		measureVariant.config(&cfg)
 		w := delivery.New(cfg, deps)

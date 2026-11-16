@@ -160,12 +160,11 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		ShutdownTimeout: cfg.ShutdownTimeout,
 		Weights:         cfg.PriorityWeights,
 		Horizon:         cfg.RateLimitHorizon,
-		SendAlign:       delivery.DefaultSendAlign,
 		ProviderTimeout: cfg.ProviderTimeout,
 		HealthCooldown:  cfg.BreakerCooldown,
 	}, delivery.Deps{
 		Queue:     store.NewQueue(db),
-		Limiter:   limiter.New(vk, cfg.RateLimitPerSecond, cfg.RateLimitHeadroomPct, cfg.RateLimitHorizon, "ratelimit:"),
+		Limiter:   limiter.New(vk, cfg.RateLimitPerSecond, cfg.RateLimitHeadroomPct, "ratelimit:"),
 		Sender:    provider.New(cfg.ProviderURLs, cfg.ProviderTimeout, cfg.WorkerConcurrency),
 		Publisher: realtime.NewPublisher(vk),
 		Health:    health.NewValkey(vk, health.Config{Failures: cfg.BreakerFailures, Cooldown: cfg.BreakerCooldown}, "health:"),

@@ -256,7 +256,7 @@ func TestAGroupAfterAnIdleGridLeavesAsSoonAsItIsClaimed(t *testing.T) {
 		busy bool // another worker holds slots just ahead
 	}{
 		{"idle grid: sent right after the claim", false},
-		{"busy grid: sent SendAlign after its slot", true},
+		{"busy grid: sent at its slot, after the slots ahead of it", true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -264,11 +264,11 @@ func TestAGroupAfterAnIdleGridLeavesAsSoonAsItIsClaimed(t *testing.T) {
 			lim := testLimiter()
 			sent := newSentLog()
 			cfg := idleConfig()
-			cfg.SendAlign = align
+			cfg.AlignFloor, cfg.AlignCeiling = align, align
 			id := q.addDue(notification.ChannelSMS, notification.PriorityHigh, time.Time{})
 			start := time.Now()
 			if c.busy {
-				if _, err := lim.Take(t.Context(), notification.ChannelSMS, 2); err != nil {
+				if _, err := lim.Take(t.Context(), notification.ChannelSMS, notification.SlotRequest{N: 2, Horizon: time.Second}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -281,13 +281,51 @@ func TestAGroupAfterAnIdleGridLeavesAsSoonAsItIsClaimed(t *testing.T) {
 			waitFor(t, "sent", func() bool { _, ok := sent.when(id); return ok })
 			at, _ := sent.when(id)
 			took := at.Sub(start)
-			if c.busy && took < align {
-				t.Fatalf("busy grid: sent after %s, want at least SendAlign (%s): an earlier slot's request may still be leaving", took, align)
+			// The two slots taken ahead start now, an interval apart.
+			if ahead := 2 * lim.interval; c.busy && took < ahead {
+				t.Fatalf("busy grid: sent after %s, want at least %s (after the two slots ahead): an earlier slot's request may still be leaving", took, ahead)
 			}
 			if !c.busy && took >= align/2 {
-				t.Fatalf("idle grid: sent after %s, want well under SendAlign (%s)", took, align)
+				t.Fatalf("idle grid: sent after %s, want well under the lead (%s)", took, align)
 			}
 		})
+	}
+}
+
+// The slots a lone row did not need go back to the limiter (giveBack): a
+// second row right behind it leaves about an interval later, not behind the
+// first group's unused slots, a lead plus a horizon out.
+func TestARowRightAfterALoneSendIsNotHeldBehindUnusedSlots(t *testing.T) {
+	const lead = 150 * time.Millisecond
+	q := newMemQueue()
+	lim := newGridLimiter(5*time.Millisecond, 100*time.Millisecond)
+	sent := newSentLog()
+	fw := newFakeWakes()
+	cfg := idleConfig()
+	cfg.Channels = []notification.Channel{notification.ChannelSMS}
+	cfg.AlignFloor, cfg.AlignCeiling = lead, lead
+	cfg.Horizon = 100 * time.Millisecond
+	stop := run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: sent, Wakes: fw}))
+	defer func() {
+		if err := stop(); err != nil {
+			t.Error(err)
+		}
+	}()
+	first := q.addDue(notification.ChannelSMS, notification.PriorityHigh, time.Time{})
+	fw.hint(notification.Wake{Channel: notification.ChannelSMS, Priority: notification.PriorityHigh})
+	waitFor(t, "the first row sent", func() bool { _, ok := sent.when(first); return ok })
+	second := q.addDue(notification.ChannelSMS, notification.PriorityHigh, time.Time{})
+	start := time.Now()
+	fw.hint(notification.Wake{Channel: notification.ChannelSMS, Priority: notification.PriorityHigh})
+	waitFor(t, "the second row sent", func() bool { _, ok := sent.when(second); return ok })
+	at, _ := sent.when(second)
+	if took := at.Sub(start); took >= lead {
+		t.Fatalf("second row sent %s after its hint; want well under the lead (%s): it waited behind the first group's unused slots", took, lead)
+	}
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
+	if lim.gaveBack == 0 {
+		t.Fatalf("no slots given back (%d GiveBack calls, none took effect)", lim.givenBack)
 	}
 }
 
@@ -299,8 +337,8 @@ type lateIdleReply struct {
 	delay time.Duration
 }
 
-func (l lateIdleReply) Take(ctx context.Context, ch notification.Channel, n int) (notification.Grant, error) {
-	g, err := l.gridLimiter.Take(ctx, ch, n)
+func (l lateIdleReply) Take(ctx context.Context, ch notification.Channel, r notification.SlotRequest) (notification.Grant, error) {
+	g, err := l.gridLimiter.Take(ctx, ch, r)
 	if err == nil && g.N > 0 && g.Idle > 0 {
 		sleep(ctx, l.delay)
 	}
@@ -310,7 +348,7 @@ func (l lateIdleReply) Take(ctx context.Context, ch notification.Channel, n int)
 func TestWorkersWokenTogetherLeaveTheHintedRowToTheEarlyGroup(t *testing.T) {
 	// Three workers share one queue and one limiter, as in the stack. A hint
 	// wakes them all; the first to reserve sees an idle grid and may send at
-	// once, the others land on a busy grid SendAlign further out. The reply
+	// once, the others land on a busy grid a horizon further out. The reply
 	// to the first comes late, so a later worker hears back first. The
 	// hinted row must still go with the early group.
 	const align = 300 * time.Millisecond
@@ -318,19 +356,19 @@ func TestWorkersWokenTogetherLeaveTheHintedRowToTheEarlyGroup(t *testing.T) {
 		t.Run(fmt.Sprintf("hint %d", attempt), func(t *testing.T) {
 			q := newMemQueue()
 			// As in production, where the first taker's 19 slots of
-			// 10.527 ms end 13 us past the 200 ms horizon and the next taker
-			// still gets one slot: the worker asks for five slots of 5 ms
-			// (horizon just under 25 ms) and the limiter's horizon admits a
-			// sixth right after them.
-			const horizon = 25*time.Millisecond - time.Microsecond
-			lim := newGridLimiter(5*time.Millisecond, 25*time.Millisecond)
-			// Under the 25 ms until that next slot, which the deferred claim
-			// waits for.
+			// 10.527 ms end 13 us past lead + 200 ms and the next taker still
+			// gets one slot right after them: the worker's horizon is its
+			// lead (300 ms), the limiter's cap 1 us under it, so the first
+			// taker gets 60 slots of 5 ms, not the 61 it asks for, and the
+			// next one the 61st.
+			lim := newGridLimiter(5*time.Millisecond, align-time.Microsecond)
+			// Well under the 300 ms the deferred claim waits for (its first
+			// slot less its lead).
 			late := lateIdleReply{gridLimiter: lim, delay: 10 * time.Millisecond}
 			sent := newSentLog()
 			cfg := idleConfig()
-			cfg.SendAlign = align
-			cfg.Horizon = horizon
+			cfg.AlignFloor, cfg.AlignCeiling = align, align
+			cfg.Horizon = 25 * time.Millisecond
 			var all []*fakeWakes
 			var stops []func() error
 			for range 3 {
@@ -359,9 +397,106 @@ func TestWorkersWokenTogetherLeaveTheHintedRowToTheEarlyGroup(t *testing.T) {
 			}
 			waitFor(t, "sent", func() bool { _, ok := sent.when(id); return ok })
 			if at, _ := sent.when(id); at.Sub(start) >= align/2 {
-				t.Fatalf("sent %s after the hint: a later group took it; want well under SendAlign (%s)", at.Sub(start), align)
+				t.Fatalf("sent %s after the hint: a later group took it; want well under the lead (%s)", at.Sub(start), align)
 			}
 		})
+	}
+}
+
+// leadLog is a gridLimiter that records the lead of every Take that asked for
+// slots, and when. Its Takes are one at a time and at least 50 us apart, as
+// Takes from processes a network away are: the limiter's now then differs
+// between workers woken together by more than the 1 us that decides whether
+// the next taker gets a slot right after the first one's group.
+type leadLog struct {
+	*gridLimiter
+	mu    sync.Mutex
+	takes sync.Mutex
+	at    []time.Time
+	leads []time.Duration
+}
+
+func (l *leadLog) Take(ctx context.Context, ch notification.Channel, r notification.SlotRequest) (notification.Grant, error) {
+	if r.N > 0 {
+		l.mu.Lock()
+		l.at, l.leads = append(l.at, time.Now()), append(l.leads, r.Lead)
+		l.mu.Unlock()
+	}
+	l.takes.Lock()
+	defer l.takes.Unlock()
+	g, err := l.gridLimiter.Take(ctx, ch, r)
+	for start := time.Now(); time.Since(start) < 50*time.Microsecond; {
+	}
+	return g, err
+}
+
+// leadsSince returns the leads of the Takes made after t.
+func (l *leadLog) leadsSince(t time.Time) []time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []time.Duration
+	for i, at := range l.at {
+		if at.After(t) {
+			out = append(out, l.leads[i])
+		}
+	}
+	return out
+}
+
+// A deferred claim (group.deferClaim) waits for its slot before it claims;
+// that wait is not claim time, so it must not lift the worker's lead. Three
+// workers with the lead free to follow their claims (memQueue claims take
+// microseconds, so it sits at the floor) are woken together by one hint after
+// another; the second worker's one slot right after the first's group is
+// deferred, as in production (TestWorkersWokenTogetherLeaveTheHintedRowToTheEarlyGroup).
+func TestDeferredClaimsDoNotLiftTheLead(t *testing.T) {
+	const floor = 20 * time.Millisecond
+	q := newMemQueue()
+	// The first taker's five slots of 5 ms end 1 us past its horizon, so
+	// the next taker gets the slot right after them and defers its claim.
+	lim := &leadLog{gridLimiter: newGridLimiter(5*time.Millisecond, 25*time.Millisecond)}
+	sent := newSentLog()
+	cfg := idleConfig()
+	cfg.Channels = []notification.Channel{notification.ChannelPush}
+	cfg.AlignFloor, cfg.AlignCeiling = floor, time.Second
+	cfg.Horizon = 25*time.Millisecond - time.Microsecond
+	var all []*fakeWakes
+	for range 3 {
+		wk := newFakeWakes()
+		all = append(all, wk)
+		stop := run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: sent, Wakes: wk}))
+		defer func() {
+			if err := stop(); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	waitFor(t, "every worker idle", func() bool { p, _ := q.stats(); return p >= 3 })
+	var settled time.Time
+	for k := range 12 {
+		waitFor(t, "grid idle", func() bool {
+			g := lim.gridLimiter // leadLog's own mu guards only its log
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			return time.Since(g.next[notification.ChannelPush]) > 50*time.Millisecond
+		})
+		if k == 6 {
+			settled = time.Now() // every worker has claimed enough to measure
+		}
+		id := q.addDue(notification.ChannelPush, notification.PriorityNormal, time.Time{})
+		for _, wk := range all {
+			wk.hint(notification.Wake{Channel: notification.ChannelPush, Priority: notification.PriorityNormal, Due: time.Now()})
+		}
+		waitFor(t, "sent", func() bool { _, ok := sent.when(id); return ok })
+	}
+	leads := lim.leadsSince(settled)
+	if len(leads) == 0 {
+		t.Fatal("no reservation after the first six hints")
+	}
+	for _, l := range leads {
+		if l > floor {
+			t.Fatalf("leads after six hints: %v; want every one at the floor (%s): a deferred claim's wait counted as claim time", leads, floor)
+		}
 	}
 }
 

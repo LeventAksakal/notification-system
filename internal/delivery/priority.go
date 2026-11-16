@@ -39,6 +39,10 @@ type selector struct {
 	// (another claimer held it); its short wait is a busy channel's, not
 	// an idle one's.
 	raced [3]bool
+	// known[i]: priority i has been answered for at least once (claimed,
+	// settled or hinted). A borrowed slot never goes to a priority not yet
+	// known (see Worker.claim).
+	known [3]bool
 }
 
 // round is the hint state when a round (a claim, or a NextDue read) began.
@@ -104,7 +108,15 @@ func lendOrder(p int) []int {
 	return out
 }
 
-func (s *selector) empty(i int, now time.Time) bool { return now.Before(s.emptyUntil[i]) }
+// empty reports whether priority i is not to be claimed at now: known to
+// have nothing due before emptyUntil, or past it only by its safety poll,
+// which is answered by Queue.NextDue (due), not by a claim query. A claim
+// that also asked such a priority would cost a full claim query for nothing
+// on most polls; while claims are slow (owner item 0011) that tripled the
+// claim time and the lead with it.
+func (s *selector) empty(i int, now time.Time) bool {
+	return now.Before(s.emptyUntil[i]) || s.check[i]
+}
 
 // beginRound starts a round that may settle priorities as empty: hints
 // received from now on are kept for its settle. Rounds of one channel never
@@ -118,7 +130,7 @@ func (s *selector) beginRound() round {
 // until is only the safety poll. A hint received since r began wins when it
 // is earlier: the round may not have seen the row it announces.
 func (s *selector) settle(i int, until time.Time, check bool, r round) {
-	s.emptyUntil[i], s.check[i], s.raced[i] = until, check, false
+	s.emptyUntil[i], s.check[i], s.raced[i], s.known[i] = until, check, false, true
 	if s.hintSeq[i] != r.seq[i] && s.hinted[i] && s.hintDue[i].Before(until) {
 		s.emptyUntil[i], s.check[i] = s.hintDue[i], false
 	}
@@ -128,6 +140,7 @@ func (s *selector) settle(i int, until time.Time, check bool, r round) {
 // then (at once when due has passed).
 func (s *selector) hint(i int, due time.Time) {
 	s.hintSeq[i]++
+	s.known[i] = true
 	if !s.hinted[i] || due.Before(s.hintDue[i]) {
 		s.hintDue[i], s.hinted[i] = due, true
 	}
@@ -138,7 +151,7 @@ func (s *selector) hint(i int, due time.Time) {
 
 // markBusy records that priority i returned every row asked for.
 func (s *selector) markBusy(i int) {
-	s.emptyUntil[i], s.check[i], s.raced[i] = time.Time{}, false, false
+	s.emptyUntil[i], s.check[i], s.raced[i], s.known[i] = time.Time{}, false, false, true
 }
 
 // contended reports whether a priority is waiting for rows another claimer

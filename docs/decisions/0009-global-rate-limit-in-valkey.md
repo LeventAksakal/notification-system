@@ -38,11 +38,16 @@ The limiter reserves up to a horizon (200 ms) of consecutive send slots per call
 | Limit | 100 per second per channel | The brief; "per second" read as any sliding one-second window, the strictest testable reading |
 | Headroom | 5% (95 per second) | Measured: at 3% a two-core machine showed the provider 99 to 100 in a second and CI 101 once; owner's choice (owner item 0013) |
 | Interval | 10.53 ms | Derived: one second divided by 95 |
-| Horizon | 200 ms (about 19 slots per call) | Batches limiter calls to about 5 per second per channel per worker. Not derived from a target: unexplained |
-| Send alignment | 200 ms | Measured claim time: 16 ms median, 50 ms p99, about 170 ms at start-up. A fixed number standing in for a measured one; see the follow-up |
+| Horizon | 200 ms, or the send alignment when that is larger | A budget of limiter calls: a busy channel calls every half horizon, 10 per second per channel per worker; it grows to the alignment so one reservation outlasts one claim (as built, 16 Nov) |
+| Send alignment | p95 of the newest 20 claims, 200 ms to lease/8 | Measured per worker and channel; floor and ceiling derived in the as-built note below (16 Nov) |
 | Allowed lateness | one interval | Derived: keeps every pair of sends at least one interval apart |
 | Throughput floors | 88 and 91 | Measured runs minus a margin (owner item 0010) |
 | CI floor | 40 | Sanity floor on the two-core runner, where throughput follows CPU (owner item 0011) |
 
 ## Follow-up (15 Nov 2026)
 The owner called the throughput drop under a slow database (56 to 75 per second instead of 95, owner item 0011) a real concern. Proposed as the clear improvement: replace the fixed 200 ms send alignment with the measured claim latency (a high percentile over a recent window, bounded), so a slot waits as long as claims are really taking instead of being given up when they take longer than a guessed constant; derive the horizon from a stated limiter-call budget. To start once the wake-hint and provider-health branches, which edit the same loop, have landed.
+
+## As built: the send alignment follows the claim time (16 Nov 2026)
+The fixed 200 ms alignment ("a slot whose claim takes longer than 200 ms ... is given up" above) is replaced (owner item 0011). A worker passes a lead to the limiter with each reservation: the p95 of its newest 20 claim times on that channel, never below 200 ms (the old fixed value) and never above an eighth of the lease (3.75 s by default). A free grid restarts at now plus that lead, and a busy grid continues where it was. Slots are still the send moments on one shared grid, so the spacing does not depend on any worker's lead. One reservation now covers the larger of `APP_RATE_LIMIT_HORIZON` and the lead, and a group that found fewer rows than slots gives the rest back to the limiter.
+
+Measured on the owner-item-0011 scenario (every claim held 1.6 s): the fast channels drained at 95.0 per second, busiest second 96; with the fixed alignment they managed 1.9 and 5.2. R8 drained at 93.3 to 94.6 per second against 89.2 to 91.9 before. R9 latency was unchanged. The design, the derived numbers and every run are in `.agents/pr/adaptive-align.md` on the branch `claude/feat-adaptive-send-alignment-a40f6f`. Claims slower than the ceiling still lose slots: the database is then several seconds behind on every query.

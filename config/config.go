@@ -140,7 +140,8 @@ var Dials = []Dial{
 		"the limiter paces this many percent under the limit; send slots are exactly one interval apart, "+
 			"so 0 is exact at the limiter but leaves no room for arrival jitter at the provider", 0, 50,
 		func(c *Config) *int { return &c.RateLimitHeadroomPct }),
-	duration("APP_RATE_LIMIT_HORIZON", "200ms", "how far ahead a worker may reserve send slots; about half of it is reserved per limiter call",
+	duration("APP_RATE_LIMIT_HORIZON", "200ms", "least span of send slots one limiter call reserves past the send alignment; a busy channel calls the limiter every half of it "+
+		"(200ms: 10 calls per second per channel per worker); it grows to the alignment while claims are slower than it",
 		10*time.Millisecond, 2*time.Second,
 		func(c *Config) *time.Duration { return &c.RateLimitHorizon }),
 	{Env: "APP_PRIORITY_WEIGHTS", Default: "70,20,10",

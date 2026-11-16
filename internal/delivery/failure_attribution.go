@@ -83,8 +83,9 @@ func (w *Worker) reportHealth(ctx context.Context, ch notification.Channel, gate
 }
 
 // probeLease is how long a channel's probe is held: the longest a live probe
-// can take from its admission to its report. Its slot is at most Horizon
-// ahead, it leaves at slot + SendAlign and at most one interval late, the
+// can take from its admission to its report. Its slot is at most the lead
+// plus the horizon ahead (both at their largest, as for the clock mapping's
+// span), it leaves at its slot and at most one interval late, the
 // call ends at ProviderTimeout (or before the row's lease does), and the
 // report's round trip fits in leaseMargin. A holder that dies delays the next
 // probe by at most this.
@@ -93,7 +94,7 @@ func (w *Worker) probeLease(interval time.Duration) time.Duration {
 	if w.cfg.ProviderTimeout > 0 && (call <= 0 || w.cfg.ProviderTimeout < call) {
 		call = w.cfg.ProviderTimeout
 	}
-	return w.cfg.Horizon + w.cfg.SendAlign + interval + call + leaseMargin
+	return w.cfg.AlignCeiling + max(w.cfg.Horizon, w.cfg.AlignCeiling) + interval + call + leaseMargin
 }
 
 // cancel ends a ticket of cr's channel whose call will not be made.

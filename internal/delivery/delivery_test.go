@@ -36,8 +36,10 @@ type memQueue struct {
 	released int
 	lost     int // result writes refused because the lease had run out
 	peeks    int // NextDue calls
-	// claimCalls counts Claim calls, empty ones included.
+	// claimCalls counts Claim calls, empty ones included; asks counts them
+	// per priority.
 	claimCalls int
+	asks       map[notification.Priority]int
 }
 
 type memRow struct {
@@ -48,7 +50,7 @@ type memRow struct {
 }
 
 func newMemQueue() *memQueue {
-	return &memQueue{rows: map[string]*memRow{}, claims: map[notification.Priority]int{}, results: map[string][]notification.AttemptOutcome{}}
+	return &memQueue{rows: map[string]*memRow{}, claims: map[notification.Priority]int{}, asks: map[notification.Priority]int{}, results: map[string][]notification.AttemptOutcome{}}
 }
 
 func (q *memQueue) add(n int, ch notification.Channel, p notification.Priority) {
@@ -65,6 +67,7 @@ func (q *memQueue) Claim(_ context.Context, ch notification.Channel, p notificat
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.claimCalls++
+	q.asks[p]++
 	// Due rows of this lane, oldest due first, as the store's claim (ORDER BY
 	// due_at); ties in insertion order.
 	now := time.Now()
@@ -179,18 +182,20 @@ func (q *memQueue) row(id string) memRow {
 }
 
 // gridLimiter is an in-memory GCRA with burst 1 per channel, like the Valkey
-// limiter: slots exactly interval apart, at most horizon ahead. Its clock is
+// limiter: slots exactly interval apart, at most horizon past the lead (the
+// smaller of the request's and its own). Its clock is
 // a "remote" one, hours away from the local wall clock and running on the
 // local monotonic clock: Grant.At is on it, as Valkey's TIME is.
 type gridLimiter struct {
-	mu       sync.Mutex
-	err      error
-	takes    int
-	reserves int // Takes that asked for slots (n > 0)
-	interval time.Duration
-	horizon  time.Duration
-	next     map[notification.Channel]time.Time
-	start    time.Time // local, monotonic
+	mu                  sync.Mutex
+	err                 error
+	takes               int
+	reserves            int // Takes that asked for slots (n > 0)
+	givenBack, gaveBack int // GiveBack calls; those that moved the next free slot back
+	interval            time.Duration
+	horizon             time.Duration
+	next                map[notification.Channel]time.Time
+	start               time.Time // local, monotonic
 }
 
 // remoteBase is the gridLimiter's clock at its start.
@@ -206,18 +211,32 @@ func (l *gridLimiter) remote(t time.Time) time.Time { return remoteBase.Add(t.Su
 // local is limiter moment at on the local monotonic clock.
 func (l *gridLimiter) local(at time.Time) time.Time { return l.start.Add(at.Sub(remoteBase)) }
 
-func (l *gridLimiter) Take(_ context.Context, ch notification.Channel, n int) (notification.Grant, error) {
+func (l *gridLimiter) Take(_ context.Context, ch notification.Channel, r notification.SlotRequest) (notification.Grant, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.takes++
 	if l.err != nil {
 		return notification.Grant{}, l.err
 	}
-	if n > 0 {
+	if r.N > 0 {
 		l.reserves++
 	}
 	now := time.Now()
-	tat := l.next[ch]
+	k, first, wait, tat, idle := gcraTake(l.next[ch], now, l.interval, r, l.horizon)
+	if k > 0 { // as the Valkey script: a Take that reserves nothing writes nothing
+		l.next[ch] = tat
+	}
+	return notification.Grant{N: k, At: l.remote(now), First: first, Interval: l.interval, Wait: wait, Idle: idle}, nil
+}
+
+// gcraTake is the Valkey limiter's script on time.Time: from the next free
+// slot tat (zero: no key) it reserves up to r.N slots, starting a free grid
+// (tat not after now) at r.Lead, and none later than r.Lead plus the smaller
+// of r.Horizon and horizon (the fake's own cap; 0 for none) after now. It
+// returns the slots reserved, the first one's distance from now, the wait
+// before asking again can reserve something, the new next free slot and how
+// long the grid had been free (Grant.Idle).
+func gcraTake(tat, now time.Time, interval time.Duration, r notification.SlotRequest, horizon time.Duration) (int, time.Duration, time.Duration, time.Time, time.Duration) {
 	idle := time.Duration(0) // as the Valkey limiter reports it
 	switch {
 	case tat.IsZero():
@@ -225,23 +244,43 @@ func (l *gridLimiter) Take(_ context.Context, ch notification.Channel, n int) (n
 	case tat.Before(now):
 		idle = now.Sub(tat)
 	}
-	if tat.Before(now) {
-		tat = now
+	if !tat.After(now) {
+		tat = now.Add(r.Lead)
 	}
+	h := r.Horizon
+	if horizon > 0 {
+		h = min(h, horizon)
+	}
+	last := r.Lead + h
 	first := tat.Sub(now)
 	k := 0
-	if first <= l.horizon {
-		k = min(int((l.horizon-first)/l.interval)+1, n)
+	if first <= last {
+		k = min(int((last-first)/interval)+1, r.N)
 	}
-	tat = tat.Add(time.Duration(k) * l.interval)
-	if k > 0 { // as the Valkey script: a Take that reserves nothing writes nothing
-		l.next[ch] = tat
-	}
+	tat = tat.Add(time.Duration(k) * interval)
 	var wait time.Duration
-	if k < n {
-		wait = max(tat.Sub(now)-l.horizon, 0)
+	if k < r.N {
+		wait = max(tat.Sub(now)-last, 0)
 	}
-	return notification.Grant{N: k, At: l.remote(now), First: first, Interval: l.interval, Wait: wait, Idle: idle}, nil
+	return k, first, wait, tat, idle
+}
+
+// GiveBack moves the channel's next free slot back to from if it is still
+// g's end, as the Valkey limiter's script does.
+func (l *gridLimiter) GiveBack(_ context.Context, ch notification.Channel, g notification.Grant, from time.Time) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.givenBack++
+	if l.err != nil {
+		return false, l.err
+	}
+	end := l.local(g.At.Add(g.First + time.Duration(g.N)*g.Interval))
+	if g.N <= 0 || !l.local(from).Before(end) || !l.next[ch].Equal(end) {
+		return false, nil
+	}
+	l.next[ch] = l.local(from)
+	l.gaveBack++
+	return true, nil
 }
 
 func testLimiter() *gridLimiter { return newGridLimiter(5*time.Millisecond, 20*time.Millisecond) }
@@ -287,7 +326,8 @@ func testConfig() Config {
 	return Config{
 		Concurrency: 30, MaxAttempts: 3, RetryBase: time.Millisecond, RetryCap: 5 * time.Millisecond,
 		Lease: time.Minute, ReapInterval: 10 * time.Millisecond, ShutdownTimeout: time.Second,
-		Weights: [3]int{70, 20, 10}, IdleMin: time.Millisecond, IdleMax: 5 * time.Millisecond, SendAlign: time.Microsecond,
+		Weights: [3]int{70, 20, 10}, IdleMin: time.Millisecond, IdleMax: 5 * time.Millisecond,
+		AlignFloor: time.Microsecond, AlignCeiling: time.Microsecond,
 		Horizon: 20 * time.Millisecond,
 	}
 }
@@ -401,7 +441,12 @@ func TestWorkerShutdownReleasesUnsentWork(t *testing.T) {
 	}
 	cfg := testConfig()
 	cfg.ShutdownTimeout = 20 * time.Millisecond
-	stop := run(t, New(cfg, Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{send}}))
+	cfg.Horizon = 100 * time.Millisecond
+	// Slots 25 ms apart: a send goroutine woken a few ms late on a loaded
+	// machine (5.5 ms seen) would miss a 5 ms slot and add a release this
+	// test does not count.
+	lim := newGridLimiter(25*time.Millisecond, 100*time.Millisecond)
+	stop := run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: scriptSender{send}}))
 	for range 3 {
 		<-started
 	}
@@ -495,6 +540,43 @@ func TestWorkerWeightsAndBorrowing(t *testing.T) {
 		q.mu.Unlock()
 		if ls := float64(l) / float64(h+l); ls < 0.25 || ls > 0.35 {
 			t.Errorf("low share %.2f, want about 0.30 (low's 10 plus normal's 20)", ls)
+		}
+	})
+
+	// A claim that runs short lends its unused slots on, but not to a
+	// priority never answered for: each such ask is one more claim query in
+	// the same claim, which tripled the claim time while the database was
+	// slow (owner item 0011). NextDue answers those priorities instead.
+	onlyHigh := [3]int{100, 0, 0}
+	t.Run("a short claim does not query priorities never answered for", func(t *testing.T) {
+		q := newMemQueue()
+		q.add(5, notification.ChannelSMS, notification.PriorityHigh)
+		cfg := testConfig()
+		cfg.Weights = onlyHigh
+		stop := run(t, New(cfg, Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{accept}}))
+		waitFor(t, "5 sent", func() bool { return q.count(notification.StatusSent) == 5 })
+		waitFor(t, "the priorities without weight looked up", func() bool { q.mu.Lock(); defer q.mu.Unlock(); return q.peeks > 0 })
+		if err := stop(); err != nil {
+			t.Fatal(err)
+		}
+		q.mu.Lock()
+		n, l := q.asks[notification.PriorityNormal], q.asks[notification.PriorityLow]
+		q.mu.Unlock()
+		if n != 0 || l != 0 {
+			t.Errorf("claim queries for normal %d, low %d with nothing due there; want none", n, l)
+		}
+	})
+
+	t.Run("rows of a priority without weight are still sent", func(t *testing.T) {
+		q := newMemQueue()
+		q.add(5, notification.ChannelSMS, notification.PriorityHigh)
+		q.add(20, notification.ChannelSMS, notification.PriorityNormal)
+		cfg := testConfig()
+		cfg.Weights = onlyHigh
+		stop := run(t, New(cfg, Deps{Queue: q, Limiter: testLimiter(), Sender: scriptSender{accept}}))
+		waitFor(t, "25 sent", func() bool { return q.count(notification.StatusSent) == 25 })
+		if err := stop(); err != nil {
+			t.Fatal(err)
 		}
 	})
 }
