@@ -10,8 +10,9 @@ import (
 
 // Handler returns the full HTTP stack: tracing, the correlation id, the body
 // size limit, then the routes that live outside the contract (/openapi.json,
-// /docs, the WebSocket), then, under the request deadline, the contract's
-// operations, which Huma validates before a handler runs.
+// /asyncapi.yaml, /docs, /docs/websocket, the WebSocket), then, under the
+// request deadline, the contract's operations, which Huma validates before a
+// handler runs.
 func (s *Server) Handler() (http.Handler, error) {
 	contract := http.NewServeMux()
 	api := s.newAPI(contract)
@@ -25,7 +26,8 @@ func (s *Server) Handler() (http.Handler, error) {
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /openapi.json", specHandler(spec))
-	mux.Handle("GET /docs", docsHandler())
+	mux.Handle("GET /docs", docsHandler(docsPage))
+	mux.Handle("GET "+websocketDocsPath, docsHandler(websocketDocsPage))
 	mux.Handle("GET "+scalarPath, scalarHandler())
 	mux.Handle("GET /asyncapi.yaml", asyncAPIHandler())
 	mux.HandleFunc("GET /v1/ws", s.streamEvents)

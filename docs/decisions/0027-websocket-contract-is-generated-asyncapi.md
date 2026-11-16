@@ -21,7 +21,7 @@ The owner, 16 Nov 2026: "that's what OpenAPI is for HTTP but for ws. it isn't th
 3. **A hand-written `asyncapi.yaml`.** No code at all, but the consumer-owned style the owner rejected for HTTP in 0004.
 
 ## Decision
-Option 1. The document covers the channel and its two query parameters (`notificationId`, `batchId`), the `snapshot` and `statusChange` messages with examples built from real `StatusEvent` values, the handshake refusals in the order the server checks them, and every close code the server or its WebSocket library sends. Clients send nothing; a data message is closed with 1008. Every `StatusEvent` field now has a description, which the OpenAPI document gains as well. This supersedes the AsyncAPI sentence in 0022.
+Option 1. The document covers the channel and its two query parameters (`notificationId`, `batchId`), the `snapshot` and `statusChange` messages with examples built from real `StatusEvent` values, the handshake refusals in the order the server checks them, and every close code the server or its WebSocket library sends. Clients send nothing; a data message is closed with 1008. Every `StatusEvent` field now has a description, which the OpenAPI document gains as well. This supersedes the AsyncAPI sentence in 0022. The document is rendered at `/docs/websocket` by the Scalar bundle already vendored for `/docs` (Scalar reads AsyncAPI 3.0 as it reads OpenAPI), so one renderer serves both contracts and each page can switch to the other.
 
 ## Confirmation
 - `go generate ./...` followed by `git diff --exit-code` in CI's static job fails on a stale `api/asyncapi.yaml`.
