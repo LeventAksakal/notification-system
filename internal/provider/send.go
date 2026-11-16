@@ -104,12 +104,18 @@ func New(urls map[notification.Channel]string, timeout time.Duration, conns int)
 		}
 		cfg.NextProtos = []string{"http/1.1"}
 		tc := tls.Client(raw, cfg)
-		hctx, cancel := context.WithTimeout(ctx, tr.TLSHandshakeTimeout) // as the transport's own handshake
-		defer cancel()
+		hctx := ctx
+		if d := tr.TLSHandshakeTimeout; d > 0 { // as the transport's own handshake: 0 is no limit beyond ctx
+			var cancel context.CancelFunc
+			hctx, cancel = context.WithTimeout(ctx, d)
+			defer cancel()
+		}
 		if err := tc.HandshakeContext(hctx); err != nil {
 			_ = raw.Close()
 			return nil, err
 		}
+		// The transport sees a writeMarkConn, not a *tls.Conn, so it leaves
+		// http.Response.TLS nil for these calls. Nothing here reads it.
 		return &writeMarkConn{Conn: tc}, nil
 	}
 	return &Client{
@@ -213,7 +219,13 @@ func (c *writeMarkConn) Write(b []byte) (int, error) {
 type connUse struct {
 	mu    sync.Mutex
 	conns []usedConn
-	other bool // a connection this client did not dial (none should exist)
+	// other: a connection that is not a writeMarkConn. Clone keeps
+	// ProxyFromEnvironment, and with HTTPS_PROXY set an https call goes
+	// through a CONNECT tunnel on which the transport layers TLS itself, so
+	// GotConn sees its *tls.Conn. Such a call is never ErrNotSent: recorded,
+	// the conservative answer. Proxies stay on because egress through one is
+	// a deployment's choice; the compose stack and the tests set none.
+	other bool
 }
 
 type usedConn struct {

@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -94,6 +96,76 @@ func hangingHandler(_ http.ResponseWriter, r *http.Request) {
 	<-r.Context().Done()
 }
 
+// silentListener accepts connections and never writes to them, so a TLS
+// client's handshake waits for a ServerHello that never comes.
+func silentListener(t *testing.T) string {
+	t.Helper()
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	})
+	t.Cleanup(func() {
+		_ = ln.Close()
+		wg.Wait()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return ln.Addr().String()
+}
+
+// The provider client speaks HTTP/1.1 even to a provider that offers HTTP/2:
+// h2 multiplexes calls on one connection, which breaks the per-call write
+// count behind ErrNotSent and lets one failed call's Close cut the others.
+func TestSendSpeaksHTTP11ToAProviderOfferingHTTP2(t *testing.T) {
+	var proto atomic.Value
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proto.Store(r.Proto)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+	if !slices.Contains(srv.TLS.NextProtos, "h2") {
+		t.Fatalf("the test server offers %v, want h2 among them", srv.TLS.NextProtos)
+	}
+	c := testClient(t, map[notification.Channel]string{notification.ChannelSMS: srv.URL}, time.Second, 1)
+	trustTLS(c, srv)
+	if _, err := c.Send(context.Background(), Message{Channel: notification.ChannelSMS, Key: "k"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := proto.Load(); got != "HTTP/1.1" {
+		t.Errorf("the provider saw %v, want HTTP/1.1", got)
+	}
+}
+
+// A TLSHandshakeTimeout of 0 is no limit beyond the call's own deadline, as
+// in the stock transport, not a handshake that fails at once.
+func TestSendOverTLSWithNoHandshakeTimeout(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusAccepted) }))
+	defer srv.Close()
+	c := testClient(t, map[notification.Channel]string{notification.ChannelSMS: srv.URL}, time.Second, 1)
+	trustTLS(c, srv)
+	c.http.Transport.(*http.Transport).TLSHandshakeTimeout = 0
+	if res, err := c.Send(context.Background(), Message{Channel: notification.ChannelSMS, Key: "k"}); err != nil || res.Status != http.StatusAccepted {
+		t.Fatalf("status %d, err %v; want 202", res.Status, err)
+	}
+}
+
 // A failed call is ErrNotSent only when it obtained a connection and wrote
 // nothing to it: the worker then gives the job back instead of recording an
 // attempt the provider never saw (decision 0005). A call that obtained no
@@ -123,6 +195,16 @@ func TestSendTellsACallThatNeverLeftFromOneThatMayHave(t *testing.T) {
 			addr := ln.Addr().String()
 			_ = ln.Close()
 			return "http://" + addr + "/send", nil
+		}},
+		{"a TLS handshake that fails (untrusted certificate) is a provider fault", func(t *testing.T) (string, func(*Client)) {
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(hangingHandler))
+			srv.Config.ErrorLog = log.New(io.Discard, "", 0) // the server's "handshake error" line is expected
+			srv.StartTLS()
+			t.Cleanup(srv.Close)
+			return srv.URL, nil // the client does not trust the test certificate
+		}},
+		{"a TLS handshake that never completes is a provider fault", func(t *testing.T) (string, func(*Client)) {
+			return "https://" + silentListener(t) + "/send", nil
 		}},
 		{"a dial that never completes is a provider fault, not a call that never left", func(*testing.T) (string, func(*Client)) {
 			return "http://192.0.2.1/send", func(c *Client) {
@@ -228,25 +310,35 @@ func TestConnUseCountsRequestWritesSinceTheCallGotItsConnections(t *testing.T) {
 // shortens or lengthens the timeout until both have.
 func TestSendNeverReportsNotSentForARequestTheServerReceived(t *testing.T) {
 	const (
-		calls  = 300                    // per round: contention enough for both stages
-		rounds = 20                     // bound on the search; see the log for the rounds a run took
-		quiet  = 200 * time.Millisecond // late arrivals after the clients gave up
-		warm   = 32                     // idle connections, so calls obtain one at once
+		calls  = 300 // per round: contention enough for both stages
+		rounds = 20  // bound on the search; see the log for the rounds a run took
+		warm   = 32  // idle connections, so calls obtain one at once
 	)
 	var mu sync.Mutex
 	received := map[string]int{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		mu.Lock()
-		received[r.Header.Get("Idempotency-Key")]++
-		mu.Unlock()
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer srv.Close()
-	urls := map[notification.Channel]string{notification.ChannelSMS: srv.URL}
 	var sawNotSent, sawAfterWrite bool
 	timeout := 200 * time.Microsecond
 	for round := 0; round < rounds && (!sawNotSent || !sawAfterWrite); round++ {
+		// One server per round, so the round can wait for every request it
+		// will ever see before counting.
+		var open atomic.Int64
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			mu.Lock()
+			received[r.Header.Get("Idempotency-Key")]++
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+			switch s {
+			case http.StateNew:
+				open.Add(1)
+			case http.StateClosed, http.StateHijacked:
+				open.Add(-1)
+			}
+		}
+		srv.Start()
+		urls := map[notification.Channel]string{notification.ChannelSMS: srv.URL}
 		c := testClient(t, urls, time.Second, warm)
 		var wg sync.WaitGroup
 		for i := range warm { // warm the pool on the long timeout
@@ -266,8 +358,18 @@ func TestSendNeverReportsNotSentForARequestTheServerReceived(t *testing.T) {
 			})
 		}
 		wg.Wait()
+		// Every client connection is now closed or idle; close the idle ones.
+		// The server closes its side only after it read the EOF, so behind
+		// every byte that arrived: when no connection is open, every request
+		// that reached it has been counted. srv.Close alone is not enough: it
+		// drops an idle connection whose request bytes it has not read yet.
 		c.http.CloseIdleConnections()
-		time.Sleep(quiet)
+		for deadline := time.Now().Add(5 * time.Second); open.Load() > 0; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) { // 5 s: a round's connections close in milliseconds
+				t.Fatalf("round %d: %d server connections still open after 5s", round, open.Load())
+			}
+		}
+		srv.Close()
 		mu.Lock()
 		var nNotSent, nAfterWrite int
 		for i := range calls {

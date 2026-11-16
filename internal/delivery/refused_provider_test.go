@@ -68,6 +68,13 @@ func TestARefusingProviderExhaustsBudgetsAndOpensTheOutage(t *testing.T) {
 		send := &countingSender{fn: refusedProvider(t).Send}
 		stop := run(t, New(testConfig(), Deps{Queue: q, Limiter: testLimiter(), Sender: send, Health: st}))
 		outage := 20 * cooldown // 1 s, as in TestAnOutageSpendsNoBudgetBeyondItsDetection
+		// A bounded measurement, not a wait for a state: the sleep is the
+		// window the calls are counted over, and the bounds are upper bounds
+		// that scale with it (one probe per cool-down). A loaded machine makes
+		// fewer calls in the window, not more, and three refused dials, which
+		// open the outage, take milliseconds. A fake clock would have to drive
+		// the limiter's grid, the idle timers and the health cool-down at
+		// once; the worker reads real time in all three.
 		time.Sleep(outage)
 		if err := stop(); err != nil {
 			t.Fatal(err)

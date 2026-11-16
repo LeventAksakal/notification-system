@@ -92,6 +92,22 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 		// due at once. A failed dial is not this: it is a recorded provider
 		// fault, or a refusing provider would loop here and never open its
 		// outage.
+		//
+		// Two releases here do come from a provider in trouble, and spend no
+		// budget and tell health nothing; neither loops:
+		//   - an idle connection the dying provider already closed: the
+		//     transport fails the call before its write starts ("server
+		//     closed idle connection"). A write that started and sent no
+		//     byte (net/http's nothingWrittenError) still counts as started,
+		//     so it is recorded, not released. Each
+		//     stale connection fails one call and is dropped, so this is
+		//     bounded by the idle pool; the next call dials, and a refused
+		//     dial is recorded.
+		//   - a dial that completes right at the call's deadline: the call
+		//     gets the connection and times out before its write. This needs
+		//     the dial to end inside the last moment of the timeout, so it
+		//     cannot repeat on every call; a dial slower than the timeout
+		//     fails as a dial and is recorded.
 		w.cancelGate(ctx, gate, tk)
 		slog.WarnContext(ctx, "provider call never left; released", "channel", job.Channel,
 			"after_ms", elapsed.Milliseconds(), "err", err)
