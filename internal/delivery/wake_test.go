@@ -329,6 +329,61 @@ func TestARowRightAfterALoneSendIsNotHeldBehindUnusedSlots(t *testing.T) {
 	}
 }
 
+// The same with three workers, as in the stack: every hint wakes all three,
+// the first to reserve gets the flex group and the others reserve right
+// after it. Their slots must not keep the near groups' give-backs from
+// taking effect, a far group must not claim the second row to send it at
+// its far slot, and none of the workers may sit out its pause while the
+// second row waits (TestGapDeliveryR7SecondRowAfterALoneSend: 385 ms there
+// before these fixes; this test caught a 158 ms case the stack had not).
+func TestASecondRowAfterALoneSendIsNotHeldBehindTheOtherWorkersSlots(t *testing.T) {
+	const lead = 150 * time.Millisecond
+	q := newMemQueue()
+	lim := newGridLimiter(5*time.Millisecond, 100*time.Millisecond)
+	sent := newSentLog()
+	cfg := idleConfig()
+	cfg.Channels = []notification.Channel{notification.ChannelSMS}
+	cfg.AlignFloor, cfg.AlignCeiling = lead, lead
+	cfg.Horizon = 100 * time.Millisecond
+	var wakes []*fakeWakes
+	for range 3 {
+		fw := newFakeWakes()
+		wakes = append(wakes, fw)
+		stop := run(t, New(cfg, Deps{Queue: q, Limiter: lim, Sender: sent, Wakes: fw}))
+		defer func() {
+			if err := stop(); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	hint := func() {
+		for _, fw := range wakes {
+			fw.hint(notification.Wake{Channel: notification.ChannelSMS, Priority: notification.PriorityHigh})
+		}
+	}
+	waitFor(t, "every worker idle", func() bool { p, _ := q.stats(); return p >= 3 })
+	var worst time.Duration
+	for range 5 {
+		time.Sleep(3 * lead) // every reservation of the last pair has passed
+		first := q.addDue(notification.ChannelSMS, notification.PriorityHigh, time.Time{})
+		hint()
+		waitFor(t, "the first row sent", func() bool { _, ok := sent.when(first); return ok })
+		second := q.addDue(notification.ChannelSMS, notification.PriorityHigh, time.Time{})
+		start := time.Now()
+		hint()
+		waitFor(t, "the second row sent", func() bool { _, ok := sent.when(second); return ok })
+		at, _ := sent.when(second)
+		t.Logf("second row sent %s after its hint", at.Sub(start))
+		worst = max(worst, at.Sub(start))
+	}
+	// Half the lead: sent at once costs a Take and a claim on the fakes
+	// (under 5 ms measured, race detector on two cores); every failure mode
+	// costs a pause (the 50 ms refill) or a slot a lead or more out.
+	if worst >= lead/2 {
+		t.Fatalf("a second row was sent %s after its hint; want well under the lead (%s): it waited behind reserved slots or a pause", worst, lead)
+	}
+}
+
 // lateIdleReply is a gridLimiter whose reply to a grant on an idle grid comes
 // late (Valkey reply jitter), so a worker that reserved after it can hear
 // back, and claim, first.

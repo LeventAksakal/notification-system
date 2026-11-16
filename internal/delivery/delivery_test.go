@@ -195,14 +195,16 @@ type gridLimiter struct {
 	interval            time.Duration
 	horizon             time.Duration
 	next                map[notification.Channel]time.Time
-	start               time.Time // local, monotonic
+	returned            map[notification.Channel]map[time.Time]time.Time // given back below a later grant: end -> start
+	start               time.Time                                        // local, monotonic
 }
 
 // remoteBase is the gridLimiter's clock at its start.
 var remoteBase = time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
 
 func newGridLimiter(interval, horizon time.Duration) *gridLimiter {
-	return &gridLimiter{interval: interval, horizon: horizon, next: map[notification.Channel]time.Time{}, start: time.Now()}
+	return &gridLimiter{interval: interval, horizon: horizon, next: map[notification.Channel]time.Time{},
+		returned: map[notification.Channel]map[time.Time]time.Time{}, start: time.Now()}
 }
 
 // remote is local moment t on the limiter's clock.
@@ -266,7 +268,9 @@ func gcraTake(tat, now time.Time, interval time.Duration, r notification.SlotReq
 }
 
 // GiveBack moves the channel's next free slot back to from if it is still
-// g's end, as the Valkey limiter's script does.
+// g's end, and on through ranges given back earlier below it; with a later
+// grant after g it remembers the range instead: as the Valkey limiter's
+// script does.
 func (l *gridLimiter) GiveBack(_ context.Context, ch notification.Channel, g notification.Grant, from time.Time) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -275,10 +279,28 @@ func (l *gridLimiter) GiveBack(_ context.Context, ch notification.Channel, g not
 		return false, l.err
 	}
 	end := l.local(g.At.Add(g.First + time.Duration(g.N)*g.Interval))
-	if g.N <= 0 || !l.local(from).Before(end) || !l.next[ch].Equal(end) {
+	if g.N <= 0 || !l.local(from).Before(end) {
 		return false, nil
 	}
-	l.next[ch] = l.local(from)
+	if !l.next[ch].Equal(end) {
+		if l.next[ch].After(end) {
+			if l.returned[ch] == nil {
+				l.returned[ch] = map[time.Time]time.Time{}
+			}
+			l.returned[ch][end] = l.local(from)
+		}
+		return false, nil
+	}
+	tat := l.local(from)
+	for {
+		back, ok := l.returned[ch][tat]
+		if !ok {
+			break
+		}
+		delete(l.returned[ch], tat)
+		tat = back
+	}
+	l.next[ch] = tat
 	l.gaveBack++
 	return true, nil
 }

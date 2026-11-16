@@ -390,6 +390,7 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		at := cr.sel.nextCheck(now)
 		claim, peek := cr.sel.due(now)
 		contended := cr.sel.contended()
+		cr.sel.revived = false // seen now
 		cr.mu.Unlock()
 		if !at.IsZero() {
 			w.idleWait(ctx, cr, at.Sub(now))
@@ -573,6 +574,34 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			w.m.gaveUp(ctx, cr.ch, giveUpBreakerOpened, g.N)
 			continue
 		}
+		flex := g.Idle > 0
+		if woke && !flex && g.First > lead {
+			// Woken from idle onto a grid already reserved further out than
+			// this worker's claim (a restart would be no later): other
+			// workers woken by the same hint (or due time) hold the near
+			// slots, the flex group if the grid was idle. These slots are
+			// given back at once rather than held for a deferred claim.
+			// Held, they sat on top of the near groups until that claim, so
+			// the near groups' give-backs waited behind them, and the claim
+			// took a row posted meanwhile to send at these far slots: a row
+			// due right after a lone send waited a lead or more (385 ms on
+			// the three-worker acceptance stack,
+			// TestGapDeliveryR7SecondRowAfterALoneSend; 158 ms with a 150 ms
+			// lead in TestASecondRowAfterALoneSendIsNotHeldBehindTheOtherWorkersSlots,
+			// where the far grant started one interval past the lead).
+			// The cost, only when more rows than the near groups hold arrive
+			// right after a lone send: the next Take, a pause later and no
+			// longer woken, finds the same slots a pause sooner, so a claim
+			// as slow as the lead misses at most a pause of them, once
+			// (refill/interval: about 9 slots at 95/s with the 200 ms
+			// horizon). The claim asks only for the slots still ahead, so
+			// those rows wait for the next group.
+			w.giveBack(ctx, cr, g, g.At.Add(g.First), g.N)
+			<-cr.claiming
+			w.cancel(ctx, cr, first)
+			woke = w.pauseWait(ctx, cr, time.Until(got.Add(pause)))
+			continue
+		}
 		// One admission covers the grant: every slot carries the same ticket
 		// (a probe's grant has one slot).
 		tickets := make([]health.Ticket, g.N)
@@ -585,13 +614,11 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			slots[i] = base.Add(time.Duration(i) * g.Interval)
 		}
 		tolerance := g.Interval - uncertainty // > 0: checked above
-		// The grid was free for an interval: every request of an earlier
-		// slot left more than an interval before the limiter's now of this
-		// grant, lateness and clock offset included (see group.flex).
-		notBefore := w.clock.toLocal(g.At, upper)
-		flex := g.Idle >= g.Interval
+		// The grid was free (Idle > 0): every request of an earlier slot
+		// left before the old TAT, the grant's now less Idle; a flex send
+		// waits until an interval after it (see group.flex).
+		notBefore := w.clock.toLocal(g.At.Add(max(g.Interval-g.Idle, 0)), upper)
 		deferClaim := woke && !flex
-		woke = false
 		inflight.Add(1)
 		go func() { // owned by Run through inflight
 			defer inflight.Done()
@@ -599,7 +626,40 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 			w.claimGroup(ctx, sendCtx, cr, group{slots: slots, tickets: tickets, tolerance: tolerance, gen: gen,
 				asked: sent, lead: lead, horizon: horizon, notBefore: notBefore, flex: flex, deferClaim: deferClaim, grant: g}, inflight)
 		}()
-		sleep(ctx, time.Until(got.Add(pause)))
+		woke = w.pauseWait(ctx, cr, time.Until(got.Add(pause)))
+	}
+}
+
+// pauseWait spaces a channel's reservations (the pause after a Take, see
+// horizon) but ends early when a hint or due time makes a priority that was
+// found empty claimable again (selector.revived): that row is not behind
+// any reservation, and on an idle channel the pause was the only thing it
+// waited for (75-85 ms of the 100 ms refill measured for a row posted right
+// after a lone send, TestGapDeliveryR7SecondRowAfterALoneSend). A channel
+// with a backlog has no empty priority to revive, so its Takes stay a refill
+// apart. It reports whether it ended early: the loop was then woken like
+// from idle, as the other workers were by the same hint (woke).
+func (w *Worker) pauseWait(ctx context.Context, cr *channelRun, d time.Duration) bool {
+	if d <= 0 {
+		return false
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+			return false
+		case <-cr.wake:
+			cr.mu.Lock()
+			revived := cr.sel.revived
+			cr.sel.revived = false
+			cr.mu.Unlock()
+			if revived {
+				return true
+			}
+		}
 	}
 }
 
@@ -634,13 +694,14 @@ type group struct {
 	grant notification.Grant
 	// lead and horizon are what the grant was asked with.
 	lead, horizon time.Duration
-	// notBefore is the limiter's now of the grant on the local clock, placed
-	// like the slots (never early on Valkey's clock): no flex send leaves
-	// before it.
+	// notBefore is one interval after the grid's TAT before the grant (the
+	// limiter's now of the grant less Grant.Idle), and never before that
+	// now, on the local clock, placed like the slots (never early on
+	// Valkey's clock): no flex send leaves before it.
 	notBefore time.Time
-	// flex: the limiter's grid had been free for at least one interval
-	// before this grant (Grant.Idle), so the group may leave as soon as it
-	// is claimed instead of at its slots, never before notBefore. On a free
+	// flex: the limiter's grid was free when this grant was made
+	// (Grant.Idle > 0), so the group may leave as soon as it is claimed
+	// instead of at its slots, never before notBefore. On a free
 	// grid the first slot is the lead after the limiter's now, and the lead
 	// is the p95 of this worker's claims, so most claims return before it:
 	// flex sends them on at once. It does so only when its claim found fewer
@@ -659,12 +720,15 @@ type group struct {
 	//    [s, s+I) on V, whichever worker sends it and whatever its offset, as
 	//    long as the offset lies in the bounds clockMap keeps (a step outside
 	//    them voids the generation, as before). notBefore is placed the same
-	//    way, so a flex send is never before N on V.
+	//    way, so a flex send is never before max(N, T+I) on V.
 	//  - Earlier grants: their last slot is at most T-I, so every request of
 	//    theirs has left before T on V, the latest one included.
 	//  - Idle is N-T, both read by the limiter on V: no worker clock in it.
-	//    Idle >= I puts N, and so the first flex send, at T+I or later: more
-	//    than I after the last earlier send. The unbroken grid only
+	//    notBefore is N + max(I - Idle, 0) = max(N, T+I), so the first flex
+	//    send is at T+I or later: more than I after the last earlier send.
+	//    (It required Idle >= I until 16 Nov, which made a row due a few
+	//    milliseconds after a lone send wait for a restart a lead out: the
+	//    cap never needed N itself past T+I, only the send.) The unbroken grid only
 	//    guarantees a gap above 0 between neighbours (a late send, then its
 	//    successor on time); the seam is sparser than the grid, so no second
 	//    holds more than on a busy channel.
@@ -684,7 +748,10 @@ type group struct {
 	// this group about 400 ms after its creation in about half the samples.
 	// Its claim waits until its first slot less its lead (the time its
 	// claims take), so the flex worker claims first. Its own sends keep
-	// their moments; a busy channel never defers (woke is false).
+	// their moments; a busy channel never defers (woke is false). A woken
+	// grant further out than the lead is not deferred but given back at
+	// once (channelLoop), so it does not sit on top of the near groups;
+	// deferral is left for grants within the lead.
 	deferClaim bool
 }
 
@@ -799,6 +866,16 @@ func (w *Worker) claimGroup(ctx, sendCtx context.Context, cr *channelRun, gr gro
 		// Slot i is the first no request went to: every request sent on
 		// this grant leaves before it, moved as the group was.
 		from := gr.grant.At.Add(gr.grant.First + time.Duration(i)*gr.grant.Interval - moved)
+		if len(jobs) == 0 && gr.grant.Idle > 0 {
+			// Nothing went out on a grant that restarted a free grid a lead
+			// out: give it all back to the grid's next free slot before it
+			// (the limiter's now less Idle), as if it had never been taken.
+			// Given back from its first slot instead, the grid looked busy
+			// for a lead after an empty claim, and a row due meanwhile
+			// waited for that restart (158 ms with a 150 ms lead, three
+			// workers, TestASecondRowAfterALoneSendIsNotHeldBehindTheOtherWorkersSlots).
+			from = gr.grant.At.Add(-gr.grant.Idle)
+		}
 		w.giveBack(ctx, cr, gr.grant, from, gr.grant.N-i)
 	}
 	for ; i < len(slots); i++ {
@@ -1012,6 +1089,14 @@ func (w *Worker) settleEmpty(ctx context.Context, cr *channelRun, idx []int, r r
 	}
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
+	defer func() {
+		if cr.sel.revived { // a hint kept over this round's "empty": wake the loop's pause
+			select {
+			case cr.wake <- struct{}{}:
+			default:
+			}
+		}
+	}()
 	for _, i := range idx {
 		wait, pending := next[priorityName(i)]
 		switch {

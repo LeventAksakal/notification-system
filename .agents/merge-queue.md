@@ -18,6 +18,7 @@ Integration branch: `refs/heads/integration/decision-review`, checked out in `C:
 | ce1fd26 | limits-standards (0017): every limit cited, blank content refused at every layer |
 | efd3d6b | metrics-rollup (0014): per-minute rollups and latency buckets |
 | f7bef32 | dials-derived (0018): every dial derived, config cross-checks |
+| (this commit) | R7 second-row fix (adaptive-align): given-back slots return once later ones are back; R7 p99 18.9 ms (was 387) |
 
 ## Protocol for every lane
 1. Finish your work and your verifier on your own branch, as briefed. Do not merge other lanes into your branch.
@@ -50,6 +51,6 @@ Don't route around the guard. Write the tests you would add to `.agents/pr/<lane
 - `test/acceptance/delivery_wake_test.go:42` uses `n.ID` where the generated client field is `Id`; `go vet -tags integration ./test/...` fails on integration. Test-writer fixes it with the held tests.
 - adaptive-align reports lint failures in other lanes' code on the integration tip; fix at the gate.
 - For the owner: `.claude/agent-policy.json` should list `api/asyncapi.yaml` under `generated`, so the guard refuses hand edits, as it does for `openapi.yaml`. That is a config change, left to the owner. AsyncAPI is split: an implementer writes the builder under `internal/`, and the coordinator does the contract wiring, because `general-purpose` has no guard profile.
-- Held acceptance tests landed in f6497d1 (47 of 48 pass). `TestGapDeliveryR7SecondRowAfterALoneSend` fails on three workers (p99 387 ms against 100 ms); adaptive-align is fixing it on `claude/fix-r7-second-row`.
+- Held acceptance tests landed in f6497d1 (47 of 48 pass). `TestGapDeliveryR7SecondRowAfterALoneSend` fails on three workers (p99 387 ms against 100 ms); fixed by adaptive-align (`claude/fix-r7-second-row`, squash-merged 16 Nov): p50 12.3 ms, p99 18.9 ms; rate caps hold (busiest second at most 97, R8 at 94 to 95/s). `GiveBack`'s doc comment in `ports.go` changed (doc only).
 - Before the gate, update these REQUIREMENTS rows: R15 (readiness without Valkey), B3 (template versions), a new O1 row (retention), R11 evidence (CallOutlivesLease replaced by SlowCallEndsInsideLease), R13 (rollups), B1 and R12 (shared health, budget_spent).
 - Realtime commit `46aefb6` doesn't build on its own; squashing covers it.

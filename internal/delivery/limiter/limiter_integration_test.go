@@ -277,6 +277,60 @@ func TestLimiterTakesBackUnusedSlots(t *testing.T) {
 	})
 }
 
+// TestLimiterReturnsUnusedSlotsInAnyOrder: a grant given back while a later
+// one sits after it is returned once the later one is given back from its
+// start, whatever the order; a later grant that sent something keeps it.
+// Workers woken together reserve one after another, and the first (the flex
+// group) often gives back before the ones after it (TestGapDeliveryR7Second
+// RowAfterALoneSend).
+func TestLimiterReturnsUnusedSlotsInAnyOrder(t *testing.T) {
+	addr := support.Valkey(t)
+	client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}, DisableCache: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	slot := func(g notification.Grant, k int) time.Time { return g.At.Add(g.First + time.Duration(k)*g.Interval) }
+	for i, c := range []struct {
+		name  string
+		sizes []int
+		// back[k] = {grant, first slot given back}, in the order given back.
+		back [][2]int
+		// want: the next Take's first slot is slot want[1] of grant want[0].
+		want [2]int
+	}{
+		{"the earlier grant first, then the later one in full", []int{5, 3}, [][2]int{{0, 1}, {1, 0}}, [2]int{0, 1}},
+		{"the later grant first, then the earlier one", []int{5, 3}, [][2]int{{1, 0}, {0, 2}}, [2]int{0, 2}},
+		{"three grants, the middle one first", []int{4, 2, 3}, [][2]int{{1, 0}, {0, 3}, {2, 0}}, [2]int{0, 3}},
+		{"a later grant that sent keeps its sent slots", []int{5, 3}, [][2]int{{0, 0}, {1, 1}}, [2]int{1, 1}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			l := limiter.New(client, 100, 0, fmt.Sprintf("test:giveback-order-%d:", i))
+			ch := notification.ChannelSMS
+			var gs []notification.Grant
+			for _, n := range c.sizes {
+				g, err := l.Take(t.Context(), ch, notification.SlotRequest{N: n, Lead: time.Second, Horizon: time.Second})
+				if err != nil || g.N != n {
+					t.Fatalf("take %d: %+v, %v", n, g, err)
+				}
+				gs = append(gs, g)
+			}
+			for _, b := range c.back {
+				if _, err := l.GiveBack(t.Context(), ch, gs[b[0]], slot(gs[b[0]], b[1])); err != nil {
+					t.Fatal(err)
+				}
+			}
+			next, err := l.Take(t.Context(), ch, notification.SlotRequest{N: 1, Lead: time.Second, Horizon: time.Second})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := slot(next, 0), slot(gs[c.want[0]], c.want[1]); !got.Equal(want) {
+				t.Fatalf("next slot at %s, want %s (slot %d of grant %d)", got, want, c.want[1], c.want[0])
+			}
+		})
+	}
+}
+
 // TestLimiterGrantCarriesValkeysClock: At is the "now" First is measured
 // from, so two grants on one key name the same grid on Valkey's timeline.
 func TestLimiterGrantCarriesValkeysClock(t *testing.T) {

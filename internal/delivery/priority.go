@@ -43,6 +43,10 @@ type selector struct {
 	// settled or hinted). A borrowed slot never goes to a priority not yet
 	// known (see Worker.claim).
 	known [3]bool
+	// revived: since the channel loop last looked, a hint lowered the sleep
+	// of a priority found empty, or a round's settle kept a hint over its
+	// "empty" (Worker.pauseWait).
+	revived bool
 }
 
 // round is the hint state when a round (a claim, or a NextDue read) began.
@@ -133,6 +137,7 @@ func (s *selector) settle(i int, until time.Time, check bool, r round) {
 	s.emptyUntil[i], s.check[i], s.raced[i], s.known[i] = until, check, false, true
 	if s.hintSeq[i] != r.seq[i] && s.hinted[i] && s.hintDue[i].Before(until) {
 		s.emptyUntil[i], s.check[i] = s.hintDue[i], false
+		s.revived = true
 	}
 }
 
@@ -146,6 +151,7 @@ func (s *selector) hint(i int, due time.Time) {
 	}
 	if s.emptyUntil[i].After(due) {
 		s.emptyUntil[i], s.check[i] = due, false
+		s.revived = true
 	}
 }
 

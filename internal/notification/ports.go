@@ -140,10 +140,13 @@ type Limiter interface {
 	// GiveBack returns what is left of grant g from the moment from (on the
 	// limiter's clock) on: if no slot was reserved on the channel after g,
 	// the channel's next free slot moves back to from, so the next Take
-	// gets it, or finds the grid free since then when it has passed. The
-	// caller sends nothing at or after from on g's account, and every
-	// request it did send on g leaves before from. It reports whether the
-	// slots were given back; false or an error only leaves them unused.
+	// gets it, or finds the grid free since then when it has passed. If
+	// slots were reserved after g, the range is kept and returned once
+	// everything reserved after it has been given back from its start, so
+	// the order of give-backs does not matter. The caller sends nothing at
+	// or after from on g's account, and every request it did send on g
+	// leaves before from. It reports whether the next free slot moved back
+	// now; false or an error only leaves the slots unused for now.
 	GiveBack(ctx context.Context, channel Channel, g Grant, from time.Time) (bool, error)
 }
 
