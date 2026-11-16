@@ -21,7 +21,7 @@ Bonus item: "Scheduled Notifications: allow scheduling notifications for future 
 3. Delayed messages in a broker. Native where a broker exists; we have none (0003).
 
 ## Decision
-Option 1. A `scheduled_at` in the past is treated as now; one further than a configured horizon (proposed 30 days) is refused.
+Option 1. A `scheduled_at` in the past is treated as now; one further than a fixed horizon (`notification.ScheduleHorizon`, 30 days) is refused.
 
 ## Confirmation
 Acceptance test with an injected clock at the database boundary: a notification scheduled for T is not at the provider double before T, is there within 2 seconds after T, and can be cancelled before T.
@@ -30,7 +30,7 @@ Acceptance test with an injected clock at the database boundary: a notification 
 | Number | Value | Where it comes from |
 |---|---|---|
 | Scheduling horizon | 30 days (`notification.ScheduleHorizon`) | Arbitrary. It bounds how long a row sits in the queue table and how long an idempotent replay must still make sense. Tune it from how far ahead real clients schedule; it is a product number, not a performance one |
-| Delivery after the due time, in the acceptance test | within 2 s | Arbitrary test slack, about 8 times the worst idle poll (250 ms). Tighten it with the measured claim latency |
+| Delivery after the due time, in the acceptance test | within 2 s | Arbitrary test slack: twice the worst idle wait (`wake.SafetyPoll`, 1 s, when a wake hint is lost; 0003). Tighten it with the measured claim latency |
 | Precision | milliseconds (`DATETIME(3)`, input truncated) | The column's precision. Pacing is about 10 ms per send, so finer scheduling would mean nothing |
 | Horizon in the database | `INTERVAL 30 DAY` in the `scheduled_within_horizon` CHECK | Repeats `notification.ScheduleHorizon`; `TestTheDatabaseRefusesASchedulePastTheHorizon` fails if they differ |
 | Database clock reads per request | 0 without a schedule, 1 with one (single or batch) | the owner's limit: at most one extra round trip per request, never one per item |
@@ -49,10 +49,10 @@ The two changes from the owner review above. Recurring schedules stay backlog (s
 
 ### Reschedule: `PATCH /v1/notifications/{id}`
 - Body `{"scheduledAt": <RFC 3339 time | null>}`, the field required and nullable; null or a past time means due now, the same rules as create. Answers 200 with the notification as stored.
-- Allowed while the row is `pending` with `claim_version = 0`: no worker has ever leased it, so no attempt, retry backoff (0007), provider `Retry-After` or breaker release (0008) is waiting on it. That is the API's `scheduled`, plus a due row not yet claimed, minus one case: a row a worker handed back unsent while the breaker was open shows as `scheduled` (attempts 0, due later) and is refused; the spec says so. Making `scheduled` also require `claim_version = 0` would change list and batch counts, so it is left to the owner. `attempts = 0` would not do: a breaker release and a reaped lease put a row back to pending with attempts still 0 and a worker's due time on it.
+- Allowed while the row is `pending` with `claim_version = 0`: no worker has ever leased it, so no attempt, retry backoff (0007), provider `Retry-After` or outage release (0026) is waiting on it. That is the API's `scheduled`, plus a due row not yet claimed, minus one case: a row a worker handed back unsent during a declared outage (0026) shows as `scheduled` (attempts 0, due later) and is refused; the spec says so. Making `scheduled` also require `claim_version = 0` would change list and batch counts, so it is left to the owner. `attempts = 0` would not do: a breaker release and a reaped lease put a row back to pending with attempts still 0 and a worker's due time on it.
 - One statement, `RescheduleNotification` in `internal/store/queries/intake.sql`: `UPDATE ... SET scheduled_at, due_at WHERE id = ? AND status = 'pending' AND claim_version = 0`. A claim racing it on the same row either leased it first (nothing matches) or leases after it and sees the new `due_at`. No row changed: 404 when the id is absent, else 409 `not_reschedulable` with the current status in the message. MySQL reports changed rows, so the same future schedule written again changes nothing; a row that is still unclaimed afterwards was unclaimed then too (`claim_version` never goes back to 0), so that counts as done.
 - No WebSocket event: the stored status does not change, and `StatusEvent` carries neither the schedule nor the `scheduled` view.
-- Tests: `internal/intake/reschedule_integration_test.go` (every allowed and refused state; 100 rounds of a reschedule racing `Queue.Claim` on one row, exactly one winner and no lost update, run with `-race`), `internal/httpapi/reschedule_integration_test.go` (over HTTP). Acceptance tests: see REQUIREMENTS B2.1.
+- Tests: `internal/intake/reschedule_integration_test.go` (every allowed and refused state; 100 rounds of a reschedule racing `Queue.Claim` on one row, exactly one winner and no lost update, run with `-race`), `internal/httpapi/reschedule_integration_test.go` (over HTTP). Acceptance tests: `TestB21RescheduleMovesAScheduledNotification`, `TestB21RescheduleRefusals`, `TestB21RescheduleRacingAWorkerHasOneWinner`, `TestB22HorizonUsesTheDatabaseClock` (`test/acceptance/schedule_reschedule_test.go`).
 
 ### One clock
 Every schedule decision now uses the database clock: `due_at` (the INSERT's `NOW(3)`), the claim, the `scheduled` status, and now the horizon, which was measured on the API process clock before.

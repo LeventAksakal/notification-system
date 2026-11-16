@@ -145,8 +145,9 @@ const (
 	MaxPageSize     = 200
 
 	// DefaultMetricsWindow and MaxMetricsWindow have no standard. The metrics
-	// endpoint scans the raw rows of the window (no rollup), so the maximum
-	// bounds that scan; tune it against the endpoint's latency. The default is
+	// endpoint reads the window's per-minute rollups plus at most 30 s of raw
+	// rows (decision 0014), so the maximum bounds that read; tune it against the
+	// endpoint's latency. The default is
 	// a product choice: the last minute.
 	DefaultMetricsWindow = 60 * time.Second
 	MaxMetricsWindow     = time.Hour

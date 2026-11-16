@@ -33,5 +33,5 @@ All valid answers `201` with the batch, not `202` (`api/openapi.yaml`): the rows
 | Number | Value | Where it comes from |
 |---|---|---|
 | Items per batch | 1000 | The brief |
-| Request body | 8 MiB (`notification.MaxRequestBodyBytes`) | The real cap for batches of large items (1000 emails at the 100 KB email limit would be about 100 MB); its reason belongs to record 0017 |
-| Per-item limits | by channel (SMS 1600 characters and E.164 recipient, email 100,000 characters and 254-character address, push 1024 characters) | Record 0017; a batch's 400 names each failing item by index and field |
+| Request body | 8 MiB (`notification.MaxRequestBodyBytes`) | The real cap for batches of large items (1000 emails at the 32,768-byte email limit would be about 32 MB); its reason belongs to record 0017 |
+| Per-item limits | by channel (SMS 1600 characters and E.164 recipient, email 32,768 bytes and 254-byte address, push 4,067 bytes) | Record 0017; a batch's 400 names each failing item by index and field |

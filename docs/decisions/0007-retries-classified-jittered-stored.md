@@ -25,7 +25,7 @@ The brief: "retry failed deliveries intelligently" and, as a bonus, "failure han
 3. Fixed interval retries. Predictable; after an outage every waiting message retries at the same instant.
 
 ## Decision
-Option 1. Every failure gets the action its meaning calls for (owner, 15 Nov 2026): a refusal is final, an unknown or transient outcome is retried, the provider's `Retry-After` is obeyed. Defaults: base 1 s, cap 5 min, 10 attempts (12 when first decided; 0026), provider timeout 5 s.
+Option 1. Every failure gets the action its meaning calls for (owner, 15 Nov 2026): a refusal is final, an unknown or transient outcome is retried, the provider's `Retry-After` is obeyed. Defaults: base 1 s, cap 5 min, 10 attempts (0026; 12 as built on 15 Nov, 5 when first recorded on 13 Nov), provider timeout 5 s.
 
 ## Confirmation
 - A table test over status codes and error kinds pins the classifier.

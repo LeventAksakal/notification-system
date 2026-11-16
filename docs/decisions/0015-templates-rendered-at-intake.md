@@ -32,10 +32,7 @@ Templates have a name and a body, no channel: the channel's limits are checked o
 ## Numbers
 | Number | Value | Where it comes from |
 |---|---|---|
-| Template name | at most 64 characters, `^[a-z0-9][a-z0-9_-]*$` | Arbitrary: a readable slug, safe in URLs. Widen it if real names hit it |
-| Template body | at most 100,000 characters | The largest channel limit (email), so any template can render for every channel whose limit it fits |
-| Variables per request | at most 50 | Arbitrary: bounds the work done per request. Tune it from the largest variable set real templates use |
-| One variable's value | at most 1000 characters | Arbitrary, same purpose. The binding limit is the channel's limit on the rendered content |
+| Template name, body, variables per request, one value | 63-character DNS label; 32,768 bytes; 6,553; 32,768 bytes | Each stands on a standard; record 0017's Numbers table and `internal/notification/limits.go` give the sources (replaced the first, arbitrary values on 16 Nov 2026) |
 
 ## Owner review (15 Nov 2026)
 - Unknown variables stay accepted. Every placeholder is required, so a typo already fails because the real variable is then missing. Rejecting extras would break every sender the moment a template drops a variable. Instead, the `400` lists `required`, `missing` and `unknown`, so a typo shows up next to the variable it was meant to be.

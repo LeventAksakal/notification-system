@@ -21,7 +21,7 @@ The brief: "millions of notifications daily", "high throughput", "reliable deliv
 3. Option 2 plus a shard resolver and date-partitioned tables now. Ready for data beyond one node; code paths that nothing in this repository can exercise or test.
 
 ## Decision
-Pending. Recommended: option 2, with option 3 written up in the README as the next step (shard by recipient hash, partition by day, drop old partitions). A lease that expires during a provider call can produce a second send; 0006 covers that case with the idempotency key.
+Option 2 (accepted 15 Nov 2026), with option 3 written up in the README as the next step (shard by recipient hash, partition by day, drop old partitions). A lease that expires during a provider call can produce a second send; 0006 covers that case with the idempotency key.
 
 ## Confirmation
 Fault tests: kill a worker mid-send, and pause a worker container past its lease then resume it. Assert every notification ends `sent`, none stays `processing`, and the paused worker's late write changed nothing.
@@ -88,4 +88,4 @@ The slow-provider gain is the concurrency's (Little's law caps 2 workers × 32 p
 ### Next step at scale
 At 24.6 M rows a day, deleting finished rows (retention, decision 0025) costs ~285 row deletes/s of steady write load on the same primary, in steps of 100 rows, and the B-tree keeps the churn. The next step: partition `notifications` and `delivery_attempts` by day (`PARTITION BY RANGE (TO_DAYS(created_at))`, the next partition created ahead each night). Retention then becomes `ALTER TABLE ... DROP PARTITION`: one metadata operation a day instead of 24.6 M row deletes, with no purge lag. MySQL requires every unique key to include the partitioning column, so the primary key becomes `(id, created_at)`, and lookups by id alone must still be served. The UUIDv7 id is time-ordered, so `created_at` can be derived from it and passed with every lookup. Written up, not built: it changes the schema's keys, every query by id and the claim index, and nothing in this repository runs at the volume that needs it.
 
-Known limits: no acceptance test runs the new defaults (the harness pins its own); `dial_measurements_test.go` is the only run of them. Two acceptance tests whose fixtures fall under the enforced lease floor are listed for test-writer in `.agents/pr/dials-derived-acceptance.md`.
+Known limits: no acceptance test runs the new defaults (the harness pins its own); `dial_measurements_test.go` is the only run of them. The two acceptance fixtures that fell under the enforced lease floor were raised above it with the held acceptance tests (commit f6497d1).

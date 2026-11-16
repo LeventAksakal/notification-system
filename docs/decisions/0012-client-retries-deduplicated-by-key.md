@@ -33,8 +33,8 @@ There is no `409` for a request still in flight: the second of two concurrent id
 | Number | Value | Where it comes from |
 |---|---|---|
 | Key lifetime | 24 h (`APP_IDEMPOTENCY_RETENTION`) | Industry default (Stripe expires keys after 24 h; the IETF draft leaves it to the server); longer than any client retry loop |
-| Sweep interval | 1 min (`APP_IDEMPOTENCY_SWEEP_INTERVAL`) | Unexplained; only the table's size depends on it |
-| Key length | at most 255 printable ASCII characters | Unexplained beyond fitting a UUID or a client token; ASCII because header values are (contract 1.1.0) |
+| Sweep interval | 1 min (`APP_IDEMPOTENCY_SWEEP_INTERVAL`) | Expired keys linger at most 1 min, 0.07% of a 24 h table (`config/config.go`, also 0018) |
+| Key length | at most 255 printable ASCII characters | Stripe's limit ("up to 255 characters", `internal/notification/limits.go`); the IETF draft sets none. ASCII because header values are (contract 1.1.0) |
 
 ## Known limits, acknowledged by the owner (15 Nov 2026)
 - **Keys are global, not scoped per client.** There is no authentication, so two clients choosing the same key collide: a 422, or with an identical body, the other client's notification. Scoping keys per account (the account in the unique index) belongs in the backlog with authentication; the brief does not require it.

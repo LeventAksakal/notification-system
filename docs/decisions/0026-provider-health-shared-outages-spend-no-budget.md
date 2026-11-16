@@ -6,6 +6,8 @@ revisit: when a provider's real error mix is measured (the false-trip numbers be
 ---
 # Provider health is shared in Valkey per channel, and a failure counts against a message only while its provider is believed healthy (0026)
 
+Supersedes 0008 (the per-worker breaker).
+
 ## Question
 When a channel's provider goes down, how does the whole fleet learn it once, stop sending, probe once per cool-down, and resume together, and how does an outage of any length dead-letter nothing while a message whose own sends keep failing is still dead-lettered?
 
@@ -58,4 +60,4 @@ How it runs (state hash `health:<channel>`; `internal/delivery/health/valkey_sta
 - `internal/delivery/failure_attribution_test.go`: the outcome table; excused due times spread over a cool-down; a worker over an outage 20 cool-downs long that spends at most K-1 units, dead-letters nothing and probes about once per cool-down; 8 message-specific 503 rows among sparse traffic declare at most N·B/(K-1) outages and are all dead-lettered.
 - `internal/delivery/retry_numbers_test.go`: the default budget is ceil(log2(cap/base)) + 1, at least K, and reaches the cap.
 - The database: `budget_within_attempts` CHECK (`budget_spent <= attempts`).
-- Acceptance (rows B1 and R12): four tests drafted in `.agents/pr/provider-health-design.md`, held until owner item 0002 settles who may write `test/acceptance/` from a worktree.
+- Acceptance (rows B1 and R12): `TestDeliveryB1SharedHealthLongOutage`, `TestDeliveryB1LoneMessageOutlivesOutage` and `TestDeliveryR12MessageSpecificFailureDeadLetters` (`test/acceptance/delivery_health_test.go`).

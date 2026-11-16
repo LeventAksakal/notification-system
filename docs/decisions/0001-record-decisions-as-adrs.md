@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-11-13
 decision-makers: owner (in chat)
-revisit: when the index passes 20 records
+revisit: when the index passes 40 records (the first trigger, 20, fired on 16 Nov 2026 at 25 records; the folder still reads well as one index)
 ---
 # Record decisions as short, checkable ADRs (0001)
 
