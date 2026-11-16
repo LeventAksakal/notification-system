@@ -37,6 +37,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/LeventAksakal/notification-system/internal/delivery/health"
+	"github.com/LeventAksakal/notification-system/internal/delivery/leasebudget"
 	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/provider"
 	"github.com/LeventAksakal/notification-system/internal/telemetry"
@@ -77,7 +78,15 @@ type Config struct {
 	// reserve now: IdleMin while all its provider calls are in flight (a call
 	// place frees within a call's time), and the clock probe's back-off from
 	// IdleMin doubling to IdleMax; IdleMax after the limiter or a claim failed
-	// and as the cap of a refused health check's wait. Defaults 50ms and 250ms. A channel
+	// and as the cap of a refused health check's wait. Defaults 50ms and 250ms:
+	// at full load a call place frees every 500 ms / 72 = 7 ms (assumed
+	// provider p99 over APP_WORKER_CONCURRENCY), so 50 ms wakes once several
+	// have freed and gives up at most about five of a channel's 10.5 ms slots
+	// to the other workers; 250 ms keeps a failing limiter or database at 4
+	// retries a second per channel per worker (36 for 3 workers x 3 channels)
+	// while bounding the first send after the fault clears. Both are free
+	// choices within those bounds; tune by the slots given up when
+	// concurrency binds. A channel
 	// with nothing due does not poll: it sleeps until its next due time, a
 	// wake hint, or SafetyPoll.
 	IdleMin, IdleMax time.Duration
@@ -193,16 +202,25 @@ func New(cfg Config, deps Deps) *Worker {
 }
 
 // storeTimeout bounds one result write; it is not cut short by shutdown, so a
-// finished send is always recorded when the database answers.
-const storeTimeout = 10 * time.Second
+// finished send is recorded when the database answers in time. Source: at
+// least the slowest result write measured under overload (3.3 s, decision
+// 0018, "As built"), and at most the 5 s compose's 25 s stop_grace_period
+// sets aside for final writes after APP_SHUTDOWN_TIMEOUT (10 s), beside the
+// telemetry flush (5 s) and 5 s to spare. A write that misses it is retried by the lease: the row is reaped
+// and sent again under the same idempotency key.
+const storeTimeout = 5 * time.Second
 
 // leaseMargin is how long before its lease ends a provider call is cut, so
-// the attempt is recorded while the claim still holds. It also covers the
-// skew between the local clock and the database's.
-const leaseMargin = 250 * time.Millisecond
+// the attempt is recorded while the claim still holds (leasebudget.Margin,
+// where its source is). config.Load refuses a lease too short to hold a whole
+// provider call, its slot wait and this margin.
+const leaseMargin = leasebudget.Margin
 
 // minSendTime is the least call time worth starting; with less lease left
-// the job is released instead.
+// the job is released instead. Source: a fifth of the assumed provider p99
+// (500 ms, decision 0018); a call given less is more likely cut than
+// answered. It is reached only after a pause, since config.Load keeps the
+// lease above a whole provider call.
 const minSendTime = 100 * time.Millisecond
 
 // errLeaseCut is the cause of a call ended by the lease, not the provider timeout.

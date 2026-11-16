@@ -60,7 +60,8 @@ func TestWorkerLeaseSafety(t *testing.T) {
 			return provider.Response{}, ctx.Err()
 		}}
 		cfg := testConfig()
-		cfg.Lease = 600 * time.Millisecond
+		// 350 ms above the margin: room to start the call, too little to finish it.
+		cfg.Lease = leaseMargin + 350*time.Millisecond
 		cfg.MaxAttempts = 1
 		stop := run(t, New(cfg, Deps{Queue: q, Limiter: testLimiter(), Sender: snd}))
 		id := "sms-normal-0"

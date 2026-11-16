@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LeventAksakal/notification-system/internal/delivery/leasebudget"
 	"github.com/LeventAksakal/notification-system/internal/notification"
 )
 
@@ -78,17 +79,18 @@ type Dial struct {
 
 // Dials lists every setting. Order is the order of the docs.
 var Dials = []Dial{
-	text("APP_HTTP_ADDR", ":8080", "HTTP listen address", func(c *Config) *string { return &c.HTTPAddr }),
-	{Env: "APP_DATABASE_DSN", Doc: "MySQL DSN (go-sql-driver format); injected at runtime", Required: true, Secret: true,
+	text("APP_HTTP_ADDR", ":8080", "HTTP listen address. Default: the conventional unprivileged HTTP port", func(c *Config) *string { return &c.HTTPAddr }),
+	{Env: "APP_DATABASE_DSN", Doc: "MySQL DSN (go-sql-driver format). Default: none, a secret is injected at runtime, never committed", Required: true, Secret: true,
 		apply: func(c *Config, raw string) error { c.DatabaseDSN = raw; return nil }},
-	text("APP_VALKEY_ADDR", "localhost:6379", "Valkey host:port", func(c *Config) *string { return &c.ValkeyAddr }),
-	text("APP_OTLP_ENDPOINT", "", "OTLP/HTTP base URL, e.g. http://otel:4318; empty disables export",
+	text("APP_VALKEY_ADDR", "localhost:6379", "Valkey host:port. Default: Valkey's standard port 6379", func(c *Config) *string { return &c.ValkeyAddr }),
+	text("APP_OTLP_ENDPOINT", "", "OTLP/HTTP base URL, e.g. http://otel:4318; empty disables export. Default: empty, so a bare run needs no collector "+
+		"(compose sets OTLP/HTTP's standard port 4318)",
 		func(c *Config) *string { return &c.OTLPEndpoint }),
-	text("APP_SERVICE_NAME", "notifier", "service.name on every span, metric and log", func(c *Config) *string { return &c.ServiceName }),
+	text("APP_SERVICE_NAME", "notifier", "service.name on every span, metric and log. Default: the product's name (a free choice; OpenTelemetry requires one)", func(c *Config) *string { return &c.ServiceName }),
 	{Env: "OTEL_TRACES_SAMPLER", Default: "parentbased_always_on", PassThrough: true,
 		Doc: "trace sampler, read by the OpenTelemetry SDK: " + strings.Join(traceSamplers, ", ") +
 			". Keep it parentbased_*: the worker continues the trace stored at the API, so the API's decision must hold there " +
-			"(production: parentbased_traceidratio, decision 0019)",
+			"(production: parentbased_traceidratio, decision 0019). Default: the OpenTelemetry SDK's own default",
 		apply: func(_ *Config, raw string) error {
 			if !slices.Contains(traceSamplers, strings.ToLower(strings.TrimSpace(raw))) {
 				return fmt.Errorf("unknown sampler %q (want one of %s)", raw, strings.Join(traceSamplers, ", "))
@@ -96,7 +98,7 @@ var Dials = []Dial{
 			return nil
 		}},
 	{Env: "OTEL_TRACES_SAMPLER_ARG", Default: "1", PassThrough: true,
-		Doc: "share of new traces the *traceidratio samplers keep, read by the OpenTelemetry SDK; ignored by the others [0..1]",
+		Doc: "share of new traces the *traceidratio samplers keep, read by the OpenTelemetry SDK; ignored by the others. Default: 1, the SDK's own default [0..1]",
 		apply: func(_ *Config, raw string) error {
 			v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
 			if err != nil {
@@ -107,20 +109,27 @@ var Dials = []Dial{
 			}
 			return nil
 		}},
-	{Env: "APP_LOG_LEVEL", Doc: "debug, info, warn or error", Default: "info",
+	{Env: "APP_LOG_LEVEL", Doc: "debug, info, warn or error. Default: slog's default level", Default: "info",
 		apply: func(c *Config, raw string) error { return c.LogLevel.UnmarshalText([]byte(raw)) }},
-	integer("APP_DB_MAX_OPEN_CONNS", "10", "MySQL pool size", 1, 200, func(c *Config) *int { return &c.DBMaxOpenConns }),
-	duration("APP_READ_HEADER_TIMEOUT", "5s", "time a client has to send request headers", time.Second, time.Minute,
+	integer("APP_DB_MAX_OPEN_CONNS", "10", "MySQL pool size per process. Default: a worker needs 3 claims + 1 reap + result "+
+		"writes (142.5/s x 5 ms on a healthy disk) = 5 connections, doubled; 4 processes x 10 stay far under MySQL's max_connections "+
+		"151; 24 measured worse on a slow disk (decision 0018)", 1, 200, func(c *Config) *int { return &c.DBMaxOpenConns }),
+	duration("APP_READ_HEADER_TIMEOUT", "5s", "time a client has to send request headers. Default: headers take one round trip (under 1 s on a slow "+
+		"mobile link); 5 s bounds a slow-header client, far under nginx's 60 s client_header_timeout", time.Second, time.Minute,
 		func(c *Config) *time.Duration { return &c.ReadHeaderTimeout }),
-	duration("APP_REQUEST_TIMEOUT", "15s", "longest a request may take before it is answered 503", time.Second, 5*time.Minute,
+	duration("APP_REQUEST_TIMEOUT", "10s", "longest a request may take before it is answered 503. Default: the slowest legitimate "+
+		"request, an 8 MiB batch uploaded at 10 Mbit/s (6.7 s) + its insert + the 1 s publish budget, rounded up; under proxies' 60 s", time.Second, 5*time.Minute,
 		func(c *Config) *time.Duration { return &c.RequestTimeout }),
-	duration("APP_SHUTDOWN_TIMEOUT", "10s", "grace period for in-flight requests on SIGTERM", time.Second, 2*time.Minute,
+	duration("APP_SHUTDOWN_TIMEOUT", "10s", "grace period for in-flight requests and provider calls on SIGTERM; at least APP_REQUEST_TIMEOUT and "+
+		"APP_PROVIDER_TIMEOUT. Default: the larger of those two; compose's 25 s stop_grace_period adds the 5 s telemetry flush, "+
+		"5 s for final writes", time.Second, 2*time.Minute,
 		func(c *Config) *time.Duration { return &c.ShutdownTimeout }),
 
 	providerURL("APP_PROVIDER_URL_SMS", notification.ChannelSMS),
 	providerURL("APP_PROVIDER_URL_EMAIL", notification.ChannelEmail),
 	providerURL("APP_PROVIDER_URL_PUSH", notification.ChannelPush),
-	duration("APP_PROVIDER_TIMEOUT", "5s", "time limit of one provider call", 10*time.Millisecond, time.Minute,
+	duration("APP_PROVIDER_TIMEOUT", "5s", "time limit of one provider call. Default: 10 x the assumed provider p99 of 500 ms (decision 0018), so a "+
+		"slow success is rarely cut", 10*time.Millisecond, time.Minute,
 		func(c *Config) *time.Duration { return &c.ProviderTimeout }),
 	integer("APP_MAX_ATTEMPTS", "10", "failed calls counted against a notification (made while its provider was believed healthy) "+
 		"before it fails as exhausted. Default: the smallest budget whose waits reach APP_RETRY_CAP, ceil(log2(cap/base))+1 = 10 with "+
@@ -134,26 +143,34 @@ var Dials = []Dial{
 		"Default target: once a message-specific failure clears, the message goes out within 5 min (time-sensitive "+
 		"notifications such as one-time codes commonly expire in 5 to 10 min)", time.Millisecond, 24*time.Hour,
 		func(c *Config) *time.Duration { return &c.RetryCap }),
-	integer("APP_RATE_LIMIT_PER_SECOND", "100", "provider's send limit per channel, per second", 1, 100_000,
+	integer("APP_RATE_LIMIT_PER_SECOND", "100", "provider's send limit per channel, per second. Default: the brief's limit", 1, 100_000,
 		func(c *Config) *int { return &c.RateLimitPerSecond }),
 	integer("APP_RATE_LIMIT_HEADROOM_PERCENT", "5",
 		"the limiter paces this many percent under the limit; send slots are exactly one interval apart, "+
-			"so 0 is exact at the limiter but leaves no room for arrival jitter at the provider", 0, 50,
+			"so 0 is exact at the limiter but leaves no room for arrival jitter at the provider. Default: measured (owner item "+
+			"0013): at 95 the busiest second at the provider is 98 to 99", 0, 50,
 		func(c *Config) *int { return &c.RateLimitHeadroomPct }),
 	duration("APP_RATE_LIMIT_HORIZON", "200ms", "least span of send slots one limiter call reserves past the send alignment; a busy channel calls the limiter every half of it "+
-		"(200ms: 10 calls per second per channel per worker); it grows to the alignment while claims are slower than it",
+		"(200ms: 10 calls per second per channel per worker); it grows to the alignment while claims are slower than it. "+
+		"Default: that budget of limiter calls (internal/delivery/send_alignment.go)",
 		10*time.Millisecond, 2*time.Second,
 		func(c *Config) *time.Duration { return &c.RateLimitHorizon }),
 	{Env: "APP_PRIORITY_WEIGHTS", Default: "70,20,10",
 		Doc: "high,normal,low shares of a channel's rate; each [0..100], sum above 0; unused share is borrowed. " +
-			"A weight of 0 means that priority only sends on slots the others leave unused",
+			"A weight of 0 means that priority only sends on slots the others leave unused. " +
+			"Default: a free choice (decision 0010); tune to the traffic mix",
 		apply: func(c *Config, raw string) error { return parseWeights(raw, &c.PriorityWeights) }},
 	duration("APP_LEASE_DURATION", "30s",
-		"how long a claimed notification belongs to its worker; a provider call is cut 250ms before it ends", time.Second, time.Hour,
+		"how long a claimed notification belongs to its worker; a provider call is cut "+leasebudget.Margin.String()+" before it "+
+			"ends; at least APP_PROVIDER_TIMEOUT + the longest slot wait (a quarter of the lease) + one slot interval + "+
+			leasebudget.Margin.String()+". Default: an eighth of it is the send alignment's ceiling, 3.75 s, above the claims of a "+
+			"loaded database (about 3 s at p95, owner item 0011)", time.Second, time.Hour,
 		func(c *Config) *time.Duration { return &c.LeaseDuration }),
-	duration("APP_REAP_INTERVAL", "5s", "how often expired leases are returned to pending", 10*time.Millisecond, 10*time.Minute,
+	duration("APP_REAP_INTERVAL", "5s", "how often expired leases are returned to pending. Default: worst-case recovery after a crash is "+
+		"lease + reap = 35 s; shorter adds little next to the 30 s lease, for one indexed UPDATE per worker per 5 s", 10*time.Millisecond, 10*time.Minute,
 		func(c *Config) *time.Duration { return &c.ReapInterval }),
-	integer("APP_WORKER_CONCURRENCY", "32", "provider calls in flight per worker process", 1, 1024,
+	integer("APP_WORKER_CONCURRENCY", "72", "provider calls in flight per worker process. Default: Little's law, 2 of 3 workers "+
+		"carry the full 285/s at the assumed 500 ms provider p99: 285 x 0.5 / 2 = 72", 1, 1024,
 		func(c *Config) *int { return &c.WorkerConcurrency }),
 	integer("APP_BREAKER_FAILURES", "5", "consecutive provider-fault results on a channel, across all workers, that declare its "+
 		"provider down (shared in Valkey, decision 0026); the declaring failure and every later one until recovery do not count "+
@@ -165,15 +182,19 @@ var Dials = []Dial{
 		"one probe per cool-down fleet-wide. Default target: sending resumes within 5 s plus one probe round trip of recovery "+
 		"(Hystrix's default sleep window), for one call per 5 s while down (0.2% of the paced rate)", 10*time.Millisecond, 10*time.Minute,
 		func(c *Config) *time.Duration { return &c.BreakerCooldown }),
-	duration("APP_IDEMPOTENCY_RETENTION", "24h", "how long an Idempotency-Key is remembered", time.Second, 30*24*time.Hour,
+	duration("APP_IDEMPOTENCY_RETENTION", "24h", "how long an Idempotency-Key is remembered. Default: Stripe's 24 h key window", time.Second, 30*24*time.Hour,
 		func(c *Config) *time.Duration { return &c.IdempotencyRetention }),
-	duration("APP_IDEMPOTENCY_SWEEP_INTERVAL", "1m", "how often app serve deletes expired Idempotency-Keys and notifications past APP_NOTIFICATION_RETENTION", 10*time.Millisecond, time.Hour,
+	duration("APP_IDEMPOTENCY_SWEEP_INTERVAL", "1m", "how often app serve deletes expired Idempotency-Keys and notifications past APP_NOTIFICATION_RETENTION. "+
+		"Default: expired keys linger at most 1 min, 0.07% of a 24 h table", 10*time.Millisecond, time.Hour,
 		func(c *Config) *time.Duration { return &c.IdempotencySweep }),
 	// At least the metrics window (an hour), so /metrics never counts a
 	// deleted row; at least APP_IDEMPOTENCY_RETENTION, checked in load.
-	duration("APP_NOTIFICATION_RETENTION", "168h", "how long sent, failed and cancelled notifications and their attempts are kept after they finish; a failed one can be replayed only while kept", time.Hour, 365*24*time.Hour,
+	duration("APP_NOTIFICATION_RETENTION", "168h", "how long sent, failed and cancelled notifications and their attempts are kept after they finish; a failed one can be replayed only while kept. "+
+		"Default: a failure on a Friday is still replayable on Monday (decision 0025)", time.Hour, 365*24*time.Hour,
 		func(c *Config) *time.Duration { return &c.NotificationRetention }),
-	integer("APP_WS_SEND_BUFFER", "256", "events buffered per WebSocket subscriber before it is dropped as slow (arbitrary; how to tune it: decision 0013, Numbers)", 1, 65_536,
+	integer("APP_WS_SEND_BUFFER", "1024", "events buffered per WebSocket subscriber before it is dropped as slow. Default: one "+
+		"batch create publishes up to 1000 events at once and an unfiltered stream gets 855 events/s at the full rate; 1024 holds "+
+		"one batch burst (about 140 KB per socket, decision 0018)", 1, 65_536,
 		func(c *Config) *int { return &c.WSSendBuffer }),
 }
 
@@ -261,12 +282,8 @@ func load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 	if err := samplerArgIgnored(settings); err != nil {
 		errs = append(errs, err)
 	}
-	if len(errs) == 0 && c.RetryCap < c.RetryBase {
-		errs = append(errs, fmt.Errorf("APP_RETRY_CAP %s is below APP_RETRY_BASE %s", c.RetryCap, c.RetryBase))
-	}
-	if len(errs) == 0 && c.NotificationRetention < c.IdempotencyRetention {
-		// A keyed retry must find the notification or batch its key names.
-		errs = append(errs, fmt.Errorf("APP_NOTIFICATION_RETENTION %s is below APP_IDEMPOTENCY_RETENTION %s", c.NotificationRetention, c.IdempotencyRetention))
+	if len(errs) == 0 {
+		errs = crossChecks(c)
 	}
 	return c, settings, errs
 }
@@ -303,7 +320,7 @@ func resolve(d Dial, getenv func(string) string, readFile func(string) ([]byte, 
 }
 
 func providerURL(env string, ch notification.Channel) Dial {
-	return Dial{Env: env, Default: "http://localhost:8090/send", Doc: "provider endpoint for " + string(ch) + " (http or https URL)",
+	return Dial{Env: env, Default: "http://localhost:8090/send", Doc: "provider endpoint for " + string(ch) + " (http or https URL). Default: the provider double's local address",
 		apply: func(c *Config, raw string) error {
 			u, err := url.Parse(raw)
 			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {

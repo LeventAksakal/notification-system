@@ -37,31 +37,40 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 - Events: every committed status change is published once through `core.Publisher` (Valkey pub/sub). Publishing never delays a response by more than one bounded wait per request, whatever the number of events (a batch is one pipelined publish with one deadline). When an API instance loses its event feed it closes its WebSocket streams and refuses new ones until the feed is back.
 
 ## Settings (all in `config`, each with default, bounds, doc line)
-| Variable | Default | Meaning |
-|---|---|---|
-| `APP_HTTP_ADDR` | `:8080` | exists |
-| `APP_DATABASE_DSN` | required | exists |
-| `APP_VALKEY_ADDR` | `localhost:6379` | exists |
-| `APP_PROVIDER_URL_SMS`, `_EMAIL`, `_PUSH` | `http://localhost:8090/send` | provider URL per channel |
-| `APP_PROVIDER_TIMEOUT` | `5s` | one provider call |
-| `APP_MAX_ATTEMPTS` | `10` | counted failures before `exhausted`: the smallest budget whose waits reach the cap; a message-specific failure retries for about 6.75 min on average, 13.5 at most (decision 0026; an outage no longer spends budget) |
-| `APP_RETRY_BASE` | `1s` | backoff base |
-| `APP_RETRY_CAP` | `5m` | backoff cap |
-| `APP_RATE_LIMIT_PER_SECOND` | `100` | provider's limit per channel |
-| `APP_RATE_LIMIT_HEADROOM_PERCENT` | `3` | the limiter paces this much under the limit, so arrival jitter cannot show 101 in a second at the provider |
-| `APP_RATE_LIMIT_HORIZON` | `200ms` | least span of send slots one limiter call reserves past the lead (a budget of 10 limiter calls per second per channel per worker) |
-| `APP_PRIORITY_WEIGHTS` | `70,20,10` | high, normal, low shares |
-| `APP_LEASE_DURATION` | `30s` | claim lease |
-| `APP_REAP_INTERVAL` | `5s` | how often expired leases are returned |
-| `APP_WORKER_CONCURRENCY` | `32` | provider calls in flight per worker process |
-| `APP_BREAKER_FAILURES` | `5` | consecutive provider faults, fleet-wide, that declare an outage |
-| `APP_BREAKER_COOLDOWN` | `5s` | least time before the next probe, fleet-wide |
-| `APP_IDEMPOTENCY_RETENTION` | `24h` | how long a key is remembered |
-| `APP_IDEMPOTENCY_SWEEP_INTERVAL` | `1m` | how often expired keys and expired finished notifications are deleted |
-| `APP_NOTIFICATION_RETENTION` | `168h` | how long finished notifications and their attempts are kept (1h..365d, at least the key retention; decision 0025) |
-| `APP_WS_SEND_BUFFER` | `256` | events buffered per subscriber before it is dropped |
-| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | pass-through, read by the OpenTelemetry SDK and validated by `config`; production `parentbased_traceidratio` (decision 0019) |
-| `OTEL_TRACES_SAMPLER_ARG` | `1` | pass-through; share of new traces kept by the `*traceidratio` samplers; production `0.02`, derived in decision 0019 |
+Each dial's doc line ends with where its default comes from (`go run ./cmd/app env`); the derivations and the measurements behind them are in decision 0018, "As built". `config.Load` and `app env check` refuse combinations that cannot work (`config/cross_checks.go`): retry cap below base, notification retention below key retention, a lease shorter than provider timeout + longest slot wait + one slot interval + 500 ms margin, and a shutdown grace shorter than the provider or request timeout.
+
+| Variable | Default | Meaning | Reason |
+|---|---|---|---|
+| `APP_HTTP_ADDR` | `:8080` | listen address | conventional unprivileged HTTP port |
+| `APP_DATABASE_DSN` | required | MySQL DSN | a secret, injected at runtime |
+| `APP_VALKEY_ADDR` | `localhost:6379` | Valkey host:port | Valkey's standard port |
+| `APP_OTLP_ENDPOINT` | empty | OTLP/HTTP base URL; empty disables export | a bare run needs no collector; compose sets port 4318 |
+| `APP_SERVICE_NAME` | `notifier` | `service.name` on all telemetry | free choice; OpenTelemetry requires one |
+| `APP_LOG_LEVEL` | `info` | log level | slog's default |
+| `APP_DB_MAX_OPEN_CONNS` | `10` | MySQL pool per process | 3 claims + 1 reap + writes = 5 needed, doubled; 24 measured worse on a slow disk |
+| `APP_READ_HEADER_TIMEOUT` | `5s` | time to send request headers | one round trip is under 1 s; far under nginx's 60 s |
+| `APP_REQUEST_TIMEOUT` | `10s` | answered 503 after | an 8 MiB batch at 10 Mbit/s (6.7 s) + insert + 1 s publish budget, rounded up |
+| `APP_SHUTDOWN_TIMEOUT` | `10s` | grace on SIGTERM | at least the request and provider timeouts (enforced); + 5 s final writes + 5 s flush + 5 s spare = compose's 25 s stop grace |
+| `APP_PROVIDER_URL_SMS`, `_EMAIL`, `_PUSH` | `http://localhost:8090/send` | provider URL per channel | the provider double's local address |
+| `APP_PROVIDER_TIMEOUT` | `5s` | one provider call | 10 × the assumed 500 ms provider p99 |
+| `APP_MAX_ATTEMPTS` | `10` | counted failures before `exhausted` | the smallest budget whose waits reach the cap, ceil(log2(cap/base)) + 1; a message-specific failure retries for about 6.75 min on average, 13.5 at most (decision 0026; an outage no longer spends budget) |
+| `APP_RETRY_BASE` | `1s` | backoff base | decision 0007: full-jitter backoff, past a transient blip |
+| `APP_RETRY_CAP` | `5m` | backoff cap | decision 0007 |
+| `APP_RATE_LIMIT_PER_SECOND` | `100` | provider's limit per channel | the brief |
+| `APP_RATE_LIMIT_HEADROOM_PERCENT` | `5` | the limiter paces this much under the limit, so arrival jitter cannot show 101 in a second at the provider | measured (owner item 0013): at 95 the busiest second is 98 to 99 |
+| `APP_RATE_LIMIT_HORIZON` | `200ms` | least span of send slots one limiter call reserves past the lead | a budget of 10 limiter calls per second per channel per worker |
+| `APP_PRIORITY_WEIGHTS` | `70,20,10` | high, normal, low shares | free choice (decision 0010); tune to the traffic mix |
+| `APP_LEASE_DURATION` | `30s` | claim lease | an eighth is the alignment's ceiling, 3.75 s, above a loaded database's claims (about 3 s at p95, owner item 0011); floor 7.35 s at the default timeout (enforced) |
+| `APP_REAP_INTERVAL` | `5s` | how often expired leases are returned | crash recovery is lease + reap = 35 s; shorter adds little next to the 30 s lease |
+| `APP_WORKER_CONCURRENCY` | `72` | provider calls in flight per worker process | Little's law: 2 of 3 workers carry 285/s at a 500 ms p99, 285 × 0.5 / 2 |
+| `APP_BREAKER_FAILURES` | `5` | consecutive provider faults, fleet-wide, that declare an outage | Envoy outlier detection's consecutive_5xx |
+| `APP_BREAKER_COOLDOWN` | `5s` | least time before the next probe, fleet-wide | Hystrix's default sleep window; one call per 5 s while down |
+| `APP_IDEMPOTENCY_RETENTION` | `24h` | how long a key is remembered | Stripe's 24 h key window |
+| `APP_IDEMPOTENCY_SWEEP_INTERVAL` | `1m` | how often expired keys and expired finished notifications are deleted | expired keys linger at most 0.07% of a 24 h table |
+| `APP_NOTIFICATION_RETENTION` | `168h` | how long finished notifications and their attempts are kept (1h..365d, at least the key retention; decision 0025) | a Friday failure is still replayable on Monday |
+| `APP_WS_SEND_BUFFER` | `1024` | events buffered per subscriber before it is dropped | one batch create publishes up to 1000 events at once; about 140 KB per socket |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | pass-through, read by the OpenTelemetry SDK and validated by `config`; production `parentbased_traceidratio` (decision 0019) | the SDK's own default |
+| `OTEL_TRACES_SAMPLER_ARG` | `1` | pass-through; share of new traces kept by the `*traceidratio` samplers; production `0.02`, derived in decision 0019 | the SDK's own default |
 
 ## Acceptance test harness (`test/acceptance/`, build tag `integration`)
 - Black box: the tests build `./cmd/app` once (`TestMain`), start real MySQL and Valkey with `test/support` (`support.MySQL(t)` returns a migrated database and its DSN, `support.Valkey(t)` an address, `support.Provider(t)` the double's URL and handle), then run `app serve` and N × `app worker` as child processes configured only through the variables above. They speak HTTP to the API, read the provider double's counters, and read the children's stdout for log assertions.

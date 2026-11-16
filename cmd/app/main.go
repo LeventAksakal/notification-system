@@ -77,7 +77,11 @@ func run(ctx context.Context, cmd string) error {
 	}
 	defer func() {
 		// The signal has cancelled ctx by now; WithoutCancel keeps its values
-		// but not its cancellation, so the flush gets its own 5 s.
+		// but not its cancellation, so the flush gets its own 5 s. Source: a
+		// free choice inside compose's 25 s stop_grace_period, which holds
+		// APP_SHUTDOWN_TIMEOUT (10 s) + this flush + 5 s for final writes; an
+		// export to a local collector takes milliseconds, so 5 s is ample
+		// (OpenTelemetry's own export deadline, OTEL_BSP_EXPORT_TIMEOUT, is 30 s).
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if err := shutdownObs(ctx); err != nil {
@@ -254,6 +258,9 @@ func serveHTTP(ctx context.Context, ln net.Listener, srv *http.Server, grace tim
 	return g.Wait()
 }
 
+// healthcheck asks /readyz. Its 3 s sits between /readyz's own 2 s deadline
+// (so the probe hears readyz's answer, not its own timeout) and compose's
+// 4 s healthcheck timeout (so compose hears this command's verdict).
 func healthcheck(ctx context.Context, url string) error {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()

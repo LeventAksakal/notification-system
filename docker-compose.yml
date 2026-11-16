@@ -83,7 +83,7 @@ services:
       migrate: { condition: service_completed_successfully }
       valkey: { condition: service_healthy }
       otel: { condition: service_started }
-    stop_grace_period: 15s # above APP_SHUTDOWN_TIMEOUT so drains finish
+    stop_grace_period: 25s # APP_SHUTDOWN_TIMEOUT 10s + final writes 5s + telemetry flush 5s + 5s to spare
     restart: unless-stopped # a crashed API comes back; `docker compose stop` still stops it
     healthcheck:
       test: ["CMD", "/app", "healthcheck"]
@@ -115,7 +115,7 @@ services:
       otel: { condition: service_started }
     deploy:
       replicas: 3
-    stop_grace_period: 15s # above APP_SHUTDOWN_TIMEOUT so in-flight sends finish
+    stop_grace_period: 25s # APP_SHUTDOWN_TIMEOUT 10s + final result writes 5s (storeTimeout) + telemetry flush 5s + 5s to spare
     restart: unless-stopped # a crashed worker comes back; its claimed rows return when their lease ends
 
 volumes:

@@ -12,7 +12,7 @@ import (
 )
 
 // DefaultRequestTimeout is APP_REQUEST_TIMEOUT's default.
-const DefaultRequestTimeout = 15 * time.Second
+const DefaultRequestTimeout = 10 * time.Second
 
 // errRequestTimeout is the cause of a request cut by its deadline.
 var errRequestTimeout = fmt.Errorf("request deadline: %w", context.DeadlineExceeded)

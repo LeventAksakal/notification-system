@@ -50,7 +50,7 @@ type Options struct {
 // NewServer takes the intake service, the readiness checks by dependency
 // name, and the optional parts.
 func NewServer(svc *intake.Service, checks map[string]Check, opts ...Options) *Server {
-	s := &Server{intake: svc, checks: checks, wsBuffer: 256 /* APP_WS_SEND_BUFFER's default */, streams: newStreams(), requestTimeout: DefaultRequestTimeout}
+	s := &Server{intake: svc, checks: checks, wsBuffer: 1024 /* APP_WS_SEND_BUFFER's default */, streams: newStreams(), requestTimeout: DefaultRequestTimeout}
 	for _, o := range opts {
 		s.metrics, s.hub = o.Metrics, o.Hub
 		if o.WSSendBuffer > 0 {

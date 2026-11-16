@@ -38,7 +38,7 @@ func TestDefaultsLoadOnceSecretsAreInjected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.HTTPAddr != ":8080" || c.ShutdownTimeout != 10*time.Second || c.DBMaxOpenConns != 10 || c.RequestTimeout != 15*time.Second {
+	if c.HTTPAddr != ":8080" || c.ShutdownTimeout != 10*time.Second || c.DBMaxOpenConns != 10 || c.RequestTimeout != 10*time.Second {
 		t.Fatalf("defaults not applied: %+v", c)
 	}
 }
@@ -54,7 +54,7 @@ func TestDeliveryDialsDefaultToTheContractTable(t *testing.T) {
 		}
 	}
 	if c.PriorityWeights != [3]int{70, 20, 10} || c.BreakerFailures != 5 || c.MaxAttempts != 10 ||
-		c.RetryCap != 5*time.Minute || c.IdempotencyRetention != 24*time.Hour || c.WSSendBuffer != 256 ||
+		c.RetryCap != 5*time.Minute || c.IdempotencyRetention != 24*time.Hour || c.WSSendBuffer != 1024 ||
 		c.RateLimitHorizon != 200*time.Millisecond || c.RateLimitHeadroomPct != 5 {
 		t.Fatalf("defaults not applied: %+v", c)
 	}

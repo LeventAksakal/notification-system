@@ -33,8 +33,8 @@ const Channel = "notifier:status-events"
 // Where it comes from: a PUBLISH to a healthy Valkey on the same network is
 // answered in about a millisecond, so a call that takes a second is a Valkey
 // that is down or hung, not a slow one; and one second spent by a caller is
-// far inside the API's request timeout (APP_REQUEST_TIMEOUT, 15 s) and the
-// worker's result-write timeout (storeTimeout, 10 s). A subscriber waits
+// far inside the API's request timeout (APP_REQUEST_TIMEOUT, 10 s) and the
+// worker's result-write timeout (storeTimeout, 5 s). A subscriber waits
 // twice this for a missing predecessor (holdForPredecessor). Arbitrary
 // within those bounds; to tune it, take the p99.9 of publish latency under
 // load and keep it two orders of magnitude above that.

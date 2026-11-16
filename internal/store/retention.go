@@ -18,7 +18,11 @@ import (
 // pause as long as the step after each one, so the sweeper keeps the database
 // busy at most half the time.
 const (
-	RetentionBatch  = 100
+	RetentionBatch = 100
+	// batchSweepLimit bounds one DELETE of expired batch rows (one small row
+	// per batch create, no attempts under it), like rollupSweepLimit's 1000:
+	// a free choice that keeps one statement short; tune it by that DELETE's
+	// duration against the 100 ms step target above.
 	batchSweepLimit = 1000
 )
 

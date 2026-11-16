@@ -2,6 +2,8 @@ package delivery
 
 import (
 	"time"
+
+	"github.com/LeventAksakal/notification-system/internal/delivery/leasebudget"
 )
 
 // The send alignment (the lead) is the time this worker's claim for a group
@@ -27,36 +29,11 @@ import (
 // given up), and a fall reserves nothing until the grid already reserved
 // comes within lead+horizon, losing nothing.
 
-// alignFloor is the least lead: the fixed alignment this replaces, so the
-// lead only ever grows past what was there. The claims it has to cover are
-// not the typical ones but the jumps: on a busy channel the claim time rose
-// from 20-70 ms to 200-445 ms within one second as a drain ended (nine
-// claimers on the last rows, each release waking all of them; acceptance R8,
-// debug trace, 16 Nov), faster than any window of past claims can follow, and
-// a claim that overruns its group loses those slots for every worker. With a
-// floor of 20 ms (the median healthy claim, 16 ms, rounded up) R8 drained at
-// 76-82 per second against 89-92 with the fixed 200 ms. What the floor costs
-// is latency on a busy grid only: a lone send on an idle grid leaves right
-// after its claim whatever the lead (group.flex).
-const alignFloor = 200 * time.Millisecond
+// alignFloor and alignCeiling bound the lead; their derivations live with the
+// rest of the lease's budget in package leasebudget, which config also reads.
+const alignFloor = leasebudget.AlignFloor
 
-// alignCeiling is the largest lead for a lease of lease: an eighth of it. The
-// horizon follows the lead (horizon), so a claimed row waits at most lead +
-// horizon = a quarter of its lease for its slot (7.5 s of the default 30 s),
-// and three quarters are left for the provider call (APP_PROVIDER_TIMEOUT,
-// default 5 s) and the result write, which a slow database also slows;
-// deliver still cuts any call 250 ms before the lease ends. Half the lease
-// (a quarter as the ceiling) lost leases in the disturbed-worker test's 2 s
-// lease on a loaded machine (verifier, 16 Nov). The default ceiling, 3.75 s,
-// is above the claims of owner item 0011 (1.6 s; the p95 of claims spread
-// over 0 to 3.2 s is about 3 s). Claims slower than the ceiling lose slots
-// again: the database is then several seconds per query behind.
-func alignCeiling(lease time.Duration) time.Duration {
-	if lease <= 0 {
-		lease = 30 * time.Second // APP_LEASE_DURATION's default
-	}
-	return lease / 8
-}
+func alignCeiling(lease time.Duration) time.Duration { return leasebudget.AlignCeiling(lease) }
 
 // lead is the send alignment of the channel's next reservation: the claim
 // time measured by this worker on this channel (claimLatency), within
