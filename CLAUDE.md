@@ -31,7 +31,7 @@ Router, not a manual. Every line is something you could not work out from the co
 - Files are named for what they do (`claim_loop.go`, `retry_budget.go`), never for the package's topic (`delivery.go`, `service.go`, `handlers.go`).
 
 ## Pushing
-- The repository is public since 16 Nov 2026, so CI minutes are free, but a run still takes about 5 min and shares the owner's queue. Batch commits locally, run the gate locally (`task check`, then `task test:integration`; pin a test to two cores to imitate the runner), and push once per change set. Never push to see what CI says.
+- The repository is public since 16 Nov 2026, so CI minutes are free, but a run still takes about 5 min and shares the owner's queue. Batch commits locally, run the gate locally (`task check`, then `task test:integration`; pin a test to two cores to imitate the runner), and push once per change set. Imitating the runner means all of it: stop the idle dev stack and the schema scratch first (`docker compose stop`, `docker stop notifier-schema-scratch`; on 16 Nov 2026 a 23 h-old stack cut the B1 fast channels from 95/s to 67/s), and set `ACCEPTANCE_RATE_FLOOR=40` as CI does when pinned. Never push to see what CI says.
 
 ## Merging
 - Fast-forward `main` to the PR branch locally (`git merge --ff-only`, then `git push origin main`; GitHub marks the PR merged). Squash-merge a PR too large to read commit by commit. Never a merge commit, never GitHub's "Rebase and merge" (it rewrites the commits CI tested), never rebase a pushed branch.
