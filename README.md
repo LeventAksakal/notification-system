@@ -40,13 +40,21 @@ curl -s --json "@examples/templated.json" localhost:8080/v1/notifications
 curl -s -X PUT --json "@examples/fault.json" localhost:8090/_control/faults
 ```
 
+The provider stand-in now refuses the next SMS with a 400, a permanent failure. Send one without an `Idempotency-Key`, so it is a new notification, then list the failed ones; it is there with `failureKind` `permanent` after one attempt:
+
+```bash
+curl -s --json "@examples/sms.json" localhost:8080/v1/notifications
+```
+
 ```bash
 curl -s "localhost:8080/v1/notifications?status=failed"
 ```
 
+A run of 503s is different: it is an outage, the channel pauses, and nothing fails or spends retry budget until the provider is back (decision 0026).
+
 `PATCH /v1/notifications/<id>` with a new `scheduledAt` reschedules a notification no worker has tried yet. Every endpoint, field, limit and error is in the API reference at `/docs`.
 
-Live status: `npx wscat -c "ws://localhost:8080/v1/ws?notificationId=<id>"`; its messages are described at http://localhost:8080/docs/websocket.
+Live status (needs Node): `npx wscat -c "ws://localhost:8080/v1/ws?notificationId=<id>"`; its messages are described at http://localhost:8080/docs/websocket.
 
 ## Where to look
 
@@ -90,7 +98,7 @@ Operating notes: the API has no authentication of its own and belongs behind a g
 
 ## Test and develop
 
-Needs Go and Docker. Every dev command runs through Go's tool directive, so nothing else needs installing: `go tool -modfile=tools.mod task --list` lists them, and `task` below is short for `go tool -modfile=tools.mod task`.
+Needs Docker and Go 1.21 or later (Go fetches the 1.27.4 toolchain `go.mod` asks for). Every dev command runs through Go's tool directive, so nothing else needs installing: `go tool "-modfile=tools.mod" task --list` lists them, and `task` below is short for `go tool "-modfile=tools.mod" task` (the quotes keep PowerShell from splitting the flag).
 
 - `task test:all` runs unit, integration and acceptance tests; `task check` is the full local gate (build, vet, lint, tests, vulnerability scan).
 - The rate tests assert the cap (at most 100 sends per channel in any second) on every machine, and a throughput floor that assumes an unloaded machine; set `ACCEPTANCE_RATE_FLOOR=40` on a busy one.

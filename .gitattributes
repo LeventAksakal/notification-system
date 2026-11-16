@@ -7,3 +7,4 @@ internal/store/sqlc/** linguist-generated
 internal/store/schema.gen.sql linguist-generated
 api/openapi.yaml linguist-generated
 api/asyncapi.yaml linguist-generated
+migrations/** linguist-generated

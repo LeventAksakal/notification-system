@@ -10,7 +10,7 @@ revisit: when a trigger or stored function is needed (sqldef cannot parse SIGNAL
 Edit `schema/**/*.sql` (one file per aggregate: a weak table and its triggers sit with their owner; files are read in path order, so a referenced table sorts first), then run `task migrate:diff -- <name>`; never hand-write `migrations/`. `task migrate:check` fails when they disagree.
 
 ## Context
-Owner, 15 Nov 2026: "atlas not supporting subdirectories is straight up BS ... requires you to pay ... Every source being colocated is useful. Its stupid to switch files or directories to see code for the table and a trigger action upon it"; "we obviously not gonna pay atlas so what alternative is there". Atlas Community reads a schema folder flat (top-level files only), rejects `atlas:import`, and manages triggers, functions and views only after `atlas login`.
+Owner, 15 Nov 2026: Atlas's free edition does not read schema subdirectories and charges for trigger support; every source of a table should sit together, since switching files to see a table and its trigger costs time; a paid tool is not an option, so what is the alternative? Atlas Community reads a schema folder flat (top-level files only), rejects `atlas:import`, and manages triggers, functions and views only after `atlas login`.
 
 ## Options
 1. Atlas Community. Worked for tables; no nested folders, no triggers.

@@ -2,7 +2,7 @@
 
 Accepted decisions only; this list is what agents load. Superseded records move to `superseded/` with a banner pointing at their replacement. `go test ./tools/adrcheck` enforces both.
 
-Record 0004 (consumer-owned spec) is superseded by 0024 (code-first with Huma) and lives under `superseded/`; every record listed here is accepted. Each was written before its slice was built; the code follows the recommended option, and where it does not the record says so under "As built". `docs/REQUIREMENTS.md` names the record behind each requirement.
+Records 0004 (consumer-owned spec, superseded by 0024: code-first with Huma) and 0008 (per-worker breaker, superseded by 0026: provider health shared in Valkey) live under `superseded/`; every record listed here is accepted. Each was written before its slice was built; the code follows the recommended option, and where it does not the record says so under "As built". `docs/REQUIREMENTS.md` names the record behind each requirement.
 
 - [Record decisions as short, checkable ADRs (0001)](0001-record-decisions-as-adrs.md)
 - [One image runs as api, worker or migrate; workers scale by replica (0002)](0002-one-image-three-roles.md)

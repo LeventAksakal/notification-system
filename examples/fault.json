@@ -1,1 +1,1 @@
-{"rules": [{"channel": "sms", "mode": "status", "status": 503, "count": 50}]}
+{"rules": [{"channel": "sms", "mode": "status", "status": 400, "count": 1}]}

@@ -3,7 +3,7 @@
 Router, not a manual. Every line is something you could not work out from the code.
 
 ## Start here
-- The task, its requirements (each mapped to a test) and where work stopped: `docs/REQUIREMENTS.md`.
+- The task and its requirements, each mapped to a test: `docs/REQUIREMENTS.md`. What the owner raised, its target and status, and where work stopped: `.agents/owner-ledger.md`.
 - Decisions in force: `docs/decisions/README.md` (accepted only; never follow a file under `superseded/`).
 - Owner items you raise: `.agents/owner-items/NNNN-<slug>.md` (question, options, the assumption you took). Never stop to ask; take the assumption and continue.
 - Work log: `.agents/logs/YYYY-MM/DD.md`, one line per pivot or mistake caught.

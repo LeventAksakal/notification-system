@@ -3,7 +3,7 @@ status: closed
 created: 2026-11-15
 tags: [mysql, migrations, privileges]
 ---
-# Who runs migrations once the schema has triggers (0014)
+# Who runs migrations once the schema has triggers (0021; filed as a second 0014)
 
 ## Question
 `app migrate` runs as the application user `app` and now creates triggers (decision 0005, "As built"). MySQL 8.4 with binary logging on refuses `CREATE TRIGGER` from a user without SUPER (error 1419) unless `log_bin_trust_function_creators` is on, and that variable is deprecated. How should migrations get the right to create triggers in production?

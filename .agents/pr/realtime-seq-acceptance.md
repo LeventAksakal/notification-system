@@ -1,7 +1,5 @@
 # realtime-seq: acceptance tests to write after landing
 
-Also saved at `C:/Users/leven/AppData/Roaming/Claude/side-session-notes/local_8d88f197-26c4-484a-961a-60c13f75899e/realtime-seq-acceptance-drafts.md` (same content).
-
 From the realtime-seq session (branch claude/feat-realtime-sequence-readiness-647281). tools/agentguard refused the test-writer in the session worktree (owner item 0002), so nothing under test/acceptance/ changed on the branch. A test-writer running from the main checkout should apply these after the merge. Until then the following acceptance tests FAIL on the branch, because /readyz no longer checks or reports Valkey:
 - TestR15HealthAndReadiness (asserts checks["valkey"]=="up")
 - TestR15ReadyzMySQLDown (asserts the valkey check stays "up")
