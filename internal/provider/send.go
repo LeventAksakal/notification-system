@@ -57,6 +57,37 @@ var ErrTimeout = errors.New("provider timeout")
 // stopped provider still opens an outage and still exhausts budgets.
 var ErrNotSent = errors.New("the request never left")
 
+// ErrTooLate wraps, beside ErrNotSent, a call whose request was due to leave
+// by a moment (WithLeaveBy) it could no longer keep: the moment had passed
+// when Send started, or when the first write came (on a connection the call
+// waited for, the moment plus that wait: connUse.got). Nothing reached the
+// provider. A slot that cannot be
+// kept is given up, never sent late (decision 0009); the check sits at the
+// first write because everything before it (the caller's last clock check,
+// goroutine scheduling, the transport's connection handoff) can still delay
+// the request past its moment.
+var ErrTooLate = errors.New("the request would have left after its leave-by moment")
+
+// leaveByKey is the context key of WithLeaveBy.
+type leaveByKey struct{}
+
+// WithLeaveBy returns ctx carrying the moment by which a call's request must
+// have started its first write; the zero time is none. Send returns
+// ErrNotSent and ErrTooLate for a call already past it, without taking a
+// connection, and refuses a later first write, excusing only the time the
+// call waited for its connection (connUse.got says why). A context value, not a field of Message:
+// it is a property of this attempt (its slot), not of the notification, and
+// the deadline of ctx is a different moment (the call's end).
+func WithLeaveBy(ctx context.Context, by time.Time) context.Context {
+	return context.WithValue(ctx, leaveByKey{}, by)
+}
+
+// LeaveBy reports the moment WithLeaveBy put in ctx.
+func LeaveBy(ctx context.Context) (time.Time, bool) {
+	by, ok := ctx.Value(leaveByKey{}).(time.Time)
+	return by, ok
+}
+
 // maxBody bounds how much of an answer is read.
 const maxBody = 64 << 10
 
@@ -167,7 +198,16 @@ func (c *Client) Send(ctx context.Context, m Message) (Response, error) {
 	}
 	propagation.TraceContext{}.Inject(ctx, propagation.HeaderCarrier(req.Header))
 	var used connUse
-	req = req.WithContext(httptrace.WithClientTrace(cctx, &httptrace.ClientTrace{GotConn: used.got}))
+	if by, ok := LeaveBy(ctx); ok && !by.IsZero() {
+		if time.Now().After(by) {
+			// Already late: taking or dialing a connection only for the
+			// first write to be refused would close it, churning the
+			// provider's connections for nothing.
+			return Response{}, fmt.Errorf("%w: %w", ErrNotSent, ErrTooLate)
+		}
+		used.leaveBy = by
+	}
+	req = req.WithContext(httptrace.WithClientTrace(cctx, &httptrace.ClientTrace{GetConn: used.get, GotConn: used.got}))
 
 	res, err := c.http.Do(req)
 	if err != nil {
@@ -175,7 +215,11 @@ func (c *Client) Send(ctx context.Context, m Message) (Response, error) {
 			err = fmt.Errorf("%w after %s", ErrTimeout, c.timeout)
 		}
 		if used.notSent() {
-			err = fmt.Errorf("%w: %w", ErrNotSent, err)
+			if used.refused.Load() {
+				err = fmt.Errorf("%w: %w: %w", ErrNotSent, ErrTooLate, err)
+			} else {
+				err = fmt.Errorf("%w: %w", ErrNotSent, err)
+			}
 		}
 		return Response{}, err
 	}
@@ -204,13 +248,39 @@ func (c *Client) Send(ctx context.Context, m Message) (Response, error) {
 type writeMarkConn struct {
 	net.Conn
 	writes atomic.Int64
+	// late is the leave-by check of the call that holds the connection,
+	// armed when it got the connection (connUse.got) and taken by the
+	// next write, the request's first. Taken, not read: a later write of the
+	// same request is not refused (half a request would be a broken one),
+	// and the next call on the connection is not judged by this call's
+	// moment.
+	late atomic.Pointer[lateCheck]
 }
 
+// errWriteTooLate is the refused write's error, inside the transport; Send
+// reports ErrTooLate from connUse.refused, not from this error, so it does
+// not depend on how net/http wraps a write error.
+var errWriteTooLate = errors.New("first write after the leave-by moment refused")
+
 // Write counts the write before making it: a write that has started may
-// have sent bytes, whether or not it returns.
+// have sent bytes, whether or not it returns. A first write after the
+// call's leave-by moment is refused before it is counted: nothing is
+// written, so the call is ErrNotSent. The transport closes a connection
+// whose write failed, so a refusal leaves nothing behind in the pool.
 func (c *writeMarkConn) Write(b []byte) (int, error) {
+	if lc := c.late.Swap(nil); lc != nil && time.Now().After(lc.by) {
+		lc.refused.Store(true)
+		return 0, errWriteTooLate
+	}
 	c.writes.Add(1)
 	return c.Conn.Write(b)
+}
+
+// lateCheck is the moment after which the first write on one connection is
+// refused, and the flag of the call it belongs to.
+type lateCheck struct {
+	by      time.Time
+	refused *atomic.Bool // connUse.refused
 }
 
 // connUse is every connection one call obtained (httptrace.GotConn), with
@@ -226,6 +296,15 @@ type connUse struct {
 	// the conservative answer. Proxies stay on because egress through one is
 	// a deployment's choice; the compose stack and the tests set none.
 	other bool
+	// leaveBy is the call's moment (WithLeaveBy); zero: none. Behind a
+	// proxy (other) nothing is armed and the request is never refused at the
+	// write. Set before the call and only read after, so not under mu.
+	leaveBy time.Time
+	// getAt is when the call last asked the transport for a connection
+	// (get); under mu.
+	getAt time.Time
+	// refused: a first write of the call was refused for lateness.
+	refused atomic.Bool
 }
 
 type usedConn struct {
@@ -233,7 +312,50 @@ type usedConn struct {
 	mark int64
 }
 
-func (u *connUse) got(info httptrace.GotConnInfo) { u.gotConn(info.Conn) }
+// get notes when the call asks the transport for a connection
+// (httptrace.GetConn), before any dial starts.
+func (u *connUse) get(string) {
+	if u.leaveBy.IsZero() {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.getAt = time.Now()
+}
+
+// got records the connection and arms the leave-by check on it: its first
+// write is refused after the call's moment plus the time the call waited
+// for the connection (GetConn to GotConn), and nothing else is excused.
+//   - A reused connection waited about nothing: the moment itself.
+//   - A connection dialed for the call excuses its dial and TLS handshake:
+//     they can outlast the whole tolerance (one interval minus the clock
+//     uncertainty, under 10.53 ms at 95 per second) on any provider a few
+//     milliseconds away, and refusing them would refuse every call on a new
+//     connection, close it, and never refill the pool: nothing sent,
+//     nothing recorded, no outage.
+//   - A stall after GotConn, or lateness the call already had when it asked
+//     (a write then comes after the moment plus the dial), is not excused.
+//     Unexcused, a stall's late requests, refused on their pooled
+//     connections, would leave in a burst on the fresh ones that replace
+//     them (a busiest second of 103 after a 250 ms stall:
+//     TestDeliveryR8RateLimit, 20 runs pinned to two cores, 16 Nov 2026).
+//
+// What it costs the cap: a request can leave late by at most the time it
+// waited for its connection.
+func (u *connUse) got(info httptrace.GotConnInfo) {
+	u.gotConn(info.Conn)
+	wc, ok := info.Conn.(*writeMarkConn)
+	if !ok || u.leaveBy.IsZero() {
+		return
+	}
+	u.mu.Lock()
+	wait := time.Duration(0)
+	if !u.getAt.IsZero() {
+		wait = time.Since(u.getAt)
+	}
+	u.mu.Unlock()
+	wc.late.Store(&lateCheck{by: u.leaveBy.Add(wait), refused: &u.refused})
+}
 
 func (u *connUse) gotConn(c net.Conn) {
 	u.mu.Lock()

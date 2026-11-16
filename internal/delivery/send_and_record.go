@@ -46,10 +46,11 @@ var errLeaseCut = errors.New("call cut before the lease ends")
 // deliver makes one provider call for a claimed job and writes the result.
 // The call ends leaseMargin before the lease does (or at the provider
 // timeout, whichever is first); with less than minSendTime of lease left it is
-// not made and the job is released. callDone is called once the provider
-// call is over (or will not be made). The result is published after
-// announced is closed.
-func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-chan struct{}, gate *health.Gate, tk health.Ticket, callDone func()) {
+// not made and the job is released. leaveBy is the slot's late moment: a
+// request not yet written by then is not written at all (provider.WithLeaveBy)
+// and the slot is given up. callDone is called once the provider call is over
+// (or will not be made). The result is published after announced is closed.
+func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-chan struct{}, gate *health.Gate, tk health.Ticket, leaveBy time.Time, callDone func()) {
 	left := job.LeaseUntil.Sub(w.deps.Now()) - leaseMargin
 	if left < minSendTime {
 		callDone()
@@ -77,6 +78,14 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 
 	start := time.Now()
 	callCtx, cancelCall := context.WithTimeoutCause(ctx, left, errLeaseCut)
+	// sendAt's own lateness check is not the last moment: the clock and
+	// gate checks, scheduling and the transport's connection handoff come
+	// after it, and a request delayed there would leave late and bunch with
+	// on-time ones (busiest second 106: TestDeliveryR8RateLimit, 20 runs
+	// pinned to two cores, 16 Nov 2026). The provider client refuses a call
+	// already past leaveBy, and a first write after leaveBy plus the time
+	// the call waited for its connection (provider connUse.got).
+	callCtx = provider.WithLeaveBy(callCtx, leaveBy)
 	res, err := w.deps.Sender.Send(callCtx, provider.Message{
 		Channel: job.Channel, To: job.To, Content: job.Content, Key: job.ID, CorrelationID: job.CorrelationID,
 	})
@@ -109,6 +118,14 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 		//     cannot repeat on every call; a dial slower than the timeout
 		//     fails as a dial and is recorded.
 		w.cancelGate(ctx, gate, tk)
+		if errors.Is(err, provider.ErrTooLate) {
+			// The request would have left after its slot's late moment: a
+			// missed slot, as in sendAt, given up, never sent late (decision
+			// 0009). Under load this is routine, not a warning.
+			w.m.gaveUp(ctx, job.Channel, giveUpSlotMissed, 1)
+			w.release(ctx, job, announced, "slot missed at the write")
+			return
+		}
 		slog.WarnContext(ctx, "provider call never left; released", "channel", job.Channel,
 			"after_ms", elapsed.Milliseconds(), "err", err)
 		w.m.gaveUp(ctx, job.Channel, giveUpCallNeverLeft, 1)

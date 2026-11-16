@@ -69,5 +69,5 @@ func (w *Worker) sendAt(ctx, jctx context.Context, cr *channelRun, job notificat
 	// Slot and leaving moment on this process's clock: beside the provider's
 	// arrival times they tell a dense grid from requests bunched in transit.
 	slog.DebugContext(jctx, "request leaving", "channel", cr.ch, "id", job.ID, "slot_us", at.UnixMicro(), "leave_us", time.Now().UnixMicro())
-	w.deliver(jctx, job, announced, cr.gate, tk, callDone)
+	w.deliver(jctx, job, announced, cr.gate, tk, late, callDone)
 }

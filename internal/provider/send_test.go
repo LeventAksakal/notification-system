@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -424,5 +425,263 @@ func TestSendIsNotReplayedByTheTransport(t *testing.T) {
 	}
 	if got := n.Load(); got != 2 {
 		t.Errorf("requests at the server: want 2 (no silent replay), got %d", got)
+	}
+}
+
+// The leave-by tests' moments. ahead: 15 ms, far above the microseconds from a
+// call's start to its GetConn and above a coarse clock's tick (the Windows
+// monotonic clock ticks in milliseconds), so the call is on time when it
+// asks for a connection. margin: 5 ms past the excused wait, far above the
+// microseconds between Send's own hooks and the test's, so the write comes
+// after the armed moment.
+const (
+	ahead  = 15 * time.Millisecond
+	margin = 5 * time.Millisecond
+)
+
+// stallAfterGotConn returns ctx whose calls, once they have their
+// connection, wait until past their leave-by moment plus the time they
+// waited for the connection (and margin): the descheduled worker between
+// the transport's handoff and the first write. Send's own hooks run first
+// (httptrace composes the newer trace before the older), so the check is
+// armed before the stall.
+func stallAfterGotConn(ctx context.Context, by time.Time) context.Context {
+	var getAt time.Time
+	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GetConn: func(string) { getAt = time.Now() },
+		GotConn: func(httptrace.GotConnInfo) {
+			until := by.Add(time.Since(getAt) + margin)
+			for now := time.Now(); !now.After(until); now = time.Now() {
+				<-time.After(until.Sub(now) + time.Microsecond)
+			}
+		},
+	})
+}
+
+// A call on time when it asks for a connection whose first write then comes
+// after its leave-by moment (WithLeaveBy) plus the time it waited for the
+// connection writes nothing: the provider never sees it, the call is
+// ErrNotSent and ErrTooLate (a slot given up, never sent late: decision
+// 0009), and the client's next call goes out normally. On a fresh
+// connection only the dial is excused, not a stall after it.
+func TestSendRefusesAFirstWriteAfterTheLeaveByMoment(t *testing.T) {
+	future := func() time.Time { return time.Now().Add(time.Hour) } // an hour: no call here lasts that long
+	cases := []struct {
+		name    string
+		tls     bool
+		warm    bool // an earlier call leaves an idle connection the timed call takes
+		stall   bool // the call stalls after GotConn past its excused moment
+		leaveBy func() time.Time
+		refused bool
+	}{
+		{"a stall on a pooled connection is refused", false, true, true, nil, true},
+		{"a stall on a pooled TLS connection is refused", true, true, true, nil, true},
+		{"a stall after the dial on a fresh connection is refused", false, false, true, nil, true},
+		{"a stall after the dial on a fresh TLS connection is refused", true, false, true, nil, true},
+		{"a moment still ahead lets the request leave", false, true, false, future, false},
+		{"no moment lets the request leave", false, true, false, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newCountingProvider(t, tc.tls, false)
+			// 1 s: far above a local call, never reached; 1 connection: the
+			// timed call takes the warm one.
+			c := p.client(t, time.Second, 1)
+			if tc.warm {
+				if _, err := p.send(context.Background(), c, "warm"); err != nil {
+					t.Fatalf("warm-up: %v", err)
+				}
+			}
+			ctx := context.Background()
+			switch {
+			case tc.stall:
+				by := time.Now().Add(ahead)
+				ctx = stallAfterGotConn(WithLeaveBy(ctx, by), by)
+			case tc.leaveBy != nil:
+				ctx = WithLeaveBy(ctx, tc.leaveBy())
+			}
+			res, err := p.send(ctx, c, "timed")
+			if tc.refused {
+				if !errors.Is(err, ErrNotSent) || !errors.Is(err, ErrTooLate) {
+					t.Fatalf("status %d, err %v; want ErrNotSent and ErrTooLate", res.Status, err)
+				}
+			} else if err != nil || res.Status != http.StatusAccepted {
+				t.Fatalf("status %d, err %v; want 202", res.Status, err)
+			}
+			if res, err := p.send(context.Background(), c, "next"); err != nil || res.Status != http.StatusAccepted {
+				t.Fatalf("the next call: status %d, err %v; want 202", res.Status, err)
+			}
+			want := 1
+			if tc.refused {
+				want = 0
+			}
+			if got, next := p.received("timed"), p.received("next"); got != want || next != 1 {
+				t.Errorf("the provider saw the timed request %d time(s) and the next %d; want %d and 1", got, next, want)
+			}
+		})
+	}
+}
+
+// A call already past its moment when Send starts is refused before it
+// takes or dials a connection: nothing reaches the provider and no
+// connection is opened or closed for it, so the pooled one serves the next
+// call.
+func TestSendRefusesACallAlreadyLateWithoutAConnection(t *testing.T) {
+	for _, warm := range []bool{true, false} {
+		t.Run(fmt.Sprintf("pooled connection waiting %v", warm), func(t *testing.T) {
+			p := newCountingProvider(t, false, false)
+			c := p.client(t, time.Second, 1) // 1 s: never reached; 1 connection: the next call reuses it
+			var dials atomic.Int64
+			tr := c.http.Transport.(*http.Transport)
+			dial := tr.DialContext
+			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dials.Add(1)
+				return dial(ctx, network, addr)
+			}
+			if warm {
+				if _, err := p.send(context.Background(), c, "warm"); err != nil {
+					t.Fatalf("warm-up: %v", err)
+				}
+			}
+			before := dials.Load()
+			// A millisecond behind the call's start: past by any later clock reading.
+			_, err := p.send(WithLeaveBy(context.Background(), time.Now().Add(-time.Millisecond)), c, "late")
+			if !errors.Is(err, ErrNotSent) || !errors.Is(err, ErrTooLate) {
+				t.Fatalf("err %v, want ErrNotSent and ErrTooLate", err)
+			}
+			if n := dials.Load() - before; n != 0 || p.received("late") != 0 {
+				t.Fatalf("%d dials and %d requests at the provider for the late call, want 0 and 0", n, p.received("late"))
+			}
+			if res, err := p.send(context.Background(), c, "next"); err != nil || res.Status != http.StatusAccepted {
+				t.Fatalf("the next call: status %d, err %v; want 202", res.Status, err)
+			}
+			if warm && dials.Load() != before {
+				t.Errorf("the next call dialed: the pooled connection was closed for the late one")
+			}
+		})
+	}
+}
+
+// A dial (or TLS handshake) slower than the tolerance must not refuse an
+// on-time call it was made for: if it did, every call on a new connection
+// would be refused, its connection closed, and the pool would never refill
+// (verifier finding, 16 Nov 2026). Calls whose every connection is dialed
+// past their moment all leave; a stall after the dial, or on a pooled
+// connection, is still refused.
+func TestSendLetsACallLeaveOnAConnectionDialedPastItsMoment(t *testing.T) {
+	// 30 ms: three times the whole tolerance at 95 per second (one interval,
+	// 10.53 ms, minus the clock uncertainty), and twice ahead, so each dial
+	// ends past an on-time call's moment.
+	const dialDelay = 30 * time.Millisecond
+	const calls = 5 // several: a refused dial would fail each, not just the first
+	t.Run("every on-time call on a connection dialed past its moment leaves", func(t *testing.T) {
+		p := newCountingProvider(t, false, true) // the provider closes each connection: every call dials
+		c := p.client(t, time.Second, 1)         // 1 s: never reached; 1 connection: one at a time
+		slowDial(c, dialDelay)
+		for i := range calls {
+			key := fmt.Sprintf("call-%d", i)
+			if res, err := p.send(WithLeaveBy(context.Background(), time.Now().Add(ahead)), c, key); err != nil || res.Status != http.StatusAccepted {
+				t.Fatalf("%s: status %d, err %v; want 202", key, res.Status, err)
+			}
+			if n := p.received(key); n != 1 {
+				t.Fatalf("%s: the provider saw it %d time(s), want 1", key, n)
+			}
+		}
+	})
+	t.Run("a stall after the slow dial is refused", func(t *testing.T) {
+		p := newCountingProvider(t, false, true) // every call dials
+		c := p.client(t, time.Second, 1)         // 1 s: never reached; 1 connection: one at a time
+		slowDial(c, dialDelay)
+		by := time.Now().Add(ahead)
+		_, err := p.send(stallAfterGotConn(WithLeaveBy(context.Background(), by), by), c, "stalled")
+		if !errors.Is(err, ErrNotSent) || !errors.Is(err, ErrTooLate) {
+			t.Fatalf("err %v, want ErrNotSent and ErrTooLate", err)
+		}
+		if n := p.received("stalled"); n != 0 {
+			t.Errorf("the provider saw it %d time(s), want 0", n)
+		}
+	})
+	t.Run("a stalled call on the pooled connection is refused", func(t *testing.T) {
+		p := newCountingProvider(t, false, false)
+		c := p.client(t, time.Second, 1) // 1 s: never reached; 1 connection: the stalled call takes the pooled one
+		slowDial(c, dialDelay)
+		if res, err := p.send(WithLeaveBy(context.Background(), time.Now().Add(ahead)), c, "dialed"); err != nil || res.Status != http.StatusAccepted {
+			t.Fatalf("dialed: status %d, err %v; want 202", res.Status, err)
+		}
+		by := time.Now().Add(ahead)
+		_, err := p.send(stallAfterGotConn(WithLeaveBy(context.Background(), by), by), c, "pooled")
+		if !errors.Is(err, ErrTooLate) {
+			t.Fatalf("pooled: err %v, want ErrTooLate", err)
+		}
+		if n := p.received("pooled"); n != 0 {
+			t.Errorf("pooled: the provider saw it %d time(s), want 0", n)
+		}
+	})
+}
+
+// countingProvider is a test provider that accepts every call and counts
+// them by Idempotency-Key.
+type countingProvider struct {
+	srv *httptest.Server
+	tls bool
+	mu  sync.Mutex
+	got map[string]int
+}
+
+// newCountingProvider starts one; closeEach makes it close every connection
+// after its answer, as a provider dropping idle connections.
+func newCountingProvider(t *testing.T, tls, closeEach bool) *countingProvider {
+	t.Helper()
+	p := &countingProvider{tls: tls, got: map[string]int{}}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		p.mu.Lock()
+		p.got[r.Header.Get("Idempotency-Key")]++
+		p.mu.Unlock()
+		if closeEach {
+			w.Header().Set("Connection", "close")
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+	if tls {
+		p.srv = httptest.NewTLSServer(h)
+	} else {
+		p.srv = httptest.NewServer(h)
+	}
+	t.Cleanup(p.srv.Close)
+	return p
+}
+
+func (p *countingProvider) client(t *testing.T, timeout time.Duration, conns int) *Client {
+	c := testClient(t, map[notification.Channel]string{notification.ChannelSMS: p.srv.URL}, timeout, conns)
+	if p.tls {
+		trustTLS(c, p.srv)
+	}
+	return c
+}
+
+func (p *countingProvider) send(ctx context.Context, c *Client, key string) (Response, error) {
+	return c.Send(ctx, Message{Channel: notification.ChannelSMS, Key: key})
+}
+
+func (p *countingProvider) received(key string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.got[key]
+}
+
+// slowDial makes every new connection of c take d longer to dial.
+func slowDial(c *Client, d time.Duration) {
+	tr := c.http.Transport.(*http.Transport)
+	dial := tr.DialContext // New's: it wraps the connection in a writeMarkConn
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		tm := time.NewTimer(d)
+		defer tm.Stop()
+		select {
+		case <-tm.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return dial(ctx, network, addr)
 	}
 }
