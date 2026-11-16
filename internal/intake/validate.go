@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/LeventAksakal/notification-system/internal/notification"
+	"github.com/LeventAksakal/notification-system/internal/store/sqlc"
 )
 
 // Conditions the API maps to its error codes.
@@ -45,6 +46,9 @@ type FieldError struct {
 	Index  *int
 	Field  string
 	Reason string
+	// Variables is set on a refused `template.variables`: what the template
+	// needs and what was sent.
+	Variables *VariableReport
 }
 
 // ValidationError lists every broken rule of a request.
@@ -77,16 +81,19 @@ type Accepted struct {
 	Priority    notification.Priority
 	Content     string
 	ScheduledAt *time.Time // nil: due now; a past time is stored and due now
+	// Template is the template and version that rendered Content; nil for
+	// content sent as is.
+	Template *TemplateOrigin
 }
 
 var smsRecipient = regexp.MustCompile(notification.SMSRecipientPattern)
 
 // Validate checks one request against every intake rule and renders its
 // template. templates maps the names of the stored templates the request may
-// reference to their bodies; a name missing from it is unknown. now is the
+// reference to their rows; a name missing from it is unknown. now is the
 // database clock (Service.scheduleClock), which the schedule horizon is
 // measured from; it is only read when r carries a schedule.
-func Validate(r Request, templates map[string]string, now time.Time) (Accepted, []FieldError) {
+func Validate(r Request, templates map[string]sqlc.Template, now time.Time) (Accepted, []FieldError) {
 	var errs []FieldError
 	add := func(field, reason string) { errs = append(errs, FieldError{Field: field, Reason: reason}) }
 
@@ -113,9 +120,9 @@ func Validate(r Request, templates map[string]string, now time.Time) (Accepted, 
 	case r.Content != nil:
 		a.Content, haveContent = *r.Content, true
 	default:
-		content, terrs := renderRef(*r.Template, templates)
+		content, origin, terrs := renderRef(*r.Template, templates)
 		errs = append(errs, terrs...)
-		a.Content, haveContent = content, len(terrs) == 0
+		a.Content, a.Template, haveContent = content, origin, len(terrs) == 0
 	}
 	if haveContent && r.Channel.Valid() {
 		if reason := checkContent(r.Channel, a.Content); reason != "" {
@@ -162,28 +169,6 @@ func checkContent(c notification.Channel, content string) string {
 		return fmt.Sprintf("is %d characters; %s allows at most %d", n, c, limit)
 	}
 	return ""
-}
-
-func renderRef(ref TemplateRef, templates map[string]string) (string, []FieldError) {
-	var errs []FieldError
-	if len(ref.Variables) > notification.MaxTemplateVariables {
-		errs = append(errs, FieldError{Field: "template.variables", Reason: fmt.Sprintf("at most %d variables", notification.MaxTemplateVariables)})
-	}
-	for name, v := range ref.Variables {
-		if utf8.RuneCountInString(v) > notification.MaxTemplateVariableLen {
-			errs = append(errs, FieldError{Field: "template.variables." + name,
-				Reason: fmt.Sprintf("must be at most %d characters", notification.MaxTemplateVariableLen)})
-		}
-	}
-	body, ok := templates[ref.Name]
-	if !ok {
-		return "", append(errs, FieldError{Field: "template.name", Reason: "no template with this name"})
-	}
-	content, missing := Render(body, ref.Variables)
-	for _, name := range missing {
-		errs = append(errs, FieldError{Field: "template.variables." + name, Reason: "the template needs this variable"})
-	}
-	return content, errs
 }
 
 // CheckTemplate validates a template before it is stored.

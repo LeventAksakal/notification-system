@@ -261,6 +261,9 @@ func refusal(err error) error {
 		details := make([]ErrorDetail, len(ve.Details))
 		for i, d := range ve.Details {
 			details[i] = ErrorDetail{Index: d.Index, Field: d.Field, Reason: d.Reason}
+			if r := d.Variables; r != nil {
+				details[i].Required, details[i].Missing, details[i].Unknown = r.Required, r.Missing, r.Unknown
+			}
 		}
 		e := invalid(details)
 		e.Message = ve.Error()
@@ -333,6 +336,9 @@ func toNotification(n intake.Notification) Notification {
 	}
 	out.ScheduledAt = timePtr(n.ScheduledAt.Time, n.ScheduledAt.Valid)
 	out.FinishedAt = timePtr(n.FinishedAt.Time, n.FinishedAt.Valid)
+	if n.TemplateName.Valid && n.TemplateVersion.Valid {
+		out.Template = &TemplateOrigin{Name: TemplateName(n.TemplateName.String), Version: int(n.TemplateVersion.Int64)}
+	}
 	if n.History != nil {
 		out.DeliveryAttempts = make([]DeliveryAttempt, len(n.History))
 		for i, a := range n.History {

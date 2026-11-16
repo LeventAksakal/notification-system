@@ -30,6 +30,8 @@ curl -s --json "@examples/batch.json" localhost:8080/v1/notifications/batch
 curl -s -X PUT --json "@examples/template.json" localhost:8080/v1/templates/welcome
 ```
 
+Running it again answers `428`: replacing a template needs `If-Match` set to the `ETag` it returned (`"1"`), so two editors cannot overwrite each other (see `/docs`).
+
 ```bash
 curl -s --json "@examples/templated.json" localhost:8080/v1/notifications
 ```

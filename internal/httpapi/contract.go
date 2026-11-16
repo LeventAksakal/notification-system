@@ -183,7 +183,15 @@ type Notification struct {
 	CreatedAt         time.Time         `json:"createdAt"`
 	UpdatedAt         time.Time         `json:"updatedAt"`
 	FinishedAt        *time.Time        `json:"finishedAt,omitempty" doc:"When it reached sent, failed or cancelled"`
+	Template          *TemplateOrigin   "json:\"template,omitempty\" readOnly:\"true\" doc:\"The template and version that rendered `content`; absent when content was sent as is\""
 	DeliveryAttempts  []DeliveryAttempt `json:"deliveryAttempts,omitzero" doc:"Only on GET by id; oldest first"`
+}
+
+// TemplateOrigin names the template and version that rendered a
+// notification's content (decision 0015, traceability).
+type TemplateOrigin struct {
+	Name    TemplateName `json:"name"`
+	Version int          `json:"version" minimum:"1"`
 }
 
 // DeliveryAttempt is one provider call.
@@ -235,6 +243,7 @@ type BatchStatus struct {
 type Template struct {
 	Name      TemplateName `json:"name"`
 	Body      string       `json:"body"`
+	Version   int          "json:\"version\" minimum:\"1\" doc:\"1 when created, one more on every update; the `ETag` carries the same number\""
 	Variables []string     `json:"variables" doc:"Variable names found in the body"`
 	CreatedAt time.Time    `json:"createdAt"`
 	UpdatedAt time.Time    `json:"updatedAt"`
@@ -315,9 +324,15 @@ const (
 
 // ErrorDetail names one broken rule. Field order is the wire order.
 type ErrorDetail struct {
-	Field  string `json:"field"`
-	Index  *int   `json:"index,omitempty" doc:"Position of the item in a batch request"`
-	Reason string `json:"reason"`
+	Field    string   `json:"field"`
+	Index    *int     `json:"index,omitempty" doc:"Position of the item in a batch request"`
+	Reason   string   `json:"reason"`
+	Required []string "json:\"required,omitzero\" doc:\"On `template.variables`, the variables the template uses, in order of first appearance\""
+	Missing  []string "json:\"missing,omitzero\" doc:\"On `template.variables`, the required variables the request did not send\""
+	// Unknown is a non-nil empty slice on a template.variables detail, so it
+	// shows as [] there and is absent from every other detail.
+	Unknown        []string "json:\"unknown,omitzero\" doc:\"On `template.variables`, variables sent that the template does not use, sorted; `[]` when none (accepted on their own, listed to help spot a typo)\""
+	CurrentVersion *int     "json:\"currentVersion,omitempty\" doc:\"On `If-Match` (412, 428), the template's current version; absent when the template does not exist\""
 }
 
 // Error is every refused request's body; errors.go makes Huma write it in
@@ -326,7 +341,7 @@ type Error struct {
 	status  int
 	headers map[string]string
 
-	Code    string        `json:"code" doc:"invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, idempotency_key_reused, request_too_large, internal"`
+	Code    string        `json:"code" doc:"invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, precondition_failed, precondition_required, idempotency_key_reused, request_too_large, internal"`
 	Details []ErrorDetail `json:"details,omitempty"`
 	Message string        `json:"message"`
 }

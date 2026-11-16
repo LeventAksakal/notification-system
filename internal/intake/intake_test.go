@@ -13,7 +13,7 @@ func ptr[T any](v T) *T { return &v }
 
 func TestValidateNamesEveryBrokenField(t *testing.T) {
 	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
-	templates := map[string]string{"welcome": "Hello {{name}}", "long": strings.Repeat("x", 1000) + "{{tail}}"}
+	templates := storedTemplates(map[string]string{"welcome": "Hello {{name}}", "long": strings.Repeat("x", 1000) + "{{tail}}"})
 	ok := func(r Request) Request { return r }
 	sms := func(content string) Request {
 		return Request{To: "+905551234567", Channel: notification.ChannelSMS, Content: &content}
@@ -47,7 +47,7 @@ func TestValidateNamesEveryBrokenField(t *testing.T) {
 		{"schedule past the horizon", Request{To: "t", Channel: notification.ChannelPush, Content: ptr("x"), ScheduledAt: ptr(now.Add(notification.ScheduleHorizon + time.Second))}, []string{"scheduledAt"}},
 		{"schedule in the past", Request{To: "t", Channel: notification.ChannelPush, Content: ptr("x"), ScheduledAt: ptr(now.Add(-time.Hour))}, nil},
 		{"template rendered", Request{To: "t", Channel: notification.ChannelPush, Template: &TemplateRef{Name: "welcome", Variables: map[string]string{"name": "Ada"}}}, nil},
-		{"template variable missing", Request{To: "t", Channel: notification.ChannelPush, Template: &TemplateRef{Name: "welcome"}}, []string{"template.variables.name"}},
+		{"template variable missing", Request{To: "t", Channel: notification.ChannelPush, Template: &TemplateRef{Name: "welcome"}}, []string{"template.variables"}},
 		{"template unknown", Request{To: "t", Channel: notification.ChannelPush, Template: &TemplateRef{Name: "nope"}}, []string{"template.name"}},
 		{"template renders past the channel limit", Request{To: "+905551234567", Channel: notification.ChannelSMS,
 			Template: &TemplateRef{Name: "long", Variables: map[string]string{"tail": strings.Repeat("y", 601)}}}, []string{"content"}},
@@ -73,7 +73,7 @@ func TestValidateRendersAndDefaults(t *testing.T) {
 	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
 	a, errs := Validate(Request{To: "t", Channel: notification.ChannelPush,
 		Template: &TemplateRef{Name: "w", Variables: map[string]string{"name": "Ada", "extra": "ignored"}}},
-		map[string]string{"w": "Hi {{ name }}!"}, now)
+		storedTemplates(map[string]string{"w": "Hi {{ name }}!"}), now)
 	if len(errs) > 0 {
 		t.Fatalf("refused: %v", errs)
 	}

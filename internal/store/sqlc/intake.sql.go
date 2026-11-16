@@ -144,7 +144,7 @@ func (q *Queries) GetIdempotencyKey(ctx context.Context, idemKey string) (Idempo
 }
 
 const getNotification = `-- name: GetNotification :one
-SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.status_from, notifications.status_seq, notifications.failure_kind, notifications.attempts, notifications.budget_spent, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
+SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.status_from, notifications.status_seq, notifications.failure_kind, notifications.attempts, notifications.budget_spent, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.template_name, notifications.template_version, notifications.created_at, notifications.updated_at, notifications.finished_at,
   CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
 FROM notifications
 WHERE id = ?
@@ -180,6 +180,8 @@ func (q *Queries) GetNotification(ctx context.Context, id string) (GetNotificati
 		&i.Notification.LastError,
 		&i.Notification.CorrelationID,
 		&i.Notification.Traceparent,
+		&i.Notification.TemplateName,
+		&i.Notification.TemplateVersion,
 		&i.Notification.CreatedAt,
 		&i.Notification.UpdatedAt,
 		&i.Notification.FinishedAt,
@@ -189,7 +191,7 @@ func (q *Queries) GetNotification(ctx context.Context, id string) (GetNotificati
 }
 
 const getTemplate = `-- name: GetTemplate :one
-SELECT name, body, created_at, updated_at FROM templates WHERE name = ?
+SELECT name, body, version, created_at, updated_at FROM templates WHERE name = ?
 `
 
 func (q *Queries) GetTemplate(ctx context.Context, name string) (Template, error) {
@@ -198,6 +200,7 @@ func (q *Queries) GetTemplate(ctx context.Context, name string) (Template, error
 	err := row.Scan(
 		&i.Name,
 		&i.Body,
+		&i.Version,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -249,24 +252,28 @@ func (q *Queries) InsertIdempotencyKey(ctx context.Context, arg InsertIdempotenc
 const insertNotification = `-- name: InsertNotification :exec
 
 INSERT INTO notifications (
-  id, recipient, channel, priority, content, due_at, scheduled_at, correlation_id, traceparent, created_at
+  id, recipient, channel, priority, content, due_at, scheduled_at, correlation_id, traceparent, created_at,
+  template_name, template_version
 ) VALUES (
   ?, ?, ?, ?, ?,
   GREATEST(COALESCE(?, NOW(3)), NOW(3)),
-  ?, ?, ?, ?
+  ?, ?, ?, ?,
+  ?, ?
 )
 `
 
 type InsertNotificationParams struct {
-	ID            string
-	Recipient     string
-	Channel       NotificationsChannel
-	Priority      NotificationsPriority
-	Content       string
-	ScheduledAt   sql.NullTime
-	CorrelationID string
-	Traceparent   sql.NullString
-	CreatedAt     time.Time
+	ID              string
+	Recipient       string
+	Channel         NotificationsChannel
+	Priority        NotificationsPriority
+	Content         string
+	ScheduledAt     sql.NullTime
+	CorrelationID   string
+	Traceparent     sql.NullString
+	CreatedAt       time.Time
+	TemplateName    sql.NullString
+	TemplateVersion sql.NullInt64
 }
 
 // Intake: create, read, list, cancel and replay notifications; batches;
@@ -274,6 +281,7 @@ type InsertNotificationParams struct {
 // database clock (stored pending, never tried, due in the future), the same
 // rule the list filter uses.
 // due_at is the schedule or now on the database clock; a past schedule means now.
+// template_name and template_version: the template that rendered content, both NULL for plain content.
 func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotificationParams) error {
 	_, err := q.db.ExecContext(ctx, insertNotification,
 		arg.ID,
@@ -286,12 +294,30 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 		arg.CorrelationID,
 		arg.Traceparent,
 		arg.CreatedAt,
+		arg.TemplateName,
+		arg.TemplateVersion,
 	)
 	return err
 }
 
+const insertTemplate = `-- name: InsertTemplate :exec
+INSERT INTO templates (name, body) VALUES (?, ?)
+`
+
+type InsertTemplateParams struct {
+	Name string
+	Body string
+}
+
+// Creates version 1 (the insert trigger sets it); a duplicate key means the
+// template exists and an update needs If-Match (decision 0015).
+func (q *Queries) InsertTemplate(ctx context.Context, arg InsertTemplateParams) error {
+	_, err := q.db.ExecContext(ctx, insertTemplate, arg.Name, arg.Body)
+	return err
+}
+
 const listBatchItems = `-- name: ListBatchItems :many
-SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.status_from, notifications.status_seq, notifications.failure_kind, notifications.attempts, notifications.budget_spent, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
+SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.status_from, notifications.status_seq, notifications.failure_kind, notifications.attempts, notifications.budget_spent, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.template_name, notifications.template_version, notifications.created_at, notifications.updated_at, notifications.finished_at,
   CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
 FROM notifications
 WHERE batch_id = ? AND CAST(batch_index AS SIGNED) > ?
@@ -342,6 +368,8 @@ func (q *Queries) ListBatchItems(ctx context.Context, arg ListBatchItemsParams) 
 			&i.Notification.LastError,
 			&i.Notification.CorrelationID,
 			&i.Notification.Traceparent,
+			&i.Notification.TemplateName,
+			&i.Notification.TemplateVersion,
 			&i.Notification.CreatedAt,
 			&i.Notification.UpdatedAt,
 			&i.Notification.FinishedAt,
@@ -466,7 +494,7 @@ func (q *Queries) ListDeliveryAttempts(ctx context.Context, notificationID strin
 }
 
 const listTemplates = `-- name: ListTemplates :many
-SELECT name, body, created_at, updated_at FROM templates ORDER BY name
+SELECT name, body, version, created_at, updated_at FROM templates ORDER BY name
 `
 
 func (q *Queries) ListTemplates(ctx context.Context) ([]Template, error) {
@@ -481,6 +509,7 @@ func (q *Queries) ListTemplates(ctx context.Context) ([]Template, error) {
 		if err := rows.Scan(
 			&i.Name,
 			&i.Body,
+			&i.Version,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -553,17 +582,24 @@ func (q *Queries) SweepIdempotencyKeys(ctx context.Context, retentionMs interfac
 	return result.RowsAffected()
 }
 
-const upsertTemplate = `-- name: UpsertTemplate :exec
-INSERT INTO templates (name, body) VALUES (?, ?)
-ON DUPLICATE KEY UPDATE body = VALUES(body)
+const updateTemplate = `-- name: UpdateTemplate :execrows
+UPDATE templates SET body = ?, version = version + 1
+WHERE name = ? AND version = ?
 `
 
-type UpsertTemplateParams struct {
-	Name string
-	Body string
+type UpdateTemplateParams struct {
+	Body    string
+	Name    string
+	Version uint32
 }
 
-func (q *Queries) UpsertTemplate(ctx context.Context, arg UpsertTemplateParams) error {
-	_, err := q.db.ExecContext(ctx, upsertTemplate, arg.Name, arg.Body)
-	return err
+// Optimistic concurrency: replaces the body only if the caller read the
+// current version; 0 rows means stale or absent. version = version + 1 is what
+// the update trigger forces anyway; it is written here so the query reads true.
+func (q *Queries) UpdateTemplate(ctx context.Context, arg UpdateTemplateParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateTemplate, arg.Body, arg.Name, arg.Version)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }

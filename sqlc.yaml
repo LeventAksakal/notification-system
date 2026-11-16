@@ -9,3 +9,8 @@ sql:
         out: internal/store/sqlc
         emit_interface: true
         emit_json_tags: false
+        overrides:
+          # INT UNSIGNED NULL becomes sql.NullInt32 by default, which holds only
+          # half the column's range (2,147,483,647 of 4,294,967,295).
+          - column: notifications.template_version
+            go_type: { import: database/sql, type: NullInt64 }

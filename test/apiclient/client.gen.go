@@ -235,7 +235,7 @@ type DeliveryTotals struct {
 
 // Error defines model for Error.
 type Error struct {
-	// Code invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, idempotency_key_reused, request_too_large, internal
+	// Code invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, precondition_failed, precondition_required, idempotency_key_reused, request_too_large, internal
 	Code    string         `json:"code"`
 	Details *[]ErrorDetail `json:"details,omitempty"`
 	Message string         `json:"message"`
@@ -243,11 +243,22 @@ type Error struct {
 
 // ErrorDetail defines model for ErrorDetail.
 type ErrorDetail struct {
-	Field string `json:"field"`
+	// CurrentVersion On `If-Match` (412, 428), the template's current version; absent when the template does not exist
+	CurrentVersion *int   `json:"currentVersion,omitempty"`
+	Field          string `json:"field"`
 
 	// Index Position of the item in a batch request
-	Index  *int   `json:"index,omitempty"`
-	Reason string `json:"reason"`
+	Index *int `json:"index,omitempty"`
+
+	// Missing On `template.variables`, the required variables the request did not send
+	Missing *[]string `json:"missing,omitempty"`
+	Reason  string    `json:"reason"`
+
+	// Required On `template.variables`, the variables the template uses, in order of first appearance
+	Required *[]string `json:"required,omitempty"`
+
+	// Unknown On `template.variables`, variables sent that the template does not use, sorted; `[]` when none (accepted on their own, listed to help spot a typo)
+	Unknown *[]string `json:"unknown,omitempty"`
 }
 
 // FailureKind `permanent`: the provider refused it. `exhausted`: every attempt failed.
@@ -316,9 +327,10 @@ type Notification struct {
 	// Status Stored states are pending, processing, sent, failed and cancelled. `scheduled` is shown
 	// for a pending notification whose due time is in the future and that was never tried.
 	// `sent` means the provider accepted it; the provider never confirms delivery.
-	Status    Status    `json:"status"`
-	To        string    `json:"to"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Status    Status          `json:"status"`
+	Template  *TemplateOrigin `json:"template,omitempty"`
+	To        string          `json:"to"`
+	UpdatedAt time.Time       `json:"updatedAt"`
 }
 
 // NotificationCreate Exactly one of `content` and `template` is required.
@@ -410,6 +422,9 @@ type Template struct {
 
 	// Variables Variable names found in the body
 	Variables []string `json:"variables"`
+
+	// Version 1 when created, one more on every update; the `ETag` carries the same number
+	Version int `json:"version"`
 }
 
 // TemplateList defines model for TemplateList.
@@ -419,6 +434,12 @@ type TemplateList struct {
 
 // TemplateName defines model for TemplateName.
 type TemplateName = string
+
+// TemplateOrigin defines model for TemplateOrigin.
+type TemplateOrigin struct {
+	Name    TemplateName `json:"name"`
+	Version int          `json:"version"`
+}
 
 // TemplateRef defines model for TemplateRef.
 type TemplateRef struct {
@@ -496,6 +517,12 @@ type CreateBatchParams struct {
 	// IdempotencyKey Visible ASCII, no spaces
 	IdempotencyKey *string `json:"Idempotency-Key,omitempty"`
 	XCorrelationID *string `json:"X-Correlation-ID,omitempty"`
+}
+
+// PutTemplateParams defines parameters for PutTemplate.
+type PutTemplateParams struct {
+	// IfMatch The template's `ETag` as last read, such as `"3"`. Required to replace an existing template; absent to create one. One strong ETag only: `*`, weak and listed ETags are refused. At most 10 digits, because a version is a MySQL INT UNSIGNED (at most 4294967295).
+	IfMatch *string `json:"If-Match,omitempty"`
 }
 
 // StreamEventsParams defines parameters for StreamEvents.
@@ -725,20 +752,32 @@ type ClientInterface interface {
 	// Variables are written `{{name}}`. Replacing a template never changes a notification that
 	// was already accepted: content is rendered at intake.
 	//
+	// Optimistic concurrency: every template has a `version`, 1 when created and one more on
+	// every update, also sent as a strong `ETag` (`"3"`). Without `If-Match` the request
+	// creates the template (`201`); if it already exists the answer is `428` with its current
+	// version. With `If-Match` set to the version last read, the template is replaced (`200`);
+	// any other version, or a template that no longer exists, is `412` and nothing changes.
+	//
 	// Takes any type of body and a specified content type.
 	//
 	// Corresponds with PUT /v1/templates/{name} (the `PutTemplate` operationId).
-	PutTemplateWithBody(ctx context.Context, name TemplateName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+	PutTemplateWithBody(ctx context.Context, name TemplateName, params *PutTemplateParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// PutTemplate Create or replace a template
 	//
 	// Variables are written `{{name}}`. Replacing a template never changes a notification that
 	// was already accepted: content is rendered at intake.
 	//
+	// Optimistic concurrency: every template has a `version`, 1 when created and one more on
+	// every update, also sent as a strong `ETag` (`"3"`). Without `If-Match` the request
+	// creates the template (`201`); if it already exists the answer is `428` with its current
+	// version. With `If-Match` set to the version last read, the template is replaced (`200`);
+	// any other version, or a template that no longer exists, is `412` and nothing changes.
+	//
 	// Takes a body of the `application/json` content type.
 	//
 	// Corresponds with PUT /v1/templates/{name} (the `PutTemplate` operationId).
-	PutTemplate(ctx context.Context, name TemplateName, body PutTemplateJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+	PutTemplate(ctx context.Context, name TemplateName, params *PutTemplateParams, body PutTemplateJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// StreamEvents WebSocket stream of status changes
 	//
@@ -1064,11 +1103,17 @@ func (c *Client) GetTemplate(ctx context.Context, name TemplateName, reqEditors 
 // Variables are written `{{name}}`. Replacing a template never changes a notification that
 // was already accepted: content is rendered at intake.
 //
+// Optimistic concurrency: every template has a `version`, 1 when created and one more on
+// every update, also sent as a strong `ETag` (`"3"`). Without `If-Match` the request
+// creates the template (`201`); if it already exists the answer is `428` with its current
+// version. With `If-Match` set to the version last read, the template is replaced (`200`);
+// any other version, or a template that no longer exists, is `412` and nothing changes.
+//
 // Takes any type of body and a specified content type.
 //
 // Corresponds with PUT /v1/templates/{name} (the `PutTemplate` operationId).
-func (c *Client) PutTemplateWithBody(ctx context.Context, name TemplateName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPutTemplateRequestWithBody(c.Server, name, contentType, body)
+func (c *Client) PutTemplateWithBody(ctx context.Context, name TemplateName, params *PutTemplateParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPutTemplateRequestWithBody(c.Server, name, params, contentType, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1084,11 +1129,17 @@ func (c *Client) PutTemplateWithBody(ctx context.Context, name TemplateName, con
 // Variables are written `{{name}}`. Replacing a template never changes a notification that
 // was already accepted: content is rendered at intake.
 //
+// Optimistic concurrency: every template has a `version`, 1 when created and one more on
+// every update, also sent as a strong `ETag` (`"3"`). Without `If-Match` the request
+// creates the template (`201`); if it already exists the answer is `428` with its current
+// version. With `If-Match` set to the version last read, the template is replaced (`200`);
+// any other version, or a template that no longer exists, is `412` and nothing changes.
+//
 // Takes a body of the `application/json` content type.
 //
 // Corresponds with PUT /v1/templates/{name} (the `PutTemplate` operationId).
-func (c *Client) PutTemplate(ctx context.Context, name TemplateName, body PutTemplateJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewPutTemplateRequest(c.Server, name, body)
+func (c *Client) PutTemplate(ctx context.Context, name TemplateName, params *PutTemplateParams, body PutTemplateJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewPutTemplateRequest(c.Server, name, params, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1811,18 +1862,18 @@ func NewGetTemplateRequest(server string, name TemplateName) (*http.Request, err
 }
 
 // NewPutTemplateRequest calls the generic PutTemplate builder with application/json body
-func NewPutTemplateRequest(server string, name TemplateName, body PutTemplateJSONRequestBody) (*http.Request, error) {
+func NewPutTemplateRequest(server string, name TemplateName, params *PutTemplateParams, body PutTemplateJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	bodyReader = bytes.NewReader(buf)
-	return NewPutTemplateRequestWithBody(server, name, "application/json", bodyReader)
+	return NewPutTemplateRequestWithBody(server, name, params, "application/json", bodyReader)
 }
 
 // NewPutTemplateRequestWithBody constructs an http.Request for the PutTemplate method, with any body, and a specified content type
-func NewPutTemplateRequestWithBody(server string, name TemplateName, contentType string, body io.Reader) (*http.Request, error) {
+func NewPutTemplateRequestWithBody(server string, name TemplateName, params *PutTemplateParams, contentType string, body io.Reader) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -1853,6 +1904,21 @@ func NewPutTemplateRequestWithBody(server string, name TemplateName, contentType
 	}
 
 	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		if params.IfMatch != nil {
+			var headerParam0 string
+
+			headerParam0, err = runtime.StyleParamWithOptions("simple", false, "If-Match", *params.IfMatch, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+			if err != nil {
+				return nil, err
+			}
+
+			req.Header.Set("If-Match", headerParam0)
+		}
+
+	}
 
 	return req, nil
 }
@@ -2124,20 +2190,32 @@ type ClientWithResponsesInterface interface {
 	// Variables are written `{{name}}`. Replacing a template never changes a notification that
 	// was already accepted: content is rendered at intake.
 	//
+	// Optimistic concurrency: every template has a `version`, 1 when created and one more on
+	// every update, also sent as a strong `ETag` (`"3"`). Without `If-Match` the request
+	// creates the template (`201`); if it already exists the answer is `428` with its current
+	// version. With `If-Match` set to the version last read, the template is replaced (`200`);
+	// any other version, or a template that no longer exists, is `412` and nothing changes.
+	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with PUT /v1/templates/{name} (the `PutTemplate` operationId).
-	PutTemplateWithBodyWithResponse(ctx context.Context, name TemplateName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PutTemplateResponse, error)
+	PutTemplateWithBodyWithResponse(ctx context.Context, name TemplateName, params *PutTemplateParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PutTemplateResponse, error)
 
 	// PutTemplateWithResponse Create or replace a template
 	//
 	// Variables are written `{{name}}`. Replacing a template never changes a notification that
 	// was already accepted: content is rendered at intake.
 	//
+	// Optimistic concurrency: every template has a `version`, 1 when created and one more on
+	// every update, also sent as a strong `ETag` (`"3"`). Without `If-Match` the request
+	// creates the template (`201`); if it already exists the answer is `428` with its current
+	// version. With `If-Match` set to the version last read, the template is replaced (`200`);
+	// any other version, or a template that no longer exists, is `412` and nothing changes.
+	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with PUT /v1/templates/{name} (the `PutTemplate` operationId).
-	PutTemplateWithResponse(ctx context.Context, name TemplateName, body PutTemplateJSONRequestBody, reqEditors ...RequestEditorFn) (*PutTemplateResponse, error)
+	PutTemplateWithResponse(ctx context.Context, name TemplateName, params *PutTemplateParams, body PutTemplateJSONRequestBody, reqEditors ...RequestEditorFn) (*PutTemplateResponse, error)
 
 	// StreamEventsWithResponse WebSocket stream of status changes
 	//
@@ -3024,6 +3102,11 @@ func (r DeleteTemplateResponse) ContentType() string {
 	return ""
 }
 
+// GetTemplateResponse200Headers the declared response headers of an HTTP 200 response for GetTemplate
+type GetTemplateResponse200Headers struct {
+	ETag *string
+}
+
 // GetTemplateResponse503Headers the declared response headers of an HTTP 503 response for GetTemplate
 type GetTemplateResponse503Headers struct {
 	RetryAfter *int
@@ -3040,6 +3123,8 @@ type GetTemplateResponse struct {
 	JSON404 *NotFound
 	// JSON503 the response for an HTTP 503 `application/json` response
 	JSON503 *ServiceUnavailable
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *GetTemplateResponse200Headers
 	// Headers503 the parsed response headers for an HTTP 503 response
 	Headers503 *GetTemplateResponse503Headers
 }
@@ -3093,6 +3178,16 @@ func (r GetTemplateResponse) ContentType() string {
 	return ""
 }
 
+// PutTemplateResponse200Headers the declared response headers of an HTTP 200 response for PutTemplate
+type PutTemplateResponse200Headers struct {
+	ETag *string
+}
+
+// PutTemplateResponse201Headers the declared response headers of an HTTP 201 response for PutTemplate
+type PutTemplateResponse201Headers struct {
+	ETag *string
+}
+
 // PutTemplateResponse503Headers the declared response headers of an HTTP 503 response for PutTemplate
 type PutTemplateResponse503Headers struct {
 	RetryAfter *int
@@ -3103,10 +3198,20 @@ type PutTemplateResponse struct {
 	HTTPResponse *http.Response
 	// JSON200 the response for an HTTP 200 `application/json` response
 	JSON200 *Template
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *Template
 	// JSON400 the response for an HTTP 400 `application/json` response
 	JSON400 *InvalidRequest
+	// JSON412 the response for an HTTP 412 `application/json` response
+	JSON412 *Error
+	// JSON428 the response for an HTTP 428 `application/json` response
+	JSON428 *Error
 	// JSON503 the response for an HTTP 503 `application/json` response
 	JSON503 *ServiceUnavailable
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *PutTemplateResponse200Headers
+	// Headers201 the parsed response headers for an HTTP 201 response
+	Headers201 *PutTemplateResponse201Headers
 	// Headers503 the parsed response headers for an HTTP 503 response
 	Headers503 *PutTemplateResponse503Headers
 }
@@ -3116,9 +3221,24 @@ func (r PutTemplateResponse) GetJSON200() *Template {
 	return r.JSON200
 }
 
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r PutTemplateResponse) GetJSON201() *Template {
+	return r.JSON201
+}
+
 // GetJSON400 returns the response for an HTTP 400 `application/json` response
 func (r PutTemplateResponse) GetJSON400() *InvalidRequest {
 	return r.JSON400
+}
+
+// GetJSON412 returns the response for an HTTP 412 `application/json` response
+func (r PutTemplateResponse) GetJSON412() *Error {
+	return r.JSON412
+}
+
+// GetJSON428 returns the response for an HTTP 428 `application/json` response
+func (r PutTemplateResponse) GetJSON428() *Error {
+	return r.JSON428
 }
 
 // GetJSON503 returns the response for an HTTP 503 `application/json` response
@@ -3476,11 +3596,17 @@ func (c *ClientWithResponses) GetTemplateWithResponse(ctx context.Context, name 
 // Variables are written `{{name}}`. Replacing a template never changes a notification that
 // was already accepted: content is rendered at intake.
 //
+// Optimistic concurrency: every template has a `version`, 1 when created and one more on
+// every update, also sent as a strong `ETag` (`"3"`). Without `If-Match` the request
+// creates the template (`201`); if it already exists the answer is `428` with its current
+// version. With `If-Match` set to the version last read, the template is replaced (`200`);
+// any other version, or a template that no longer exists, is `412` and nothing changes.
+//
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with PUT /v1/templates/{name} (the `PutTemplate` operationId).
-func (c *ClientWithResponses) PutTemplateWithBodyWithResponse(ctx context.Context, name TemplateName, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PutTemplateResponse, error) {
-	rsp, err := c.PutTemplateWithBody(ctx, name, contentType, body, reqEditors...)
+func (c *ClientWithResponses) PutTemplateWithBodyWithResponse(ctx context.Context, name TemplateName, params *PutTemplateParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PutTemplateResponse, error) {
+	rsp, err := c.PutTemplateWithBody(ctx, name, params, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -3492,11 +3618,17 @@ func (c *ClientWithResponses) PutTemplateWithBodyWithResponse(ctx context.Contex
 // Variables are written `{{name}}`. Replacing a template never changes a notification that
 // was already accepted: content is rendered at intake.
 //
+// Optimistic concurrency: every template has a `version`, 1 when created and one more on
+// every update, also sent as a strong `ETag` (`"3"`). Without `If-Match` the request
+// creates the template (`201`); if it already exists the answer is `428` with its current
+// version. With `If-Match` set to the version last read, the template is replaced (`200`);
+// any other version, or a template that no longer exists, is `412` and nothing changes.
+//
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with PUT /v1/templates/{name} (the `PutTemplate` operationId).
-func (c *ClientWithResponses) PutTemplateWithResponse(ctx context.Context, name TemplateName, body PutTemplateJSONRequestBody, reqEditors ...RequestEditorFn) (*PutTemplateResponse, error) {
-	rsp, err := c.PutTemplate(ctx, name, body, reqEditors...)
+func (c *ClientWithResponses) PutTemplateWithResponse(ctx context.Context, name TemplateName, params *PutTemplateParams, body PutTemplateJSONRequestBody, reqEditors ...RequestEditorFn) (*PutTemplateResponse, error) {
+	rsp, err := c.PutTemplate(ctx, name, params, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -4330,6 +4462,16 @@ func ParseGetTemplateResponse(rsp *http.Response) (*GetTemplateResponse, error) 
 	}
 
 	switch {
+	case rsp.StatusCode == 200:
+		var headers GetTemplateResponse200Headers
+		if values := rsp.Header.Values("ETag"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "ETag", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.ETag = &value
+		}
+		response.Headers200 = &headers
 	case rsp.StatusCode == 503:
 		var headers GetTemplateResponse503Headers
 		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
@@ -4366,12 +4508,33 @@ func ParsePutTemplateResponse(rsp *http.Response) (*PutTemplateResponse, error) 
 		}
 		response.JSON200 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest Template
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
 		var dest InvalidRequest
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
 		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 412:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON412 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 428:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON428 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
 		var dest ServiceUnavailable
@@ -4383,6 +4546,26 @@ func ParsePutTemplateResponse(rsp *http.Response) (*PutTemplateResponse, error) 
 	}
 
 	switch {
+	case rsp.StatusCode == 200:
+		var headers PutTemplateResponse200Headers
+		if values := rsp.Header.Values("ETag"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "ETag", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.ETag = &value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 201:
+		var headers PutTemplateResponse201Headers
+		if values := rsp.Header.Values("ETag"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "ETag", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.ETag = &value
+		}
+		response.Headers201 = &headers
 	case rsp.StatusCode == 503:
 		var headers PutTemplateResponse503Headers
 		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {

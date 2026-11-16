@@ -21,7 +21,7 @@ import (
 // Version is the contract's version (info.version). Bump the minor version
 // for an addition, the major one for a breaking change; CI's oasdiff check
 // compares the generated spec with the base branch.
-const Version = "1.3.0"
+const Version = "1.4.0"
 
 const description = `Accepts notification requests (sms, email, push), queues them, and delivers them to an
 external provider with rate limiting, priorities, retries and status tracking.
@@ -242,13 +242,7 @@ func (s *Server) register(api huma.API) {
 		OperationID: "listTemplates", Method: http.MethodGet, Path: "/v1/templates", Tags: []string{"templates"},
 		Summary: "All templates, by name",
 	}, "Templates", 503), s.ListTemplates)
-	huma.Register(api, operation(huma.Operation{
-		OperationID: "putTemplate", Method: http.MethodPut, Path: "/v1/templates/{name}", Tags: []string{"templates"},
-		Summary: "Create or replace a template",
-		Description: "Variables are written `{{name}}`. Replacing a template never changes a notification that\n" +
-			"was already accepted: content is rendered at intake.\n",
-		RequestBody: jsonBody(map[string]*huma.Example{"welcome": {Value: map[string]any{"body": "Hello {{name}}, welcome aboard."}}}),
-	}, "Stored", 400, 503), s.PutTemplate)
+	s.registerPutTemplate(api)
 	huma.Register(api, operation(huma.Operation{
 		OperationID: "getTemplate", Method: http.MethodGet, Path: "/v1/templates/{name}", Tags: []string{"templates"},
 		Summary: "Read one template",

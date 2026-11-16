@@ -72,6 +72,8 @@ CREATE TABLE `notifications` (
   `last_error` varchar(1024) DEFAULT NULL,
   `correlation_id` varchar(128) NOT NULL,
   `traceparent` varchar(64) DEFAULT NULL,
+  `template_name` varchar(64) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,
+  `template_version` int unsigned DEFAULT NULL,
   `created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   `updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   `finished_at` datetime(3) DEFAULT NULL,
@@ -96,16 +98,20 @@ CREATE TABLE `notifications` (
   CONSTRAINT `recipient_sms_e164` CHECK (((`channel` <> _utf8mb4'sms') or regexp_like(`recipient`,_utf8mb4'^\\+[0-9]{7,15}$'))),
   CONSTRAINT `scheduled_within_horizon` CHECK (((`scheduled_at` is null) or (`scheduled_at` <= (`updated_at` + interval 30 day)))),
   CONSTRAINT `status_seq_from_one` CHECK ((`status_seq` >= 1)),
-  CONSTRAINT `status_transition` CHECK (((`status_from` is null) or ((`status_from`,`status`) in ((_utf8mb4'created',_utf8mb4'pending'),(_utf8mb4'pending',_utf8mb4'processing'),(_utf8mb4'pending',_utf8mb4'cancelled'),(_utf8mb4'processing',_utf8mb4'sent'),(_utf8mb4'processing',_utf8mb4'pending'),(_utf8mb4'processing',_utf8mb4'failed'),(_utf8mb4'failed',_utf8mb4'pending')))))
+  CONSTRAINT `status_transition` CHECK (((`status_from` is null) or ((`status_from`,`status`) in ((_utf8mb4'created',_utf8mb4'pending'),(_utf8mb4'pending',_utf8mb4'processing'),(_utf8mb4'pending',_utf8mb4'cancelled'),(_utf8mb4'processing',_utf8mb4'sent'),(_utf8mb4'processing',_utf8mb4'pending'),(_utf8mb4'processing',_utf8mb4'failed'),(_utf8mb4'failed',_utf8mb4'pending'))))),
+  CONSTRAINT `template_origin_complete` CHECK (((`template_name` is null) = (`template_version` is null))),
+  CONSTRAINT `template_origin_version_positive` CHECK ((`template_version` >= 1))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `templates` (
   `name` varchar(64) CHARACTER SET ascii COLLATE ascii_general_ci NOT NULL,
   `body` mediumtext NOT NULL,
+  `version` int unsigned NOT NULL DEFAULT '1',
   `created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   `updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (`name`),
   CONSTRAINT `template_body_length` CHECK ((char_length(`body`) between 1 and 100000)),
-  CONSTRAINT `template_name_shape` CHECK (regexp_like(`name`,_utf8mb4'^[a-z0-9][a-z0-9_-]{0,63}$'))
+  CONSTRAINT `template_name_shape` CHECK (regexp_like(`name`,_ascii'^[a-z0-9][a-z0-9_-]{0,63}$')),
+  CONSTRAINT `template_version_positive` CHECK ((`version` >= 1))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

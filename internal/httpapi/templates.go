@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/danielgtaylor/huma/v2"
-
 	"github.com/LeventAksakal/notification-system/internal/intake"
 )
 
@@ -27,22 +25,10 @@ type TemplateNameInput struct {
 	Name TemplateName `path:"name"`
 }
 
-type putTemplateInput struct {
-	TemplateNameInput
-	Body TemplateWrite
-}
-
-// Resolve: every operation with a body runs singleValues (see refuseNull).
-func (*putTemplateInput) Resolve(ctx huma.Context) []error { return singleValues(ctx) }
-
-type templateOutput struct{ Body Template }
-
-func (s *Server) PutTemplate(ctx context.Context, in *putTemplateInput) (*templateOutput, error) {
-	t, err := s.intake.PutTemplate(ctx, string(in.Name), in.Body.Body)
-	if err := refusal(err); err != nil {
-		return nil, err
-	}
-	return &templateOutput{toTemplate(t)}, nil
+// templateOutput is one template with its version as the ETag.
+type templateOutput struct {
+	ETag string `header:"ETag" doc:"The template's version as a strong ETag, such as \"3\"; send it back in If-Match"`
+	Body Template
 }
 
 func (s *Server) GetTemplate(ctx context.Context, in *TemplateNameInput) (*templateOutput, error) {
@@ -53,7 +39,7 @@ func (s *Server) GetTemplate(ctx context.Context, in *TemplateNameInput) (*templ
 	if err != nil {
 		return nil, err
 	}
-	return &templateOutput{toTemplate(t)}, nil
+	return &templateOutput{ETag: etagOf(t.Version), Body: toTemplate(t)}, nil
 }
 
 func (s *Server) DeleteTemplate(ctx context.Context, in *TemplateNameInput) (*struct{}, error) {
@@ -65,5 +51,5 @@ func (s *Server) DeleteTemplate(ctx context.Context, in *TemplateNameInput) (*st
 }
 
 func toTemplate(t intake.Template) Template {
-	return Template{Name: TemplateName(t.Name), Body: t.Body, Variables: t.Variables, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt}
+	return Template{Name: TemplateName(t.Name), Body: t.Body, Version: int(t.Version), Variables: t.Variables, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt}
 }

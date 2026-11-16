@@ -87,7 +87,11 @@ type Querier interface {
 	// database clock (stored pending, never tried, due in the future), the same
 	// rule the list filter uses.
 	// due_at is the schedule or now on the database clock; a past schedule means now.
+	// template_name and template_version: the template that rendered content, both NULL for plain content.
 	InsertNotification(ctx context.Context, arg InsertNotificationParams) error
+	// Creates version 1 (the insert trigger sets it); a duplicate key means the
+	// template exists and an update needs If-Match (decision 0015).
+	InsertTemplate(ctx context.Context, arg InsertTemplateParams) error
 	// pending -> processing for the rows locked by ClaimCandidates in the same
 	// transaction, in one statement (one round trip, however many rows). The
 	// trigger raises status_seq; each row's new value is the one ClaimCandidates
@@ -180,7 +184,10 @@ type Querier interface {
 	// and against its budget: the reaper cannot tell an outage from a message
 	// that kills its worker, and the second must end (decision 0026).
 	UnknownOnReap(ctx context.Context, ids []string) (int64, error)
-	UpsertTemplate(ctx context.Context, arg UpsertTemplateParams) error
+	// Optimistic concurrency: replaces the body only if the caller read the
+	// current version; 0 rows means stale or absent. version = version + 1 is what
+	// the update trigger forces anyway; it is written here so the query reads true.
+	UpdateTemplate(ctx context.Context, arg UpdateTemplateParams) (int64, error)
 }
 
 var _ Querier = (*Queries)(nil)

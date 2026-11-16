@@ -5,12 +5,15 @@
 
 -- name: InsertNotification :exec
 -- due_at is the schedule or now on the database clock; a past schedule means now.
+-- template_name and template_version: the template that rendered content, both NULL for plain content.
 INSERT INTO notifications (
-  id, recipient, channel, priority, content, due_at, scheduled_at, correlation_id, traceparent, created_at
+  id, recipient, channel, priority, content, due_at, scheduled_at, correlation_id, traceparent, created_at,
+  template_name, template_version
 ) VALUES (
   sqlc.arg(id), sqlc.arg(recipient), sqlc.arg(channel), sqlc.arg(priority), sqlc.arg(content),
   GREATEST(COALESCE(sqlc.narg(scheduled_at), NOW(3)), NOW(3)),
-  sqlc.narg(scheduled_at), sqlc.arg(correlation_id), sqlc.narg(traceparent), sqlc.arg(created_at)
+  sqlc.narg(scheduled_at), sqlc.arg(correlation_id), sqlc.narg(traceparent), sqlc.arg(created_at),
+  sqlc.narg(template_name), sqlc.narg(template_version)
 );
 
 -- name: DatabaseNow :one
@@ -114,9 +117,17 @@ DELETE FROM idempotency_keys
 WHERE created_at < NOW(3) - INTERVAL sqlc.arg(retention_ms) * 1000 MICROSECOND
 LIMIT 1000;
 
--- name: UpsertTemplate :exec
-INSERT INTO templates (name, body) VALUES (?, ?)
-ON DUPLICATE KEY UPDATE body = VALUES(body);
+-- name: InsertTemplate :exec
+-- Creates version 1 (the insert trigger sets it); a duplicate key means the
+-- template exists and an update needs If-Match (decision 0015).
+INSERT INTO templates (name, body) VALUES (?, ?);
+
+-- name: UpdateTemplate :execrows
+-- Optimistic concurrency: replaces the body only if the caller read the
+-- current version; 0 rows means stale or absent. version = version + 1 is what
+-- the update trigger forces anyway; it is written here so the query reads true.
+UPDATE templates SET body = sqlc.arg(body), version = version + 1
+WHERE name = sqlc.arg(name) AND version = sqlc.arg(version);
 
 -- name: GetTemplate :one
 SELECT * FROM templates WHERE name = ?;

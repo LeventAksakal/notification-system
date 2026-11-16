@@ -40,6 +40,11 @@ CREATE TABLE notifications (
   last_error VARCHAR(1024) NULL,
   correlation_id VARCHAR(128) NOT NULL,
   traceparent VARCHAR(64) NULL,
+  -- The template and version that rendered content (decision 0015); both NULL
+  -- when content was sent as is. No foreign key: the template may be replaced
+  -- or deleted later, and the notification keeps what produced it.
+  template_name VARCHAR(64) CHARACTER SET ascii NULL,
+  template_version INT UNSIGNED NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   -- Set on reaching sent, failed or cancelled; cleared by a replay.
@@ -69,6 +74,8 @@ CREATE TABLE notifications (
   -- on insert, ON UPDATE), so a row that passed once keeps passing while the
   -- server clock does not step back (decision 0016, "As built").
   CONSTRAINT scheduled_within_horizon CHECK (((`scheduled_at` is null) or (`scheduled_at` <= (`updated_at` + interval 30 day)))),
+  CONSTRAINT template_origin_complete CHECK (((`template_name` is null) = (`template_version` is null))),
+  CONSTRAINT template_origin_version_positive CHECK ((`template_version` >= 1)),
   -- The claim: WHERE status='pending' AND channel=? AND priority=? AND due_at<=NOW(3) ORDER BY due_at.
   KEY claim_idx (status, channel, priority, due_at),
   -- The reaper: WHERE status='processing' AND lease_until < NOW(3).

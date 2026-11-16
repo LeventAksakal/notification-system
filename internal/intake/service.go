@@ -199,6 +199,10 @@ func (s *Service) Create(ctx context.Context, r Request, m Meta) (n Notification
 		Traceparent:   sql.NullString{String: m.Traceparent, Valid: m.Traceparent != ""},
 		CreatedAt:     createdAt,
 	}
+	if a.Template != nil {
+		params.TemplateName = sql.NullString{String: a.Template.Name, Valid: true}
+		params.TemplateVersion = sql.NullInt64{Int64: int64(a.Template.Version), Valid: true}
+	}
 	stored, err := s.store(ctx, m.IdempotencyKey, hash, sqlc.IdempotencyKeysResourceKindNotification, params.ID,
 		func(q *sqlc.Queries, _ *sql.Tx) error { return q.InsertNotification(ctx, params) })
 	if err != nil {
@@ -253,6 +257,9 @@ func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b Batc
 		}
 		items[i] = store.BatchItem{BatchIndex: i, Recipient: a.To, Channel: string(a.Channel),
 			Priority: string(a.Priority), Content: a.Content, ScheduledAt: a.ScheduledAt}
+		if a.Template != nil {
+			items[i].TemplateName, items[i].TemplateVersion = a.Template.Name, a.Template.Version
+		}
 	}
 	if len(all) > 0 {
 		return BatchCreated{}, false, &ValidationError{Details: all}
@@ -671,10 +678,11 @@ func (s *Service) inTx(ctx context.Context, fn func(q *sqlc.Queries, tx *sql.Tx)
 	return nil
 }
 
-// loadTemplates reads the bodies of the templates the requests name; an
-// unknown name is simply absent from the map.
-func (s *Service) loadTemplates(ctx context.Context, rs []Request) (map[string]string, error) {
-	out := map[string]string{}
+// loadTemplates reads the templates the requests name, body and version in
+// one row read, so the version stored on a notification is the one rendered;
+// an unknown name is simply absent from the map.
+func (s *Service) loadTemplates(ctx context.Context, rs []Request) (map[string]sqlc.Template, error) {
+	out := map[string]sqlc.Template{}
 	tried := map[string]bool{}
 	for _, r := range rs {
 		if r.Template == nil || tried[r.Template.Name] {
@@ -688,7 +696,7 @@ func (s *Service) loadTemplates(ctx context.Context, rs []Request) (map[string]s
 		if err != nil {
 			return nil, fmt.Errorf("read template %q: %w", r.Template.Name, err)
 		}
-		out[t.Name] = t.Body
+		out[t.Name] = t
 	}
 	return out, nil
 }

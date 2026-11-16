@@ -458,6 +458,8 @@ type Notification struct {
 	LastError         sql.NullString
 	CorrelationID     string
 	Traceparent       sql.NullString
+	TemplateName      sql.NullString
+	TemplateVersion   sql.NullInt64
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	FinishedAt        sql.NullTime
@@ -466,6 +468,7 @@ type Notification struct {
 type Template struct {
 	Name      string
 	Body      string
+	Version   uint32
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

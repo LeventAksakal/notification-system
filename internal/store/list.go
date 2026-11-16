@@ -35,7 +35,7 @@ type ListedNotification struct {
 
 const listColumns = `SELECT id, batch_id, batch_index, recipient, channel, priority, content, status, failure_kind,
   attempts, due_at, scheduled_at, lease_until, claim_version, provider_message_id, last_error, correlation_id,
-  traceparent, created_at, updated_at, finished_at,
+  traceparent, created_at, updated_at, finished_at, template_name, template_version,
   status = 'pending' AND attempts = 0 AND due_at > NOW(3) AS is_scheduled
 FROM notifications`
 
@@ -120,7 +120,7 @@ func ListNotifications(ctx context.Context, db *sql.DB, f ListFilter) ([]ListedN
 		if err := rows.Scan(&n.ID, &n.BatchID, &n.BatchIndex, &n.Recipient, &n.Channel, &n.Priority, &n.Content,
 			&n.Status, &n.FailureKind, &n.Attempts, &n.DueAt, &n.ScheduledAt, &n.LeaseUntil, &n.ClaimVersion,
 			&n.ProviderMessageID, &n.LastError, &n.CorrelationID, &n.Traceparent, &n.CreatedAt, &n.UpdatedAt,
-			&n.FinishedAt, &r.IsScheduled); err != nil {
+			&n.FinishedAt, &n.TemplateName, &n.TemplateVersion, &r.IsScheduled); err != nil {
 			return nil, fmt.Errorf("scan notification: %w", err)
 		}
 		out = append(out, r)

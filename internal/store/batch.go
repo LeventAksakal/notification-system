@@ -17,6 +17,10 @@ type BatchItem struct {
 	Priority    string
 	Content     string
 	ScheduledAt *time.Time // nil: due now
+	// TemplateName and TemplateVersion: the template that rendered Content;
+	// "" and 0 for plain content, stored as NULL.
+	TemplateName    string
+	TemplateVersion uint32
 }
 
 // BatchMeta is what every row of one batch shares.
@@ -35,12 +39,16 @@ const (
 )
 
 const insertColumns = `INSERT INTO notifications
-  (id, batch_id, batch_index, recipient, channel, priority, content, due_at, scheduled_at, correlation_id, traceparent, created_at)
+  (id, batch_id, batch_index, recipient, channel, priority, content, due_at, scheduled_at, correlation_id, traceparent, created_at,
+   template_name, template_version)
 VALUES `
 
 // One row; due_at is the schedule or now on the database clock, as in the
 // sqlc query InsertNotification.
-const insertRow = `(?, ?, ?, ?, ?, ?, ?, GREATEST(COALESCE(?, NOW(3)), NOW(3)), ?, ?, ?, ?)`
+const insertRow = `(?, ?, ?, ?, ?, ?, ?, GREATEST(COALESCE(?, NOW(3)), NOW(3)), ?, ?, ?, ?, ?, ?)`
+
+// argsPerRow is the number of placeholders in insertRow.
+const argsPerRow = 14
 
 // InsertBatchItems inserts a batch's notifications with multi-row INSERTs in
 // chunks, inside tx. sqlc cannot express a variable-length VALUES list, so
@@ -59,7 +67,7 @@ func InsertBatchItems(ctx context.Context, tx *sql.Tx, meta BatchMeta, items []B
 		chunk := items[start:end]
 		var b strings.Builder
 		b.WriteString(insertColumns)
-		args := make([]any, 0, len(chunk)*12)
+		args := make([]any, 0, len(chunk)*argsPerRow)
 		for i, it := range chunk {
 			if i > 0 {
 				b.WriteString(", ")
@@ -69,8 +77,14 @@ func InsertBatchItems(ctx context.Context, tx *sql.Tx, meta BatchMeta, items []B
 			if it.ScheduledAt != nil {
 				sched = sql.NullTime{Time: it.ScheduledAt.UTC(), Valid: true}
 			}
+			var tname sql.NullString
+			var tversion sql.NullInt64
+			if it.TemplateName != "" {
+				tname = sql.NullString{String: it.TemplateName, Valid: true}
+				tversion = sql.NullInt64{Int64: int64(it.TemplateVersion), Valid: true}
+			}
 			args = append(args, it.ID, meta.BatchID, it.BatchIndex, it.Recipient, it.Channel, it.Priority, it.Content,
-				sched, sched, meta.CorrelationID, tp, meta.CreatedAt.UTC())
+				sched, sched, meta.CorrelationID, tp, meta.CreatedAt.UTC(), tname, tversion)
 		}
 		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
 			return fmt.Errorf("insert batch items %d..%d: %w", start, end-1, err)
