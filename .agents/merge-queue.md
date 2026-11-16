@@ -15,6 +15,8 @@ Integration branch: `refs/heads/integration/decision-review`, checked out in `C:
 | 341630c | realtime-seq (0013): status_seq ordering, MySQL-only readiness, 503/1012 in the contract |
 | c488661 | template-versioning (0015): versions with If-Match, detailed variables error, template origin on notifications |
 | aaeb893 | adaptive-align (0009): alignment follows measured claim latency |
+| ce1fd26 | limits-standards (0017): every limit cited, blank content refused at every layer |
+| efd3d6b | metrics-rollup (0014): per-minute rollups and latency buckets |
 
 ## Protocol for every lane
 1. Finish your work and your verifier on your own branch, as briefed. Do not merge other lanes into your branch.
