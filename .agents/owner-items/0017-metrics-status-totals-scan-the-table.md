@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-16
 tags: [api, metrics, scale, retention]
 ---
@@ -23,3 +23,4 @@ Option 3 for the API (what an operator acts on is the backlog and the recent out
 Option 1: totals unchanged on the metrics-rollups branch.
 
 ## Answer
+Owner, 16 Nov 2026: covered in the 15 to 16 Nov walkthrough. The assumption taken above stands as the answer; closed by the coordinator.

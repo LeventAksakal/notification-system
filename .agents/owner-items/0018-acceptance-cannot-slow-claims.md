@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-16
 tags: [tests, acceptance, rate-limit, harness]
 ---
@@ -23,3 +23,4 @@ Option 3 until a slow-claim incident is seen outside tests; option 1 if the owne
 Option 3: the two tests are not written in `test/acceptance`.
 
 ## Answer
+Owner, 16 Nov 2026: covered in the 15 to 16 Nov walkthrough. The assumption taken above stands as the answer; closed by the coordinator.

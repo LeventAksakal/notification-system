@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-14
 tags: [tests, rate-limit]
 ---
@@ -21,3 +21,4 @@ Histogram of one run: `sms [98 97 97 97 97 97 96 21]`, `email [98 97 97 97 96 98
 Option 1, set by the coordinator, implemented by a test-writer (not by the lane that wrote the worker). The ceiling assertion (at most 100 in any sliding second) is unchanged.
 
 ## Answer
+Owner, 16 Nov 2026: covered in the 15 to 16 Nov walkthrough. The assumption taken above stands as the answer; closed by the coordinator.

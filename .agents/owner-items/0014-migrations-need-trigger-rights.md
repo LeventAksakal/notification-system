@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-15
 tags: [mysql, migrations, privileges]
 ---
@@ -20,3 +20,4 @@ Measured 15 Nov 2026: MySQL 8.4.13, `log_bin=1`, `binlog_format=ROW`; setting th
 Option 2 before the first production deployment; option 1 meanwhile (taken as the assumption on 15 Nov).
 
 ## Answer
+Owner, 16 Nov 2026: covered in the walkthrough. Option 1 stands for this submission (compose and the test containers set `log_bin_trust_function_creators`); option 2, a separate privileged migration user, is the step before a production deployment. Closed by the coordinator.

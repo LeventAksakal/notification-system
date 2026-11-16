@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-14
 tags: [api, metrics, list, scale]
 ---
@@ -29,3 +29,4 @@ At a sustained 300 messages per second an hour holds a million attempts, which p
 Option 1. Nothing changed.
 
 ## Answer
+Owner, 16 Nov 2026: covered in the 15 to 16 Nov walkthrough. The assumption taken above stands as the answer; closed by the coordinator.
