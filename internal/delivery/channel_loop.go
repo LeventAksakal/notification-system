@@ -49,8 +49,24 @@ func (w *Worker) channelLoop(ctx, sendCtx context.Context, cr *channelRun, infli
 		at := cr.sel.nextCheck(now)
 		claim, peek := cr.sel.due(now)
 		contended := cr.sel.contended()
+		revived := cr.sel.revived
 		cr.sel.revived = false // seen now
 		cr.mu.Unlock()
+		if revived && !contended {
+			// A hint (or due time) made a priority found empty claimable
+			// again and no wait reported it: it came as the pause's timer
+			// fired (pauseWait's select took the timer) or after the pause
+			// ended. The channel is woken by it all the same, as every other
+			// worker the hint reached is, so the grant it is about to take
+			// on their busy grid must not claim at once (woke): unreported,
+			// it claimed the hinted row for its slot a lead or more out while
+			// the worker holding the near flex group still waited for its
+			// reply (600 ms with a 300 ms lead,
+			// TestWorkersWokenTogetherLeaveTheHintedRowToTheEarlyGroup on two
+			// cores, about one run in a hundred). Not on a contended channel,
+			// as after idleWait.
+			woke = true
+		}
 		if !at.IsZero() {
 			w.idleWait(ctx, cr, at.Sub(now))
 			woke = !contended

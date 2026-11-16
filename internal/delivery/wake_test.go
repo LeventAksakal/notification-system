@@ -384,77 +384,257 @@ func TestASecondRowAfterALoneSendIsNotHeldBehindTheOtherWorkersSlots(t *testing.
 	}
 }
 
-// lateIdleReply is a gridLimiter whose reply to a grant on an idle grid comes
-// late (Valkey reply jitter), so a worker that reserved after it can hear
-// back, and claim, first.
-type lateIdleReply struct {
-	*gridLimiter
-	delay time.Duration
+// wokenTogether puts the moments of a late reply in order with events, not a
+// sleep. Workers woken by one hint each reserve on one grid; the reply to the
+// Take that finds it idle (the early group's) is held until every other
+// worker has heard back from its own Take and made its next call on what it
+// heard: a GiveBack or a claim (counted once it returns) or another Take
+// (counted as it is made). So the later workers hear back first and act
+// first, whatever the scheduler does, and a row one of them claims on a grant
+// made before the early group heard back is in its hands before the early
+// group can ask. That holds for a deferred claim (group.deferClaim) too: the
+// later grant here lies beyond the lead, which channelLoop gives back at
+// once, and this test pins that.
+//
+// A Take a later worker makes after that waits until the hinted row is
+// claimed. channelLoop makes it a pause after the first (Grant.Wait +
+// refill(Horizon): 100 ms or more with the 200 ms Horizon, about 17.5 ms
+// here, 5 ms + 25 ms/2), no longer woken, so it claims at once; the early
+// group's claim is under way as soon as its reply is in, so the reply's
+// jitter has that pause to fit in. That margin is the product's (channelLoop
+// gives a woken grant beyond the lead back and claims on the next one); this
+// test does not race it on the scheduler. The 10 ms sleep that stood in for
+// the jitter left 7.5 ms of it, which the race detector on a loaded runner
+// lost in about one run in eight (the row then left at the later worker's
+// slot, about 600 ms out).
+type wokenTogether struct {
+	ch notification.Channel
+	n  int // workers
+
+	takes sync.Mutex // one woken Take at a time
+	last  time.Time  // guarded by takes: when the last woken Take returned
+
+	mu      sync.Mutex
+	armed   bool
+	early   int           // the worker whose Take found the grid idle; -1 before
+	heard   map[int]bool  // workers that have heard back from a Take since armed
+	acted   map[int]bool  // later workers that have made their next call since
+	settled map[int]bool  // workers that have asked NextDue: idle until a hint
+	release chan struct{} // closed once every later worker has acted
+	claimed chan struct{} // closed once the hinted row is claimed
 }
 
-func (l lateIdleReply) Take(ctx context.Context, ch notification.Channel, r notification.SlotRequest) (notification.Grant, error) {
+func newWokenTogether(ch notification.Channel, n int) *wokenTogether {
+	return &wokenTogether{ch: ch, n: n, early: -1, heard: map[int]bool{}, acted: map[int]bool{},
+		settled: map[int]bool{}, release: make(chan struct{}), claimed: make(chan struct{})}
+}
+
+// arm starts ordering: every reserving Take on ch from now on is a woken one.
+func (o *wokenTogether) arm() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.armed = true
+}
+
+// idle reports whether every worker's start-up round is over, so only a hint
+// wakes it. With no rows and no catch-up hint (quietWakes) start-up is one
+// round: every priority starts due (newSelector), and a claim that finds
+// nothing carries its slots on to the next priority, or looks it up, until
+// all three are answered; its NextDue comes after its claims and give-back
+// and settles them empty until the 30 s safety poll.
+func (o *wokenTogether) idle() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return len(o.settled) == o.n
+}
+
+// earlyWorker is the worker whose Take found the grid idle, -1 if none did.
+func (o *wokenTogether) earlyWorker() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.early
+}
+
+// act counts worker id's next call after its first reply; o.mu is held.
+func (o *wokenTogether) act(id int) {
+	if !o.armed || id == o.early || !o.heard[id] || o.acted[id] {
+		return
+	}
+	o.acted[id] = true
+	if len(o.acted) == o.n-1 {
+		close(o.release)
+	}
+}
+
+// wokenLimiter is worker id's view of the shared gridLimiter.
+type wokenLimiter struct {
+	*gridLimiter
+	o  *wokenTogether
+	id int
+}
+
+func (l wokenLimiter) Take(ctx context.Context, ch notification.Channel, r notification.SlotRequest) (notification.Grant, error) {
+	o := l.o
+	o.mu.Lock()
+	ordered := o.armed && ch == o.ch && r.N > 0 // a Take of no slots only reads the clock
+	again := ordered && o.heard[l.id]
+	if again {
+		o.act(l.id)
+	}
+	o.mu.Unlock()
+	if !ordered {
+		return l.gridLimiter.Take(ctx, ch, r)
+	}
+	if again {
+		select {
+		case <-o.claimed:
+		case <-ctx.Done():
+			return notification.Grant{}, ctx.Err()
+		}
+		return l.gridLimiter.Take(ctx, ch, r)
+	}
+	// One at a time, each on a later limiter now than the one before, as
+	// Takes from processes a network apart are (leadLog): woken on one tick
+	// of a coarse clock (Windows), the next taker's first free slot would be
+	// 600 ms out, 1 us past the lead plus the cap (300 ms + 299.999 ms) it
+	// may reserve to, and it would get none instead of the one right after
+	// the early group.
+	o.takes.Lock()
+	for !time.Now().After(o.last) {
+	}
 	g, err := l.gridLimiter.Take(ctx, ch, r)
-	if err == nil && g.N > 0 && g.Idle > 0 {
-		sleep(ctx, l.delay)
+	o.last = time.Now()
+	o.takes.Unlock()
+	o.mu.Lock()
+	o.heard[l.id] = true
+	early := o.early < 0 && err == nil && g.N > 0 && g.Idle > 0
+	if early {
+		o.early = l.id
+	}
+	o.mu.Unlock()
+	if early {
+		select {
+		case <-o.release:
+		case <-ctx.Done():
+			return notification.Grant{}, ctx.Err()
+		}
 	}
 	return g, err
+}
+
+func (l wokenLimiter) GiveBack(ctx context.Context, ch notification.Channel, g notification.Grant, from time.Time) (bool, error) {
+	ok, err := l.gridLimiter.GiveBack(ctx, ch, g, from)
+	if ch == l.o.ch {
+		l.o.mu.Lock()
+		l.o.act(l.id)
+		l.o.mu.Unlock()
+	}
+	return ok, err
+}
+
+// wokenQueue is worker id's view of the shared memQueue.
+type wokenQueue struct {
+	*memQueue
+	o  *wokenTogether
+	id int
+}
+
+func (q wokenQueue) Claim(ctx context.Context, ch notification.Channel, p notification.Priority, n int, lease time.Duration) ([]notification.Job, error) {
+	jobs, err := q.memQueue.Claim(ctx, ch, p, n, lease)
+	if ch == q.o.ch {
+		q.o.mu.Lock()
+		if q.o.armed && len(jobs) > 0 {
+			select {
+			case <-q.o.claimed:
+			default:
+				close(q.o.claimed)
+			}
+		}
+		q.o.act(q.id)
+		q.o.mu.Unlock()
+	}
+	return jobs, err
+}
+
+func (q wokenQueue) NextDue(ctx context.Context, ch notification.Channel) (map[notification.Priority]time.Duration, error) {
+	next, err := q.memQueue.NextDue(ctx, ch)
+	if ch == q.o.ch {
+		q.o.mu.Lock()
+		q.o.settled[q.id] = true
+		q.o.mu.Unlock()
+	}
+	return next, err
+}
+
+// quietWakes is a fakeWakes without its subscription's catch-up hint
+// (onSubscribed). Every priority starts due anyway (newSelector), so the
+// start-up round asks what that hint would; the second start-up round the
+// hint can add (one landing on a round under way is kept for another) could
+// still be running when the test adds its row and hints.
+type quietWakes struct{ *fakeWakes }
+
+func (q quietWakes) Run(ctx context.Context, chs []notification.Channel, onHint func(notification.Wake), _ func()) error {
+	return q.fakeWakes.Run(ctx, chs, onHint, func() {})
 }
 
 func TestWorkersWokenTogetherLeaveTheHintedRowToTheEarlyGroup(t *testing.T) {
 	// Three workers share one queue and one limiter, as in the stack. A hint
 	// wakes them all; the first to reserve sees an idle grid and may send at
 	// once, the others land on a busy grid a horizon further out. The reply
-	// to the first comes late, so a later worker hears back first. The
-	// hinted row must still go with the early group.
+	// to the first comes late, so the later workers hear back first
+	// (wokenTogether). The hinted row must still go with the early group.
 	const align = 300 * time.Millisecond
-	for attempt := range 5 {
-		t.Run(fmt.Sprintf("hint %d", attempt), func(t *testing.T) {
-			q := newMemQueue()
-			// As in production, where the first taker's 19 slots of
-			// 10.527 ms end 13 us past lead + 200 ms and the next taker still
-			// gets one slot right after them: the worker's horizon is its
-			// lead (300 ms), the limiter's cap 1 us under it, so the first
-			// taker gets 60 slots of 5 ms, not the 61 it asks for, and the
-			// next one the 61st.
-			lim := newGridLimiter(5*time.Millisecond, align-time.Microsecond)
-			// Well under the 300 ms the deferred claim waits for (its first
-			// slot less its lead).
-			late := lateIdleReply{gridLimiter: lim, delay: 10 * time.Millisecond}
-			sent := newSentLog()
-			cfg := idleConfig()
-			cfg.AlignFloor, cfg.AlignCeiling = align, align
-			cfg.Horizon = 25 * time.Millisecond
-			var all []*fakeWakes
-			var stops []func() error
-			for range 3 {
-				wk := newFakeWakes()
-				all = append(all, wk)
-				stops = append(stops, run(t, New(cfg, Deps{Queue: q, Limiter: late, Sender: sent, Wakes: wk})))
+	const workers = 3
+	q := newMemQueue()
+	// As in production, where the first taker's 19 slots of 10.527 ms end
+	// 13 us past lead + 200 ms and the next taker still gets one slot right
+	// after them: the worker's horizon is its lead (300 ms), the limiter's
+	// cap 1 us under it, so the first taker gets 60 slots of 5 ms, not the
+	// 61 it asks for, and the next one the 61st, about 600 ms out.
+	lim := newGridLimiter(5*time.Millisecond, align-time.Microsecond)
+	order := newWokenTogether(notification.ChannelPush, workers)
+	cfg := idleConfig()
+	cfg.Channels = []notification.Channel{notification.ChannelPush}
+	cfg.AlignFloor, cfg.AlignCeiling = align, align
+	cfg.Horizon = 25 * time.Millisecond
+	var all []*fakeWakes
+	var sent []*sentLog // one per worker: which one sent the row
+	for i := range workers {
+		wk := newFakeWakes()
+		all = append(all, wk)
+		sent = append(sent, newSentLog())
+		stop := run(t, New(cfg, Deps{Queue: wokenQueue{memQueue: q, o: order, id: i},
+			Limiter: wokenLimiter{gridLimiter: lim, o: order, id: i}, Sender: sent[i], Wakes: quietWakes{wk}}))
+		defer func() {
+			if err := stop(); err != nil {
+				t.Error(err)
 			}
-			defer func() {
-				for _, stop := range stops {
-					if err := stop(); err != nil {
-						t.Error(err)
-					}
-				}
-			}()
-			waitFor(t, "every worker idle", func() bool { p, _ := q.stats(); return p >= 3*len(notification.Channels) })
-			// The start-up rounds reserved slots: let the grid fall idle.
-			waitFor(t, "grid idle", func() bool {
-				lim.mu.Lock()
-				defer lim.mu.Unlock()
-				return time.Since(lim.next[notification.ChannelPush]) > align+lim.interval
-			})
-			id := q.addDue(notification.ChannelPush, notification.PriorityNormal, time.Time{})
-			start := time.Now()
-			for _, wk := range all {
-				wk.hint(notification.Wake{Channel: notification.ChannelPush, Priority: notification.PriorityNormal, Due: start})
+		}()
+	}
+	waitFor(t, "every worker idle", order.idle)
+	// The start-up rounds reserved slots: let the grid fall idle.
+	waitFor(t, "grid idle", func() bool {
+		lim.mu.Lock()
+		defer lim.mu.Unlock()
+		return time.Since(lim.next[notification.ChannelPush]) > align+lim.interval
+	})
+	id := q.addDue(notification.ChannelPush, notification.PriorityNormal, time.Time{})
+	order.arm()
+	for _, wk := range all {
+		wk.hint(notification.Wake{Channel: notification.ChannelPush, Priority: notification.PriorityNormal, Due: time.Now()})
+	}
+	by := -1
+	waitFor(t, "sent", func() bool {
+		for i, s := range sent {
+			if _, ok := s.when(id); ok {
+				by = i
+				return true
 			}
-			waitFor(t, "sent", func() bool { _, ok := sent.when(id); return ok })
-			if at, _ := sent.when(id); at.Sub(start) >= align/2 {
-				t.Fatalf("sent %s after the hint: a later group took it; want well under the lead (%s)", at.Sub(start), align)
-			}
-		})
+		}
+		return false
+	})
+	if early := order.earlyWorker(); by != early {
+		t.Fatalf("the hinted row was sent by worker %d, the early group was worker %d's: a later group took it on a grant made before the early group heard back", by, early)
 	}
 }
 
