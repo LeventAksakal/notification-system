@@ -10,6 +10,7 @@ Integration branch: `refs/heads/integration/decision-review`, checked out in `C:
 | d580c4e | huma-code-first (0004 → 0024): Huma owns the HTTP contract, `task gen` writes `api/openapi.yaml` and `test/apiclient` |
 | 6873097 | provider-health (0008 → 0026): shared outage state; `APP_MAX_ATTEMPTS` 10 |
 | af16e3a | trace-correlation (0019): sampler env vars, stored correlation id on every line |
+| 5eb668f | db-rules-retention (0005, 0025): state machine in MySQL, write-ahead attempts, retention |
 
 ## Protocol for every lane
 1. Finish your work and your verifier on your own branch, as briefed. Do not merge other lanes into your branch.
@@ -38,4 +39,5 @@ Don't route around the guard. Write the tests you would add to `.agents/pr/<lane
 - provider-health changed `APP_MAX_ATTEMPTS` from 12 to 10. Outages no longer spend the budget (0026), so 10 is the smallest budget that reaches the 5-minute cap. Tell the owner, since they approved 12 in 0007.
 - After realtime-seq lands, update the R15 row in `docs/REQUIREMENTS.md`: `/readyz` checks MySQL only, and while Valkey is down `/v1/ws` answers 503 and open streams close with 1012.
 - Flaky on a loaded host, to re-run on a quiet one: `TestWorkersAcrossSmallLimiterClockSteps` (also on main under `-race`), and the delivery rate floor `TestWorkersHoldTheRateAtTheProvider`.
+- `test/acceptance/delivery_wake_test.go:42` uses `n.ID` where the generated client field is `Id`; `go vet -tags integration ./test/...` fails on integration. Test-writer fixes it with the held tests.
 - Realtime commit `46aefb6` doesn't build on its own; squashing covers it.
