@@ -84,7 +84,8 @@ var smsRecipient = regexp.MustCompile(notification.SMSRecipientPattern)
 // Validate checks one request against every intake rule and renders its
 // template. templates maps the names of the stored templates the request may
 // reference to their bodies; a name missing from it is unknown. now is the
-// clock the schedule horizon is measured from.
+// database clock (Service.scheduleClock), which the schedule horizon is
+// measured from; it is only read when r carries a schedule.
 func Validate(r Request, templates map[string]string, now time.Time) (Accepted, []FieldError) {
 	var errs []FieldError
 	add := func(field, reason string) { errs = append(errs, FieldError{Field: field, Reason: reason}) }
@@ -123,11 +124,10 @@ func Validate(r Request, templates map[string]string, now time.Time) (Accepted, 
 	}
 
 	if r.ScheduledAt != nil {
-		if r.ScheduledAt.After(now.Add(notification.ScheduleHorizon)) {
-			add("scheduledAt", fmt.Sprintf("must be at most %s ahead", humanDuration(notification.ScheduleHorizon)))
+		a.ScheduledAt = truncate(r.ScheduledAt)
+		if a.ScheduledAt.After(now.Add(notification.ScheduleHorizon)) {
+			add("scheduledAt", horizonReason())
 		}
-		t := r.ScheduledAt.UTC().Truncate(time.Millisecond)
-		a.ScheduledAt = &t
 	}
 	return a, errs
 }
@@ -199,6 +199,11 @@ func CheckTemplate(name, body string) []FieldError {
 }
 
 var templateName = regexp.MustCompile(notification.TemplateNamePattern)
+
+// horizonReason is the refusal of a schedule beyond notification.ScheduleHorizon.
+func horizonReason() string {
+	return fmt.Sprintf("must be at most %s ahead", humanDuration(notification.ScheduleHorizon))
+}
 
 func humanDuration(d time.Duration) string {
 	if d%(24*time.Hour) == 0 {

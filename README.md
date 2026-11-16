@@ -86,7 +86,7 @@ Operating notes: the API has no authentication of its own and belongs behind a g
 api/  schema/  migrations/  config/   contracts and settings
 cmd/app  cmd/fakeprovider             entry points; cmd/app wires the packages
 internal/notification                 vocabulary, state machine, limits, ports
-internal/intake                       accept, read, cancel, retry
+internal/intake                       accept, read, cancel, retry, reschedule
 internal/delivery (limiter, health)   the worker loop and its policies
 internal/httpapi                      HTTP and WebSocket handlers, generated server, /docs
 internal/store                        SQL queries (sqlc) and the queue

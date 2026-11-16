@@ -205,7 +205,7 @@ components:
     Error:
       properties:
         code:
-          description: invalid_request, not_found, not_cancellable, not_retryable, idempotency_key_reused, request_too_large, internal
+          description: invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, idempotency_key_reused, request_too_large, internal
           type: string
         details:
           items:
@@ -375,7 +375,7 @@ components:
         priority:
           $ref: "#/components/schemas/Priority"
         scheduledAt:
-          description: Deliver no earlier than this. A time in the past means now; more than 30 days ahead is refused.
+          description: Deliver no earlier than this. A time in the past means now. More than 30 days ahead is refused, measured on the server's database clock, the same clock that decides when the notification is due.
           format: date-time
           type: string
         template:
@@ -399,6 +399,17 @@ components:
           type: string
       required:
         - items
+      type: object
+    NotificationReschedule:
+      additionalProperties: false
+      properties:
+        scheduledAt:
+          description: The new schedule; `null` means due now. A time in the past means now. More than 30 days ahead is refused, measured on the server's database clock, the same clock that decides when the notification is due.
+          format: date-time
+          nullable: true
+          type: string
+      required:
+        - scheduledAt
       type: object
     Priority:
       enum:
@@ -918,6 +929,54 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
       summary: Status, attempt count, last error and the attempt history of one notification
+      tags:
+        - notifications
+    patch:
+      description: |
+        Sets `scheduledAt` (and so `dueAt`) under the same rules as create. Allowed while the
+        notification is pending and no worker has picked it up: `scheduled`, or `pending` and due but not
+        yet claimed. One a worker already picked up is refused (409; the message names the status): one
+        waiting for a retry, so a reschedule never overrides a retry backoff or a provider's Retry-After, and
+        one handed back unsent while its channel was paused, which shows as `scheduled` until it is due. A
+        reschedule racing a worker has exactly one winner. No WebSocket event is sent: the stored status does
+        not change.
+      operationId: rescheduleNotification
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            format: uuid
+            type: string
+      requestBody:
+        content:
+          application/json:
+            examples:
+              later:
+                value:
+                  scheduledAt: "2026-12-01T09:00:00Z"
+              now:
+                value:
+                  scheduledAt: null
+            schema:
+              $ref: "#/components/schemas/NotificationReschedule"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Notification"
+          description: Rescheduled; the notification as stored now
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+      summary: Reschedule a notification that no worker has picked up
       tags:
         - notifications
   /v1/notifications/{id}/cancel:

@@ -93,6 +93,7 @@ CREATE TABLE `notifications` (
   CONSTRAINT `recipient_email_length` CHECK (((`channel` <> _utf8mb4'email') or (char_length(`recipient`) <= 254))),
   CONSTRAINT `recipient_not_blank` CHECK ((char_length(`recipient`) between 1 and 255)),
   CONSTRAINT `recipient_sms_e164` CHECK (((`channel` <> _utf8mb4'sms') or regexp_like(`recipient`,_utf8mb4'^\\+[0-9]{7,15}$'))),
+  CONSTRAINT `scheduled_within_horizon` CHECK (((`scheduled_at` is null) or (`scheduled_at` <= (`updated_at` + interval 30 day)))),
   CONSTRAINT `status_transition` CHECK (((`status_from` is null) or ((`status_from`,`status`) in ((_utf8mb4'created',_utf8mb4'pending'),(_utf8mb4'pending',_utf8mb4'processing'),(_utf8mb4'pending',_utf8mb4'cancelled'),(_utf8mb4'processing',_utf8mb4'sent'),(_utf8mb4'processing',_utf8mb4'pending'),(_utf8mb4'processing',_utf8mb4'failed'),(_utf8mb4'failed',_utf8mb4'pending')))))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

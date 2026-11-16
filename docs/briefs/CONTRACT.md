@@ -13,7 +13,7 @@ One binary, `cmd/app`: `app migrate`, `app serve` (HTTP API), `app worker` (deli
 ## HTTP conventions
 - Refusals use the `Error` body `{code, message, details[{index?, field, reason}]}`.
 - 400 `invalid_request` for every broken rule, whether Huma's request validation or the service found it; `details[].field` names the JSON field (`to`, `content`, `template.variables.name`, `scheduledAt`, `notifications`), `index` the batch position.
-- 413 `request_too_large` for a body over 8 MiB. 404 `not_found`. 409 `not_cancellable` (cancel when not pending), 409 `not_retryable` (retry when not failed). 422 `idempotency_key_reused`.
+- 413 `request_too_large` for a body over 8 MiB. 404 `not_found`. 409 `not_cancellable` (cancel when not pending), 409 `not_retryable` (retry when not failed), 409 `not_reschedulable` (PATCH reschedule once a worker has picked it up; the message names the status). 422 `idempotency_key_reused`.
 - `X-Correlation-ID`: accepted, else generated; echoed on every response; stored on the row; on every log line about that notification in API and worker (JSON logs on stdout, field `correlation_id`; `notification_id` when known); sent to the provider as `X-Correlation-ID`.
 - `Idempotency-Key` on POST create (single or batch): same key and same payload returns the first response, same ids, status 201, header `Idempotent-Replayed: true`. Same key, different payload: 422.
 - Outside the Huma operations (not validated by Huma): `GET /v1/ws` (WebSocket, `github.com/coder/websocket`; documented in the spec, its message schema `StatusEvent` from `contract.go`), `GET /openapi.json` (the spec built from the operations), `GET /docs` (a page that renders it).

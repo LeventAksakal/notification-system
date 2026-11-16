@@ -58,6 +58,12 @@ CREATE TABLE notifications (
   CONSTRAINT provider_id_only_when_sent CHECK (((`status` = _utf8mb4'sent') or (`provider_message_id` is null))),
   CONSTRAINT attempted_before_sent_or_failed CHECK (((`status` not in (_utf8mb4'sent',_utf8mb4'failed')) or (`attempts` >= 1))),
   CONSTRAINT batch_position_with_batch CHECK (((`batch_id` is null) = (`batch_index` is null))),
+  -- The schedule horizon (notification.ScheduleHorizon, decision 0016) on the
+  -- database clock: a CHECK cannot call NOW(), but updated_at is stamped with
+  -- the statement's NOW(3) by every write that changes the row (the default
+  -- on insert, ON UPDATE), so a row that passed once keeps passing while the
+  -- server clock does not step back (decision 0016, "As built").
+  CONSTRAINT scheduled_within_horizon CHECK (((`scheduled_at` is null) or (`scheduled_at` <= (`updated_at` + interval 30 day)))),
   -- The claim: WHERE status='pending' AND channel=? AND priority=? AND due_at<=NOW(3) ORDER BY due_at.
   KEY claim_idx (status, channel, priority, due_at),
   -- The reaper: WHERE status='processing' AND lease_until < NOW(3).

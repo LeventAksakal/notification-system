@@ -221,6 +221,7 @@ func (s *Server) register(api huma.API) {
 		OperationID: "getNotification", Method: http.MethodGet, Path: "/v1/notifications/{id}", Tags: []string{"notifications"},
 		Summary: "Status, attempt count, last error and the attempt history of one notification",
 	}, "Found; `deliveryAttempts` is included", 404, 400, 503), s.GetNotification)
+	s.registerReschedule(api)
 	huma.Register(api, operation(huma.Operation{
 		OperationID: "cancelNotification", Method: http.MethodPost, Path: "/v1/notifications/{id}/cancel", Tags: []string{"notifications"},
 		Summary:     "Cancel a notification that has not been picked up",
@@ -322,7 +323,7 @@ func openResponses(oapi *huma.OpenAPI) {
 		}
 	}
 	for _, item := range oapi.Paths {
-		for _, op := range []*huma.Operation{item.Put, item.Post} {
+		for _, op := range []*huma.Operation{item.Put, item.Post, item.Patch} {
 			if op != nil && op.RequestBody != nil {
 				for _, mt := range op.RequestBody.Content {
 					mark(mt.Schema)
@@ -363,7 +364,7 @@ func plainIntegers(oapi *huma.OpenAPI) {
 		walk(s)
 	}
 	for _, item := range oapi.Paths {
-		for _, op := range []*huma.Operation{item.Get, item.Put, item.Post, item.Delete} {
+		for _, op := range []*huma.Operation{item.Get, item.Put, item.Post, item.Patch, item.Delete} {
 			if op == nil {
 				continue
 			}

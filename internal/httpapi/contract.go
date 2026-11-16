@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"strconv"
 	"time"
 	"uuid"
 
@@ -123,11 +124,21 @@ type NotificationCreate struct {
 	Content     string       `json:"content,omitempty" minLength:"1"`
 	Template    *TemplateRef `json:"template,omitempty"`
 	Priority    Priority     `json:"priority,omitempty"`
-	ScheduledAt *time.Time   `json:"scheduledAt,omitempty" doc:"Deliver no earlier than this. A time in the past means now; more than 30 days ahead is refused."`
+	ScheduledAt *time.Time   `json:"scheduledAt,omitempty"`
+}
+
+// scheduleDoc describes `scheduledAt` with the horizon from
+// internal/notification. OpenAPI cannot state a time relative to the request,
+// so the rule is prose; the service and a database CHECK enforce it.
+func scheduleDoc(lead string) string {
+	return lead + " A time in the past means now. More than " +
+		strconv.Itoa(int(notification.ScheduleHorizon/(24*time.Hour))) + " days ahead is refused, measured on the" +
+		" server's database clock, the same clock that decides when the notification is due."
 }
 
 func (NotificationCreate) TransformSchema(_ huma.Registry, s *huma.Schema) *huma.Schema {
 	s.Description = "Exactly one of `content` and `template` is required."
+	s.Properties["scheduledAt"].Description = scheduleDoc("Deliver no earlier than this.")
 	s.Properties["to"].MaxLength = ptr(notification.MaxRecipientLen)
 	s.Properties["content"].MaxLength = ptr(notification.MaxContentLen)
 	return s
@@ -333,7 +344,7 @@ type Error struct {
 	status  int
 	headers map[string]string
 
-	Code    string        `json:"code" doc:"invalid_request, not_found, not_cancellable, not_retryable, idempotency_key_reused, request_too_large, internal"`
+	Code    string        `json:"code" doc:"invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, idempotency_key_reused, request_too_large, internal"`
 	Details []ErrorDetail `json:"details,omitempty"`
 	Message string        `json:"message"`
 }

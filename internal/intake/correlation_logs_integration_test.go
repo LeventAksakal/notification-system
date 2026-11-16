@@ -48,9 +48,15 @@ func TestLinesAboutANotificationCarryItsStoredCorrelationIDWhicheverRequestWrite
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(t.Context(),
-		`UPDATE notifications SET status = 'failed', failure_kind = 'exhausted', finished_at = NOW(3) WHERE id = ?`, f.ID); err != nil {
-		t.Fatal(err)
+	// The database allows only the state machine's transitions (decision
+	// 0005), so the row goes pending -> processing -> failed like a worker's.
+	for _, q := range []string{
+		`UPDATE notifications SET status = 'processing', lease_until = NOW(3) + INTERVAL 1 MINUTE, claim_version = claim_version + 1 WHERE id = ?`,
+		`UPDATE notifications SET status = 'failed', failure_kind = 'exhausted', finished_at = NOW(3), lease_until = NULL, attempts = 1 WHERE id = ?`,
+	} {
+		if _, err := db.ExecContext(t.Context(), q, f.ID); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := svc.Retry(telemetry.WithCorrelationID(t.Context(), retry), f.ID); err != nil {
 		t.Fatal(err)

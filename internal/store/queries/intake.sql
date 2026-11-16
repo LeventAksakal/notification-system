@@ -13,6 +13,25 @@ INSERT INTO notifications (
   sqlc.narg(scheduled_at), sqlc.arg(correlation_id), sqlc.narg(traceparent), sqlc.arg(created_at)
 );
 
+-- name: DatabaseNow :one
+-- The database clock, the one clock every schedule decision uses (decision
+-- 0016): due_at, the claim, the scheduled status and the horizon check.
+SELECT CAST(NOW(3) AS DATETIME(3)) AS now;
+
+-- name: RescheduleNotification :execrows
+-- A new schedule for a notification no worker has claimed yet (claim_version
+-- 0: never leased, so no attempt, retry backoff or Retry-After is pending).
+-- One statement: a claim racing it on the same row either leased it first
+-- (no row matches) or leases it after with the new due_at. due_at follows
+-- the create rule (a past or absent schedule means now). When the row
+-- changes, ON UPDATE stamps updated_at with this statement's NOW(3), which the
+-- scheduled_within_horizon CHECK measures from; when it does not (the same
+-- schedule again), nothing is written and 0 rows are reported.
+UPDATE notifications
+SET scheduled_at = sqlc.narg(scheduled_at),
+    due_at = GREATEST(COALESCE(sqlc.narg(scheduled_at), NOW(3)), NOW(3))
+WHERE id = sqlc.arg(id) AND status = 'pending' AND claim_version = 0;
+
 -- name: InsertBatch :exec
 INSERT INTO batches (id, total, correlation_id, created_at) VALUES (?, ?, ?, ?);
 

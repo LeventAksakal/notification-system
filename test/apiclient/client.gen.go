@@ -235,7 +235,7 @@ type DeliveryTotals struct {
 
 // Error defines model for Error.
 type Error struct {
-	// Code invalid_request, not_found, not_cancellable, not_retryable, idempotency_key_reused, request_too_large, internal
+	// Code invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, idempotency_key_reused, request_too_large, internal
 	Code    string         `json:"code"`
 	Details *[]ErrorDetail `json:"details,omitempty"`
 	Message string         `json:"message"`
@@ -327,7 +327,7 @@ type NotificationCreate struct {
 	Content  *string   `json:"content,omitempty"`
 	Priority *Priority `json:"priority,omitempty"`
 
-	// ScheduledAt Deliver no earlier than this. A time in the past means now; more than 30 days ahead is refused.
+	// ScheduledAt Deliver no earlier than this. A time in the past means now. More than 30 days ahead is refused, measured on the server's database clock, the same clock that decides when the notification is due.
 	ScheduledAt *time.Time   `json:"scheduledAt,omitempty"`
 	Template    *TemplateRef `json:"template,omitempty"`
 	To          string       `json:"to"`
@@ -339,6 +339,12 @@ type NotificationPage struct {
 
 	// NextCursor Absent on the last page
 	NextCursor *string `json:"nextCursor,omitempty"`
+}
+
+// NotificationReschedule defines model for NotificationReschedule.
+type NotificationReschedule struct {
+	// ScheduledAt The new schedule; `null` means due now. A time in the past means now. More than 30 days ahead is refused, measured on the server's database clock, the same clock that decides when the notification is due.
+	ScheduledAt *time.Time `json:"scheduledAt"`
 }
 
 // Priority defines model for Priority.
@@ -498,6 +504,9 @@ type CreateNotificationJSONRequestBody = NotificationCreate
 // CreateBatchJSONRequestBody defines body for CreateBatch for application/json ContentType.
 type CreateBatchJSONRequestBody = BatchCreate
 
+// RescheduleNotificationJSONRequestBody defines body for RescheduleNotification for application/json ContentType.
+type RescheduleNotificationJSONRequestBody = NotificationReschedule
+
 // PutTemplateJSONRequestBody defines body for PutTemplate for application/json ContentType.
 type PutTemplateJSONRequestBody = TemplateWrite
 
@@ -645,6 +654,36 @@ type ClientInterface interface {
 	//
 	// Corresponds with GET /v1/notifications/{id} (the `GetNotification` operationId).
 	GetNotification(ctx context.Context, id openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RescheduleNotificationWithBody Reschedule a notification that no worker has picked up
+	//
+	// Sets `scheduledAt` (and so `dueAt`) under the same rules as create. Allowed while the
+	// notification is pending and no worker has picked it up: `scheduled`, or `pending` and due but not
+	// yet claimed. One a worker already picked up is refused (409; the message names the status): one
+	// waiting for a retry, so a reschedule never overrides a retry backoff or a provider's Retry-After, and
+	// one handed back unsent while its channel was paused, which shows as `scheduled` until it is due. A
+	// reschedule racing a worker has exactly one winner. No WebSocket event is sent: the stored status does
+	// not change.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with PATCH /v1/notifications/{id} (the `RescheduleNotification` operationId).
+	RescheduleNotificationWithBody(ctx context.Context, id openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RescheduleNotification Reschedule a notification that no worker has picked up
+	//
+	// Sets `scheduledAt` (and so `dueAt`) under the same rules as create. Allowed while the
+	// notification is pending and no worker has picked it up: `scheduled`, or `pending` and due but not
+	// yet claimed. One a worker already picked up is refused (409; the message names the status): one
+	// waiting for a retry, so a reschedule never overrides a retry backoff or a provider's Retry-After, and
+	// one handed back unsent while its channel was paused, which shows as `scheduled` until it is due. A
+	// reschedule racing a worker has exactly one winner. No WebSocket event is sent: the stored status does
+	// not change.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with PATCH /v1/notifications/{id} (the `RescheduleNotification` operationId).
+	RescheduleNotification(ctx context.Context, id openapi_types.UUID, body RescheduleNotificationJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// CancelNotification Cancel a notification that has not been picked up
 	//
@@ -870,6 +909,56 @@ func (c *Client) CreateBatch(ctx context.Context, params *CreateBatchParams, bod
 // Corresponds with GET /v1/notifications/{id} (the `GetNotification` operationId).
 func (c *Client) GetNotification(ctx context.Context, id openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetNotificationRequest(c.Server, id)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RescheduleNotificationWithBody Reschedule a notification that no worker has picked up
+//
+// Sets `scheduledAt` (and so `dueAt`) under the same rules as create. Allowed while the
+// notification is pending and no worker has picked it up: `scheduled`, or `pending` and due but not
+// yet claimed. One a worker already picked up is refused (409; the message names the status): one
+// waiting for a retry, so a reschedule never overrides a retry backoff or a provider's Retry-After, and
+// one handed back unsent while its channel was paused, which shows as `scheduled` until it is due. A
+// reschedule racing a worker has exactly one winner. No WebSocket event is sent: the stored status does
+// not change.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with PATCH /v1/notifications/{id} (the `RescheduleNotification` operationId).
+func (c *Client) RescheduleNotificationWithBody(ctx context.Context, id openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRescheduleNotificationRequestWithBody(c.Server, id, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RescheduleNotification Reschedule a notification that no worker has picked up
+//
+// Sets `scheduledAt` (and so `dueAt`) under the same rules as create. Allowed while the
+// notification is pending and no worker has picked it up: `scheduled`, or `pending` and due but not
+// yet claimed. One a worker already picked up is refused (409; the message names the status): one
+// waiting for a retry, so a reschedule never overrides a retry backoff or a provider's Retry-After, and
+// one handed back unsent while its channel was paused, which shows as `scheduled` until it is due. A
+// reschedule racing a worker has exactly one winner. No WebSocket event is sent: the stored status does
+// not change.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with PATCH /v1/notifications/{id} (the `RescheduleNotification` operationId).
+func (c *Client) RescheduleNotification(ctx context.Context, id openapi_types.UUID, body RescheduleNotificationJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRescheduleNotificationRequest(c.Server, id, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1495,6 +1584,53 @@ func NewGetNotificationRequest(server string, id openapi_types.UUID) (*http.Requ
 	return req, nil
 }
 
+// NewRescheduleNotificationRequest calls the generic RescheduleNotification builder with application/json body
+func NewRescheduleNotificationRequest(server string, id openapi_types.UUID, body RescheduleNotificationJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRescheduleNotificationRequestWithBody(server, id, "application/json", bodyReader)
+}
+
+// NewRescheduleNotificationRequestWithBody constructs an http.Request for the RescheduleNotification method, with any body, and a specified content type
+func NewRescheduleNotificationRequestWithBody(server string, id openapi_types.UUID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "id", id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/notifications/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewCancelNotificationRequest constructs an http.Request for the CancelNotification method
 func NewCancelNotificationRequest(server string, id openapi_types.UUID) (*http.Request, error) {
 	var err error
@@ -1897,6 +2033,36 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with GET /v1/notifications/{id} (the `GetNotification` operationId).
 	GetNotificationWithResponse(ctx context.Context, id openapi_types.UUID, reqEditors ...RequestEditorFn) (*GetNotificationResponse, error)
+
+	// RescheduleNotificationWithBodyWithResponse Reschedule a notification that no worker has picked up
+	//
+	// Sets `scheduledAt` (and so `dueAt`) under the same rules as create. Allowed while the
+	// notification is pending and no worker has picked it up: `scheduled`, or `pending` and due but not
+	// yet claimed. One a worker already picked up is refused (409; the message names the status): one
+	// waiting for a retry, so a reschedule never overrides a retry backoff or a provider's Retry-After, and
+	// one handed back unsent while its channel was paused, which shows as `scheduled` until it is due. A
+	// reschedule racing a worker has exactly one winner. No WebSocket event is sent: the stored status does
+	// not change.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PATCH /v1/notifications/{id} (the `RescheduleNotification` operationId).
+	RescheduleNotificationWithBodyWithResponse(ctx context.Context, id openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RescheduleNotificationResponse, error)
+
+	// RescheduleNotificationWithResponse Reschedule a notification that no worker has picked up
+	//
+	// Sets `scheduledAt` (and so `dueAt`) under the same rules as create. Allowed while the
+	// notification is pending and no worker has picked it up: `scheduled`, or `pending` and due but not
+	// yet claimed. One a worker already picked up is refused (409; the message names the status): one
+	// waiting for a retry, so a reschedule never overrides a retry backoff or a provider's Retry-After, and
+	// one handed back unsent while its channel was paused, which shows as `scheduled` until it is due. A
+	// reschedule racing a worker has exactly one winner. No WebSocket event is sent: the stored status does
+	// not change.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PATCH /v1/notifications/{id} (the `RescheduleNotification` operationId).
+	RescheduleNotificationWithResponse(ctx context.Context, id openapi_types.UUID, body RescheduleNotificationJSONRequestBody, reqEditors ...RequestEditorFn) (*RescheduleNotificationResponse, error)
 
 	// CancelNotificationWithResponse Cancel a notification that has not been picked up
 	//
@@ -2486,6 +2652,82 @@ func (r GetNotificationResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r GetNotificationResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// RescheduleNotificationResponse503Headers the declared response headers of an HTTP 503 response for RescheduleNotification
+type RescheduleNotificationResponse503Headers struct {
+	RetryAfter *int
+}
+
+type RescheduleNotificationResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *Notification
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *InvalidRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *Conflict
+	// JSON503 the response for an HTTP 503 `application/json` response
+	JSON503 *ServiceUnavailable
+	// Headers503 the parsed response headers for an HTTP 503 response
+	Headers503 *RescheduleNotificationResponse503Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r RescheduleNotificationResponse) GetJSON200() *Notification {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RescheduleNotificationResponse) GetJSON400() *InvalidRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RescheduleNotificationResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r RescheduleNotificationResponse) GetJSON409() *Conflict {
+	return r.JSON409
+}
+
+// GetJSON503 returns the response for an HTTP 503 `application/json` response
+func (r RescheduleNotificationResponse) GetJSON503() *ServiceUnavailable {
+	return r.JSON503
+}
+
+// GetBody returns the raw response body bytes
+func (r RescheduleNotificationResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RescheduleNotificationResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RescheduleNotificationResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RescheduleNotificationResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -3097,6 +3339,48 @@ func (c *ClientWithResponses) GetNotificationWithResponse(ctx context.Context, i
 	return ParseGetNotificationResponse(rsp)
 }
 
+// RescheduleNotificationWithBodyWithResponse Reschedule a notification that no worker has picked up
+//
+// Sets `scheduledAt` (and so `dueAt`) under the same rules as create. Allowed while the
+// notification is pending and no worker has picked it up: `scheduled`, or `pending` and due but not
+// yet claimed. One a worker already picked up is refused (409; the message names the status): one
+// waiting for a retry, so a reschedule never overrides a retry backoff or a provider's Retry-After, and
+// one handed back unsent while its channel was paused, which shows as `scheduled` until it is due. A
+// reschedule racing a worker has exactly one winner. No WebSocket event is sent: the stored status does
+// not change.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PATCH /v1/notifications/{id} (the `RescheduleNotification` operationId).
+func (c *ClientWithResponses) RescheduleNotificationWithBodyWithResponse(ctx context.Context, id openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RescheduleNotificationResponse, error) {
+	rsp, err := c.RescheduleNotificationWithBody(ctx, id, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRescheduleNotificationResponse(rsp)
+}
+
+// RescheduleNotificationWithResponse Reschedule a notification that no worker has picked up
+//
+// Sets `scheduledAt` (and so `dueAt`) under the same rules as create. Allowed while the
+// notification is pending and no worker has picked it up: `scheduled`, or `pending` and due but not
+// yet claimed. One a worker already picked up is refused (409; the message names the status): one
+// waiting for a retry, so a reschedule never overrides a retry backoff or a provider's Retry-After, and
+// one handed back unsent while its channel was paused, which shows as `scheduled` until it is due. A
+// reschedule racing a worker has exactly one winner. No WebSocket event is sent: the stored status does
+// not change.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PATCH /v1/notifications/{id} (the `RescheduleNotification` operationId).
+func (c *ClientWithResponses) RescheduleNotificationWithResponse(ctx context.Context, id openapi_types.UUID, body RescheduleNotificationJSONRequestBody, reqEditors ...RequestEditorFn) (*RescheduleNotificationResponse, error) {
+	rsp, err := c.RescheduleNotification(ctx, id, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRescheduleNotificationResponse(rsp)
+}
+
 // CancelNotificationWithResponse Cancel a notification that has not been picked up
 //
 // Allowed from `pending` only (including scheduled and waiting to retry). A cancel racing a worker has exactly one winner.
@@ -3659,6 +3943,73 @@ func ParseGetNotificationResponse(rsp *http.Response) (*GetNotificationResponse,
 	switch {
 	case rsp.StatusCode == 503:
 		var headers GetNotificationResponse503Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = &value
+		}
+		response.Headers503 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseRescheduleNotificationResponse parses an HTTP response from a RescheduleNotificationWithResponse call
+func ParseRescheduleNotificationResponse(rsp *http.Response) (*RescheduleNotificationResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RescheduleNotificationResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest Notification
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest InvalidRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Conflict
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest ServiceUnavailable
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 503:
+		var headers RescheduleNotificationResponse503Headers
 		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
 			var value int
 			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {

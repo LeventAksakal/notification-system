@@ -33,6 +33,9 @@ type Querier interface {
 	ClaimCandidates(ctx context.Context, arg ClaimCandidatesParams) ([]ClaimCandidatesRow, error)
 	// Counts per API status (scheduled is a view of pending).
 	CountBatchByStatus(ctx context.Context, batchID sql.NullString) ([]CountBatchByStatusRow, error)
+	// The database clock, the one clock every schedule decision uses (decision
+	// 0016): due_at, the claim, the scheduled status and the horizon check.
+	DatabaseNow(ctx context.Context) (time.Time, error)
 	// The attempts of the rows locked by RetentionCandidates (attempts_notification_idx).
 	DeleteAttemptsOf(ctx context.Context, ids []string) (int64, error)
 	// Forget one key older than the retention, so it can be used again.
@@ -132,6 +135,15 @@ type Querier interface {
 	ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error)
 	// A dead letter goes back to pending with a fresh attempt budget; history is kept.
 	ReplayNotification(ctx context.Context, id string) (int64, error)
+	// A new schedule for a notification no worker has claimed yet (claim_version
+	// 0: never leased, so no attempt, retry backoff or Retry-After is pending).
+	// One statement: a claim racing it on the same row either leased it first
+	// (no row matches) or leases it after with the new due_at. due_at follows
+	// the create rule (a past or absent schedule means now). When the row
+	// changes, ON UPDATE stamps updated_at with this statement's NOW(3), which the
+	// scheduled_within_horizon CHECK measures from; when it does not (the same
+	// schedule again), nothing is written and 0 rows are reported.
+	RescheduleNotification(ctx context.Context, arg RescheduleNotificationParams) (int64, error)
 	// Retention (decision 0025): finished notifications, their attempts and their
 	// batches are deleted once they are older than the retention, on the database
 	// clock, in bounded batches.

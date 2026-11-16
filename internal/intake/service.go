@@ -178,7 +178,11 @@ func (s *Service) Create(ctx context.Context, r Request, m Meta) (n Notification
 	if err != nil {
 		return Notification{}, false, err
 	}
-	a, errs := Validate(r, templates, s.now())
+	now, err := s.scheduleClock(ctx, []Request{r})
+	if err != nil {
+		return Notification{}, false, err
+	}
+	a, errs := Validate(r, templates, now)
 	if len(errs) > 0 {
 		return Notification{}, false, &ValidationError{Details: errs}
 	}
@@ -235,7 +239,10 @@ func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b Batc
 	if err != nil {
 		return BatchCreated{}, false, err
 	}
-	now := s.now()
+	now, err := s.scheduleClock(ctx, rs)
+	if err != nil {
+		return BatchCreated{}, false, err
+	}
 	items := make([]store.BatchItem, len(rs))
 	var all []FieldError
 	for i, r := range rs {
@@ -335,11 +342,36 @@ func (s *Service) store(ctx context.Context, key string, hash []byte, kind sqlc.
 			last = errKeyTaken
 		case store.IsLockConflict(err):
 			last = err
+		case store.IsBeyondScheduleHorizon(err):
+			// The database's own check (see scheduleClock); which item of a
+			// batch it refused is not reported, so neither is an index.
+			return "", invalid("scheduledAt", horizonReason())
 		default:
 			return "", err
 		}
 	}
 	return "", fmt.Errorf("store after %d attempts: %w", maxTxAttempts, last)
+}
+
+// scheduleClock reads the database clock when any of rs carries a schedule,
+// once per request whatever the batch size, so the horizon is measured on the
+// clock that sets due_at and runs the claim (decision 0016). A request
+// without a schedule reads nothing and gets the zero time, which Validate
+// does not look at then. The scheduled_within_horizon CHECK repeats the rule
+// in the INSERT with the statement's own NOW(3), which is never earlier than
+// this read, so it only refuses what this check accepted if the server clock
+// stepped back in between.
+func (s *Service) scheduleClock(ctx context.Context, rs []Request) (time.Time, error) {
+	for _, r := range rs {
+		if r.ScheduledAt != nil {
+			now, err := s.q.DatabaseNow(ctx)
+			if err != nil {
+				return time.Time{}, fmt.Errorf("read the database clock: %w", err)
+			}
+			return now, nil
+		}
+	}
+	return time.Time{}, nil
 }
 
 // earlier looks key up before a create does any work. ok reports a stored

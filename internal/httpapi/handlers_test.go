@@ -113,6 +113,14 @@ func TestRefusedRequestsNameTheOffendingField(t *testing.T) {
 			ErrorDetail{Field: "notifications"}},
 		{"bad query parameter", http.MethodGet, "/v1/notifications?limit=0", "",
 			ErrorDetail{Field: "limit"}},
+		{"reschedule without scheduledAt", http.MethodPatch, "/v1/notifications/01a1e115-35f4-713d-8d33-fbf2f9af0c3c", `{}`,
+			ErrorDetail{Field: "scheduledAt"}},
+		{"reschedule to a non-time", http.MethodPatch, "/v1/notifications/01a1e115-35f4-713d-8d33-fbf2f9af0c3c", `{"scheduledAt":"tomorrow"}`,
+			ErrorDetail{Field: "scheduledAt"}},
+		{"reschedule with an unknown field", http.MethodPatch, "/v1/notifications/01a1e115-35f4-713d-8d33-fbf2f9af0c3c", `{"scheduledAt":null,"dueAt":null}`,
+			ErrorDetail{Field: "body"}},
+		{"reschedule of a malformed id", http.MethodPatch, "/v1/notifications/not-a-uuid", `{"scheduledAt":null}`,
+			ErrorDetail{Field: "id"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := serve(t, nil, tc.method, tc.path, tc.body)

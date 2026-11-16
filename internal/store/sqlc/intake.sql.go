@@ -67,6 +67,19 @@ func (q *Queries) CountBatchByStatus(ctx context.Context, batchID sql.NullString
 	return items, nil
 }
 
+const databaseNow = `-- name: DatabaseNow :one
+SELECT CAST(NOW(3) AS DATETIME(3)) AS now
+`
+
+// The database clock, the one clock every schedule decision uses (decision
+// 0016): due_at, the claim, the scheduled status and the horizon check.
+func (q *Queries) DatabaseNow(ctx context.Context) (time.Time, error) {
+	row := q.db.QueryRowContext(ctx, databaseNow)
+	var now time.Time
+	err := row.Scan(&now)
+	return now, err
+}
+
 const deleteExpiredIdempotencyKey = `-- name: DeleteExpiredIdempotencyKey :execrows
 DELETE FROM idempotency_keys WHERE idem_key = ? AND created_at < ?
 `
@@ -457,6 +470,34 @@ WHERE id = ? AND status = 'failed'
 // A dead letter goes back to pending with a fresh attempt budget; history is kept.
 func (q *Queries) ReplayNotification(ctx context.Context, id string) (int64, error) {
 	result, err := q.db.ExecContext(ctx, replayNotification, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const rescheduleNotification = `-- name: RescheduleNotification :execrows
+UPDATE notifications
+SET scheduled_at = ?,
+    due_at = GREATEST(COALESCE(?, NOW(3)), NOW(3))
+WHERE id = ? AND status = 'pending' AND claim_version = 0
+`
+
+type RescheduleNotificationParams struct {
+	ScheduledAt sql.NullTime
+	ID          string
+}
+
+// A new schedule for a notification no worker has claimed yet (claim_version
+// 0: never leased, so no attempt, retry backoff or Retry-After is pending).
+// One statement: a claim racing it on the same row either leased it first
+// (no row matches) or leases it after with the new due_at. due_at follows
+// the create rule (a past or absent schedule means now). When the row
+// changes, ON UPDATE stamps updated_at with this statement's NOW(3), which the
+// scheduled_within_horizon CHECK measures from; when it does not (the same
+// schedule again), nothing is written and 0 rows are reported.
+func (q *Queries) RescheduleNotification(ctx context.Context, arg RescheduleNotificationParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, rescheduleNotification, arg.ScheduledAt, arg.ScheduledAt, arg.ID)
 	if err != nil {
 		return 0, err
 	}
