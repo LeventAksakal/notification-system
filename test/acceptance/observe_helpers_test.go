@@ -283,9 +283,19 @@ func (p *tcpProxy) Close() {
 
 // ---- WebSocket ----
 
-// dialWS opens GET /v1/ws with the given query parameters (name/value pairs).
-// On a refused handshake it returns the HTTP status (0 when none arrived).
+// dialWS opens GET /v1/ws with the given query parameters (name/value pairs),
+// once, without retrying: tests that expect a refusal (404, 503) call it or
+// tryWS directly. On a refused handshake it returns the HTTP status (0 when
+// none arrived).
 func (s *stack) dialWS(kv ...string) (*websocket.Conn, int, error) {
+	c, a := s.handshakeWS(kv...)
+	return c, a.Status, a.Err
+}
+
+// handshakeWS performs one GET /v1/ws handshake and returns the open socket,
+// or the refusal with up to 1 KiB of its body (coder/websocket leaves that
+// much in res.Body when the handshake is refused).
+func (s *stack) handshakeWS(kv ...string) (*websocket.Conn, wsAnswer) {
 	q := url.Values{}
 	for i := 0; i+1 < len(kv); i += 2 {
 		q.Set(kv[i], kv[i+1])
@@ -297,29 +307,76 @@ func (s *stack) dialWS(kv ...string) (*websocket.Conn, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	c, res, err := websocket.Dial(ctx, u, nil)
-	status := 0
+	a := wsAnswer{Err: err}
 	if res != nil {
-		status = res.StatusCode
+		a.Status = res.StatusCode
 		if res.Body != nil {
+			if err != nil {
+				a.Body, _ = io.ReadAll(res.Body)
+			}
 			_ = res.Body.Close()
 		}
 	}
 	if err != nil {
-		return nil, status, err
+		return nil, a
 	}
 	c.SetReadLimit(1 << 20)
-	return c, status, nil
+	return c, a
 }
 
-// subscribe is dialWS that must succeed; the socket closes when the test ends.
+// feedConnectWait bounds how long subscribe keeps reconnecting while an
+// instance answers 503 `unavailable` because its event feed is not live yet
+// (a just-started instance is ready, /readyz checks MySQL only, before its
+// hub has confirmed its Valkey subscription; the contract says "reconnect
+// shortly"). Derived from the hub's own connect path (internal/realtime
+// Hub.Run/listen and valkey-go's defaults): one SUBSCRIBE attempt that fails
+// takes at most valkey-go's DefaultDialTimeout (5 s), the hub then waits
+// retryFirst (100 ms) and a second attempt again at most 5 s: 10.1 s for a
+// feed that comes up after one failed attempt. The 15 s bound is that plus
+// about 50 % margin for a loaded machine. A feed still down after it is a
+// failure, not slowness. To tune it: if valkey-go's dial timeout or the hub's
+// retryFirst change, recompute 2 x dial timeout + retryFirst and keep the margin.
+const feedConnectWait = 15 * time.Second
+
+// Reconnect backoff of subscribe after a 503 `unavailable`: doubling from
+// the first wait, capped. Arbitrary, like a client's own reconnect backoff:
+// short against feedConnectWait so a feed that comes up is joined within
+// about a second.
+const (
+	feedRetryFirst = 100 * time.Millisecond
+	feedRetryMax   = time.Second
+)
+
+// subscribe opens GET /v1/ws as a client following the contract: a 503 whose
+// body code is `unavailable` (this instance's event feed is not live) is
+// retried with a short backoff for up to feedConnectWait; any other refusal
+// fails at once. The socket closes when the test ends.
 func (s *stack) subscribe(t *testing.T, kv ...string) *websocket.Conn {
 	t.Helper()
-	c, status, err := s.dialWS(kv...)
-	if err != nil {
-		t.Fatalf("GET /v1/ws %q: handshake failed (HTTP %d): %v", kv, status, err)
+	start := time.Now()
+	wait := feedRetryFirst
+	tries := 0
+	for {
+		tries++
+		c, a := s.handshakeWS(kv...)
+		if a.Err == nil {
+			if tries > 1 {
+				t.Logf("GET /v1/ws %q: accepted after %d attempts in %s (503 unavailable until the event feed was live)",
+					kv, tries, time.Since(start).Round(time.Millisecond))
+			}
+			t.Cleanup(func() { _ = c.CloseNow() })
+			return c
+		}
+		if !a.refusedUnavailable() {
+			t.Fatalf("GET /v1/ws %q: handshake failed (HTTP %d): %v", kv, a.Status, a.Err)
+		}
+		if time.Since(start)+wait > feedConnectWait {
+			t.Fatalf("GET /v1/ws %q: handshake still refused after %d attempts in %s (bound %s; event feed never live): last %s",
+				kv, tries, time.Since(start).Round(time.Millisecond), feedConnectWait, a)
+		}
+		time.Sleep(wait)
+		wait = min(wait*2, feedRetryMax)
 	}
-	t.Cleanup(func() { _ = c.CloseNow() })
-	return c
 }
 
 var errWSTimeout = errors.New("no message before the deadline")
