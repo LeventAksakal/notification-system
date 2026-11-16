@@ -107,6 +107,12 @@ func TestRefusedRequestsNameTheOffendingField(t *testing.T) {
 			ErrorDetail{Field: "to"}},
 		{"field over its limit", http.MethodPost, "/v1/notifications", item(over),
 			ErrorDetail{Field: "content"}},
+		{"content whitespace only", http.MethodPost, "/v1/notifications", item(` \t\u3000`),
+			ErrorDetail{Field: "content"}},
+		{"to whitespace only", http.MethodPost, "/v1/notifications", `{"to":" \u00a0","channel":"push","content":"hi"}`,
+			ErrorDetail{Field: "to"}},
+		{"template body whitespace only", http.MethodPut, "/v1/templates/welcome", `{"body":"\n\u2028 "}`,
+			ErrorDetail{Field: "body"}},
 		{"batch item over its limit", http.MethodPost, "/v1/notifications/batch", batch(item("a"), item("b"), item("c"), item(over)),
 			ErrorDetail{Field: "content", Index: &three}},
 		{"batch over 1000 items", http.MethodPost, "/v1/notifications/batch", batch(many...),
@@ -206,6 +212,35 @@ func TestAMalformedIdempotencyKeyIs400NamingTheHeader(t *testing.T) {
 				e.Details[0].Field != "Idempotency-Key" {
 				t.Fatalf("got %d %.300s", rec.Code, rec.Body)
 			}
+		})
+	}
+}
+
+// The create operations declare X-Correlation-ID in the spec, so a value past
+// MaxCorrelationIDLen (a W3C traceparent) is refused there naming the header;
+// other routes replace it (TestEveryResponseCarriesTheCorrelationID).
+func TestACorrelationIDPastTheLimitIsRefusedOnCreate(t *testing.T) {
+	h, err := NewServer(nil, nil).Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/v1/notifications", "/v1/notifications/batch"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(`{}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Correlation-ID", strings.Repeat("a", notification.MaxCorrelationIDLen+1))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			e := decodeError(t, rec)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("got %d %.300s", rec.Code, rec.Body)
+			}
+			for _, d := range e.Details {
+				if d.Field == "X-Correlation-ID" {
+					return
+				}
+			}
+			t.Fatalf("no detail names X-Correlation-ID: %.300s", rec.Body)
 		})
 	}
 }

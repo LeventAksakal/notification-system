@@ -72,7 +72,7 @@ CREATE TABLE `notifications` (
   `last_error` varchar(1024) DEFAULT NULL,
   `correlation_id` varchar(128) NOT NULL,
   `traceparent` varchar(64) DEFAULT NULL,
-  `template_name` varchar(64) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,
+  `template_name` varchar(63) CHARACTER SET ascii COLLATE ascii_general_ci DEFAULT NULL,
   `template_version` int unsigned DEFAULT NULL,
   `created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   `updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -88,14 +88,16 @@ CREATE TABLE `notifications` (
   CONSTRAINT `attempted_before_sent_or_failed` CHECK (((`status` not in (_utf8mb4'sent',_utf8mb4'failed')) or (`attempts` >= 1))),
   CONSTRAINT `batch_position_with_batch` CHECK (((`batch_id` is null) = (`batch_index` is null))),
   CONSTRAINT `budget_within_attempts` CHECK ((`budget_spent` <= `attempts`)),
-  CONSTRAINT `content_length` CHECK ((((`channel` = _utf8mb4'sms') and (char_length(`content`) between 1 and 1600)) or ((`channel` = _utf8mb4'email') and (char_length(`content`) between 1 and 100000)) or ((`channel` = _utf8mb4'push') and (char_length(`content`) between 1 and 1024)))),
+  CONSTRAINT `content_length` CHECK ((((`channel` = _utf8mb4'sms') and (char_length(`content`) between 1 and 1600)) or ((`channel` = _utf8mb4'email') and (length(`content`) between 1 and 32768)) or ((`channel` = _utf8mb4'push') and (length(`content`) between 1 and 4067)))),
+  CONSTRAINT `content_not_blank` CHECK (regexp_like(`content`,_utf8mb4'[^\\t\\n\\x{0B}\\f\\r \\x{85}\\x{A0}\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]')),
   CONSTRAINT `failure_kind_only_when_failed` CHECK (((`status` = _utf8mb4'failed') = (`failure_kind` is not null))),
   CONSTRAINT `finished_exactly_when_terminal` CHECK (((`status` in (_utf8mb4'sent',_utf8mb4'failed',_utf8mb4'cancelled')) = (`finished_at` is not null))),
   CONSTRAINT `lease_only_while_processing` CHECK (((`status` = _utf8mb4'processing') = (`lease_until` is not null))),
   CONSTRAINT `provider_id_only_when_sent` CHECK (((`status` = _utf8mb4'sent') or (`provider_message_id` is null))),
-  CONSTRAINT `recipient_email_length` CHECK (((`channel` <> _utf8mb4'email') or (char_length(`recipient`) <= 254))),
+  CONSTRAINT `recipient_email_length` CHECK (((`channel` <> _utf8mb4'email') or (length(`recipient`) <= 254))),
   CONSTRAINT `recipient_not_blank` CHECK ((char_length(`recipient`) between 1 and 255)),
-  CONSTRAINT `recipient_sms_e164` CHECK (((`channel` <> _utf8mb4'sms') or regexp_like(`recipient`,_utf8mb4'^\\+[0-9]{7,15}$'))),
+  CONSTRAINT `recipient_not_whitespace` CHECK (regexp_like(`recipient`,_utf8mb4'[^\\t\\n\\x{0B}\\f\\r \\x{85}\\x{A0}\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]')),
+  CONSTRAINT `recipient_sms_e164` CHECK (((`channel` <> _utf8mb4'sms') or regexp_like(`recipient`,_utf8mb4'^\\+[1-9][0-9]{1,14}$'))),
   CONSTRAINT `scheduled_within_horizon` CHECK (((`scheduled_at` is null) or (`scheduled_at` <= (`updated_at` + interval 30 day)))),
   CONSTRAINT `status_seq_from_one` CHECK ((`status_seq` >= 1)),
   CONSTRAINT `status_transition` CHECK (((`status_from` is null) or ((`status_from`,`status`) in ((_utf8mb4'created',_utf8mb4'pending'),(_utf8mb4'pending',_utf8mb4'processing'),(_utf8mb4'pending',_utf8mb4'cancelled'),(_utf8mb4'processing',_utf8mb4'sent'),(_utf8mb4'processing',_utf8mb4'pending'),(_utf8mb4'processing',_utf8mb4'failed'),(_utf8mb4'failed',_utf8mb4'pending'))))),
@@ -104,14 +106,15 @@ CREATE TABLE `notifications` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `templates` (
-  `name` varchar(64) CHARACTER SET ascii COLLATE ascii_general_ci NOT NULL,
+  `name` varchar(63) CHARACTER SET ascii COLLATE ascii_general_ci NOT NULL,
   `body` mediumtext NOT NULL,
   `version` int unsigned NOT NULL DEFAULT '1',
   `created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   `updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (`name`),
-  CONSTRAINT `template_body_length` CHECK ((char_length(`body`) between 1 and 100000)),
-  CONSTRAINT `template_name_shape` CHECK (regexp_like(`name`,_ascii'^[a-z0-9][a-z0-9_-]{0,63}$')),
+  CONSTRAINT `template_body_length` CHECK ((length(`body`) between 1 and 32768)),
+  CONSTRAINT `template_body_not_blank` CHECK (regexp_like(`body`,_utf8mb4'[^\\t\\n\\x{0B}\\f\\r \\x{85}\\x{A0}\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]')),
+  CONSTRAINT `template_name_shape` CHECK (((char_length(`name`) between 1 and 63) and regexp_like(`name`,_ascii'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$',_utf8mb4'c'))),
   CONSTRAINT `template_version_positive` CHECK ((`version` >= 1))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

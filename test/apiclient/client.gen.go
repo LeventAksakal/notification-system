@@ -333,7 +333,7 @@ type Notification struct {
 	UpdatedAt time.Time       `json:"updatedAt"`
 }
 
-// NotificationCreate Exactly one of `content` and `template` is required.
+// NotificationCreate Exactly one of `content` and `template` is required. Per channel, the final content (given, or rendered from the template) is at most: sms 1600 characters, email 32768 bytes, push 4067 bytes (UTF-8); `to` is an E.164 number for sms, an address of at most 254 bytes for email, a device token of at most 255 characters for push. `to` and the final content must hold a character that is not whitespace.
 type NotificationCreate struct {
 	Channel  Channel   `json:"channel"`
 	Content  *string   `json:"content,omitempty"`

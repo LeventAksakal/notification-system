@@ -255,6 +255,9 @@ func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b Batc
 			e.Index = &i
 			all = append(all, e)
 		}
+		if len(all) > 0 {
+			continue // the batch is refused; keep no content
+		}
 		items[i] = store.BatchItem{BatchIndex: i, Recipient: a.To, Channel: string(a.Channel),
 			Priority: string(a.Priority), Content: a.Content, ScheduledAt: a.ScheduledAt}
 		if a.Template != nil {

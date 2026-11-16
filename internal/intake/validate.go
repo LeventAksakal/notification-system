@@ -120,7 +120,7 @@ func Validate(r Request, templates map[string]sqlc.Template, now time.Time) (Acc
 	case r.Content != nil:
 		a.Content, haveContent = *r.Content, true
 	default:
-		content, origin, terrs := renderRef(*r.Template, templates)
+		content, origin, terrs := renderRef(*r.Template, templates, renderLimit(r.Channel))
 		errs = append(errs, terrs...)
 		a.Content, a.Template, haveContent = content, origin, len(terrs) == 0
 	}
@@ -139,18 +139,20 @@ func Validate(r Request, templates map[string]sqlc.Template, now time.Time) (Acc
 	return a, errs
 }
 
+// blankReason is the reason given for an empty or whitespace-only field.
+const blankReason = "must not be empty or whitespace only"
+
 func checkRecipient(c notification.Channel, to string) string {
-	n := utf8.RuneCountInString(to)
-	if n == 0 {
-		return "must not be empty"
+	if notification.IsBlank(to) {
+		return blankReason
 	}
-	if limit := notification.MaxRecipientLenFor(c); n > limit {
-		return fmt.Sprintf("must be at most %d characters", limit)
+	if l := notification.RecipientLimit(c); l.Unit.Len(to) > l.Max {
+		return fmt.Sprintf("must be at most %d %s", l.Max, l.Unit)
 	}
 	switch c {
 	case notification.ChannelSMS:
 		if !smsRecipient.MatchString(to) {
-			return "must be an E.164 phone number (+ and 7 to 15 digits)"
+			return "must be an E.164 phone number: + and at most 15 digits, the first not 0"
 		}
 	case notification.ChannelEmail:
 		if strings.Count(to, "@") != 1 {
@@ -160,25 +162,42 @@ func checkRecipient(c notification.Channel, to string) string {
 	return ""
 }
 
+// checkContent checks the final content, given or rendered from a template.
 func checkContent(c notification.Channel, content string) string {
-	n := utf8.RuneCountInString(content)
-	if n == 0 {
-		return "must not be empty"
+	if notification.IsBlank(content) {
+		return blankReason
 	}
-	if limit := notification.MaxContentLenFor(c); n > limit {
-		return fmt.Sprintf("is %d characters; %s allows at most %d", n, c, limit)
+	if l := notification.ContentLimit(c); l.Unit.Len(content) > l.Max {
+		return fmt.Sprintf("is %d %s; %s allows at most %d", l.Unit.Len(content), l.Unit, c, l.Max)
 	}
 	return ""
+}
+
+// renderLimit is the most bytes a rendering may reach for channel c: its
+// content limit in bytes, or 4 bytes per character (the UTF-8 maximum) for a
+// limit in characters. An unknown channel gets the largest content limit.
+func renderLimit(c notification.Channel) int {
+	l := notification.ContentLimit(c)
+	switch {
+	case l.Max == 0:
+		return notification.MaxContentLen
+	case l.Unit == notification.Characters:
+		return l.Max * utf8.UTFMax
+	}
+	return l.Max
 }
 
 // CheckTemplate validates a template before it is stored.
 func CheckTemplate(name, body string) []FieldError {
 	var errs []FieldError
 	if n := len(name); n == 0 || n > notification.MaxTemplateNameLen || !templateName.MatchString(name) {
-		errs = append(errs, FieldError{Field: "name", Reason: fmt.Sprintf("must match %s, at most %d characters", notification.TemplateNamePattern, notification.MaxTemplateNameLen)})
+		errs = append(errs, FieldError{Field: "name", Reason: fmt.Sprintf("must be a DNS label: lowercase letters, digits and '-', starting and ending with a letter or digit, at most %d characters", notification.MaxTemplateNameLen)})
 	}
-	if n := utf8.RuneCountInString(body); n == 0 || n > notification.MaxTemplateBodyLen {
-		errs = append(errs, FieldError{Field: "body", Reason: fmt.Sprintf("must be 1 to %d characters", notification.MaxTemplateBodyLen)})
+	switch {
+	case notification.IsBlank(body):
+		errs = append(errs, FieldError{Field: "body", Reason: blankReason})
+	case len(body) > notification.MaxTemplateBodyBytes:
+		errs = append(errs, FieldError{Field: "body", Reason: fmt.Sprintf("must be at most %d bytes", notification.MaxTemplateBodyBytes)})
 	}
 	return errs
 }

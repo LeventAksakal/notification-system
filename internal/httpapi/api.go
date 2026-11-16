@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"mime"
@@ -43,12 +44,19 @@ Conventions
   to the provider.
 - ` + "`Idempotency-Key`" + ` on a create request stores the request once. A repeat with the same key
   and the same payload returns the first response (same ids) with ` + "`Idempotent-Replayed: true`" + `.
-- Limits (single source: ` + "`internal/notification/limits.go`" + `): sms ` + "`to`" + ` is E.164, content 1..1600
-  characters; email ` + "`to`" + ` is an address of at most 254 characters, content 1..100000; push
-  ` + "`to`" + ` is a device token of 1..255 characters, content 1..1024. Length is counted in
-  characters, not bytes. A batch holds 1..1000 notifications. A request body is at most
-  8 MiB (` + "`413 request_too_large`" + `).
 `
+
+// limitsDescription ends the API description with the limits, read from
+// internal/notification so the text cannot drift from them.
+var limitsDescription = fmt.Sprintf(`- Limits (single source: `+"`internal/notification/limits.go`"+`, each with its standard): sms `+"`to`"+` is
+  E.164, content 1..%d characters; email `+"`to`"+` is an address of at most %d bytes, content
+  1..%d bytes; push `+"`to`"+` is a device token of 1..%d characters, content 1..%d bytes.
+  Bytes are UTF-8. `+"`to`"+`, content and a template body must hold a character that is not
+  whitespace. A batch holds 1..%d notifications. A request body is at most %d MiB
+  (`+"`413 request_too_large`"+`).
+`, notification.MaxSMSContentLen, notification.MaxEmailRecipientBytes, notification.MaxEmailContentBytes,
+	notification.MaxPushRecipientLen, notification.MaxPushContentBytes, notification.MaxBatchSize,
+	notification.MaxRequestBodyBytes>>20)
 
 func init() {
 	hookErrors()
@@ -64,7 +72,7 @@ func init() {
 // at /openapi.json and the vendored Scalar page at /docs).
 func config() huma.Config {
 	c := huma.DefaultConfig("Notification system", Version)
-	c.Info.Description = description
+	c.Info.Description = description + limitsDescription
 	c.Servers = []*huma.Server{{URL: "http://localhost:8080"}}
 	c.Tags = []*huma.Tag{{Name: "notifications"}, {Name: "batches"}, {Name: "templates"}, {Name: "operations"}}
 	c.Formats = map[string]huma.Format{"application/json": huma.DefaultJSONFormat, "json": huma.DefaultJSONFormat}

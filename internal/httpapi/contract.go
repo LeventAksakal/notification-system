@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 	"uuid"
@@ -111,7 +112,7 @@ func (TemplateRef) TransformSchema(_ huma.Registry, s *huma.Schema) *huma.Schema
 	v := s.Properties["variables"]
 	v.MaxProperties = ptr(notification.MaxTemplateVariables)
 	if vs, ok := v.AdditionalProperties.(*huma.Schema); ok {
-		vs.MaxLength = ptr(notification.MaxTemplateVariableLen)
+		vs.MaxLength = ptr(notification.MaxTemplateVariableBytes)
 		vs.PrecomputeMessages() // the parent's pass does not reach additionalProperties
 	}
 	return s
@@ -137,10 +138,17 @@ func scheduleDoc(lead string) string {
 }
 
 func (NotificationCreate) TransformSchema(_ huma.Registry, s *huma.Schema) *huma.Schema {
-	s.Description = "Exactly one of `content` and `template` is required."
+	s.Description = fmt.Sprintf("Exactly one of `content` and `template` is required. "+
+		"Per channel, the final content (given, or rendered from the template) is at most: "+
+		"sms %d characters, email %d bytes, push %d bytes (UTF-8); "+
+		"`to` is an E.164 number for sms, an address of at most %d bytes for email, "+
+		"a device token of at most %d characters for push. "+
+		"`to` and the final content must hold a character that is not whitespace.",
+		notification.MaxSMSContentLen, notification.MaxEmailContentBytes, notification.MaxPushContentBytes,
+		notification.MaxEmailRecipientBytes, notification.MaxPushRecipientLen)
 	s.Properties["scheduledAt"].Description = scheduleDoc("Deliver no earlier than this.")
-	s.Properties["to"].MaxLength = ptr(notification.MaxRecipientLen)
-	s.Properties["content"].MaxLength = ptr(notification.MaxContentLen)
+	notBlank(s.Properties["to"]).MaxLength = ptr(notification.MaxRecipientLen)
+	notBlank(s.Properties["content"]).MaxLength = ptr(notification.MaxContentLen)
 	return s
 }
 
@@ -160,7 +168,14 @@ type TemplateWrite struct {
 }
 
 func (TemplateWrite) TransformSchema(_ huma.Registry, s *huma.Schema) *huma.Schema {
-	s.Properties["body"].MaxLength = ptr(notification.MaxTemplateBodyLen)
+	notBlank(s.Properties["body"]).MaxLength = ptr(notification.MaxTemplateBodyBytes)
+	return s
+}
+
+// notBlank makes a string property refuse an empty or whitespace-only value.
+func notBlank(s *huma.Schema) *huma.Schema {
+	s.Pattern = notification.NotBlankPattern
+	s.PatternDescription = "not blank: at least one character that is not whitespace"
 	return s
 }
 

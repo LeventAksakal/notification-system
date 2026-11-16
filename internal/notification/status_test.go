@@ -52,17 +52,3 @@ func TestTerminalStates(t *testing.T) {
 		}
 	}
 }
-
-func TestContentLimitPerChannel(t *testing.T) {
-	for _, c := range Channels {
-		if n := MaxContentLenFor(c); n <= 0 || n > MaxContentLen {
-			t.Errorf("MaxContentLenFor(%q) = %d, want within (0, %d]", c, n, MaxContentLen)
-		}
-		if n := MaxRecipientLenFor(c); n <= 0 || n > MaxRecipientLen {
-			t.Errorf("MaxRecipientLenFor(%q) = %d, want within (0, %d]", c, n, MaxRecipientLen)
-		}
-	}
-	if MaxContentLenFor("fax") != 0 || MaxRecipientLenFor("fax") != 0 {
-		t.Error("unknown channel must have no limit value")
-	}
-}

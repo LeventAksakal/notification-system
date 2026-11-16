@@ -1,4 +1,7 @@
 -- Limits repeat internal/notification/limits.go; a test asserts they agree (decision 0017).
+-- A limit counted in bytes there is length() (OCTET_LENGTH) here; one counted in characters is char_length().
+-- The not-blank REGEXPs spell notification.NotBlankPattern in ICU escapes: at least one character
+-- outside Unicode White_Space (MySQL's TRIM strips spaces only).
 -- CHECKs that compare a column with a string are written as MySQL stores them
 -- (SHOW CREATE TABLE); sqldef reports a false change for any other spelling.
 
@@ -43,7 +46,7 @@ CREATE TABLE notifications (
   -- The template and version that rendered content (decision 0015); both NULL
   -- when content was sent as is. No foreign key: the template may be replaced
   -- or deleted later, and the notification keeps what produced it.
-  template_name VARCHAR(64) CHARACTER SET ascii NULL,
+  template_name VARCHAR(63) CHARACTER SET ascii NULL,
   template_version INT UNSIGNED NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -52,9 +55,11 @@ CREATE TABLE notifications (
   PRIMARY KEY (id),
   CONSTRAINT notifications_batch_fk FOREIGN KEY (batch_id) REFERENCES batches (id),
   CONSTRAINT recipient_not_blank CHECK (CHAR_LENGTH(recipient) BETWEEN 1 AND 255),
-  CONSTRAINT recipient_email_length CHECK (((`channel` <> _utf8mb4'email') or (char_length(`recipient`) <= 254))),
-  CONSTRAINT recipient_sms_e164 CHECK (((`channel` <> _utf8mb4'sms') or regexp_like(`recipient`,_utf8mb4'^\\+[0-9]{7,15}$'))),
-  CONSTRAINT content_length CHECK ((((`channel` = _utf8mb4'sms') and (char_length(`content`) between 1 and 1600)) or ((`channel` = _utf8mb4'email') and (char_length(`content`) between 1 and 100000)) or ((`channel` = _utf8mb4'push') and (char_length(`content`) between 1 and 1024)))),
+  CONSTRAINT recipient_not_whitespace CHECK (regexp_like(`recipient`,_utf8mb4'[^\\t\\n\\x{0B}\\f\\r \\x{85}\\x{A0}\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]')),
+  CONSTRAINT recipient_email_length CHECK (((`channel` <> _utf8mb4'email') or (length(`recipient`) <= 254))),
+  CONSTRAINT recipient_sms_e164 CHECK (((`channel` <> _utf8mb4'sms') or regexp_like(`recipient`,_utf8mb4'^\\+[1-9][0-9]{1,14}$'))),
+  CONSTRAINT content_length CHECK ((((`channel` = _utf8mb4'sms') and (char_length(`content`) between 1 and 1600)) or ((`channel` = _utf8mb4'email') and (length(`content`) between 1 and 32768)) or ((`channel` = _utf8mb4'push') and (length(`content`) between 1 and 4067)))),
+  CONSTRAINT content_not_blank CHECK (regexp_like(`content`,_utf8mb4'[^\\t\\n\\x{0B}\\f\\r \\x{85}\\x{A0}\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}]')),
   CONSTRAINT failure_kind_only_when_failed CHECK ((status = 'failed') = (failure_kind IS NOT NULL)),
   CONSTRAINT budget_within_attempts CHECK ((`budget_spent` <= `attempts`)),
   CONSTRAINT status_seq_from_one CHECK ((`status_seq` >= 1)),

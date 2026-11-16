@@ -397,13 +397,15 @@ components:
       type: object
     NotificationCreate:
       additionalProperties: false
-      description: Exactly one of `content` and `template` is required.
+      description: "Exactly one of `content` and `template` is required. Per channel, the final content (given, or rendered from the template) is at most: sms 1600 characters, email 32768 bytes, push 4067 bytes (UTF-8); `to` is an E.164 number for sms, an address of at most 254 bytes for email, a device token of at most 255 characters for push. `to` and the final content must hold a character that is not whitespace."
       properties:
         channel:
           $ref: "#/components/schemas/Channel"
         content:
-          maxLength: 100000
+          maxLength: 32768
           minLength: 1
+          pattern: "[^\t\n\x0B\f\r \x85   - \u2028\u2029  　]"
+          patternDescription: "not blank: at least one character that is not whitespace"
           type: string
         priority:
           $ref: "#/components/schemas/Priority"
@@ -416,6 +418,8 @@ components:
         to:
           maxLength: 255
           minLength: 1
+          pattern: "[^\t\n\x0B\f\r \x85   - \u2028\u2029  　]"
+          patternDescription: "not blank: at least one character that is not whitespace"
           type: string
       required:
         - to
@@ -580,9 +584,9 @@ components:
         - items
       type: object
     TemplateName:
-      maxLength: 64
+      maxLength: 63
       minLength: 1
-      pattern: ^[a-z0-9][a-z0-9_-]*$
+      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
       type: string
     TemplateOrigin:
       properties:
@@ -602,9 +606,9 @@ components:
           $ref: "#/components/schemas/TemplateName"
         variables:
           additionalProperties:
-            maxLength: 1000
+            maxLength: 32768
             type: string
-          maxProperties: 50
+          maxProperties: 6553
           type: object
       required:
         - name
@@ -613,8 +617,10 @@ components:
       additionalProperties: false
       properties:
         body:
-          maxLength: 100000
+          maxLength: 32768
           minLength: 1
+          pattern: "[^\t\n\x0B\f\r \x85   - \u2028\u2029  　]"
+          patternDescription: "not blank: at least one character that is not whitespace"
           type: string
       required:
         - body
@@ -641,11 +647,12 @@ info:
       to the provider.
     - `Idempotency-Key` on a create request stores the request once. A repeat with the same key
       and the same payload returns the first response (same ids) with `Idempotent-Replayed: true`.
-    - Limits (single source: `internal/notification/limits.go`): sms `to` is E.164, content 1..1600
-      characters; email `to` is an address of at most 254 characters, content 1..100000; push
-      `to` is a device token of 1..255 characters, content 1..1024. Length is counted in
-      characters, not bytes. A batch holds 1..1000 notifications. A request body is at most
-      8 MiB (`413 request_too_large`).
+    - Limits (single source: `internal/notification/limits.go`, each with its standard): sms `to` is
+      E.164, content 1..1600 characters; email `to` is an address of at most 254 bytes, content
+      1..32768 bytes; push `to` is a device token of 1..255 characters, content 1..4067 bytes.
+      Bytes are UTF-8. `to`, content and a template body must hold a character that is not
+      whitespace. A batch holds 1..1000 notifications. A request body is at most 8 MiB
+      (`413 request_too_large`).
   title: Notification system
   version: 1.4.0
 openapi: 3.0.3
@@ -706,7 +713,7 @@ paths:
           name: cursor
           schema:
             description: Opaque; the `nextCursor` of the previous page
-            maxLength: 255
+            maxLength: 52
             minLength: 1
             type: string
       responses:
@@ -809,7 +816,7 @@ paths:
           name: cursor
           schema:
             description: Opaque; the `nextCursor` of the previous page
-            maxLength: 255
+            maxLength: 52
             minLength: 1
             type: string
       responses:
@@ -842,7 +849,7 @@ paths:
         - in: header
           name: X-Correlation-ID
           schema:
-            maxLength: 128
+            maxLength: 55
             minLength: 1
             pattern: ^[A-Za-z0-9._:-]+$
             type: string
@@ -919,7 +926,7 @@ paths:
         - in: header
           name: X-Correlation-ID
           schema:
-            maxLength: 128
+            maxLength: 55
             minLength: 1
             pattern: ^[A-Za-z0-9._:-]+$
             type: string
