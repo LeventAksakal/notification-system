@@ -44,6 +44,7 @@ const (
 	DeliveryAttemptOutcomeAccepted  DeliveryAttemptOutcome = "accepted"
 	DeliveryAttemptOutcomePermanent DeliveryAttemptOutcome = "permanent"
 	DeliveryAttemptOutcomeTransient DeliveryAttemptOutcome = "transient"
+	DeliveryAttemptOutcomeUnknown   DeliveryAttemptOutcome = "unknown"
 )
 
 // Valid indicates whether the value is a known member of the DeliveryAttemptOutcome enum.
@@ -54,6 +55,8 @@ func (e DeliveryAttemptOutcome) Valid() bool {
 	case DeliveryAttemptOutcomePermanent:
 		return true
 	case DeliveryAttemptOutcomeTransient:
+		return true
+	case DeliveryAttemptOutcomeUnknown:
 		return true
 	default:
 		return false
@@ -186,13 +189,13 @@ type DeliveryAttempt struct {
 	// HttpStatus Absent when no response arrived
 	HttpStatus *int `json:"httpStatus,omitempty"`
 
-	// Outcome `accepted`: 2xx. `transient`: will be retried (network error, timeout, 408, 425, 429, 5xx). `permanent`: any other 4xx.
+	// Outcome `accepted`: 2xx. `transient`: will be retried (network error, timeout, 408, 425, 429, 5xx). `permanent`: any other 4xx. `unknown`: the worker stopped during the call, so the request may or may not have reached the provider; it counts as an attempt and the notification is retried (decision 0005).
 	Outcome           DeliveryAttemptOutcome `json:"outcome"`
 	ProviderMessageId *string                `json:"providerMessageId,omitempty"`
 	StartedAt         time.Time              `json:"startedAt"`
 }
 
-// DeliveryAttemptOutcome `accepted`: 2xx. `transient`: will be retried (network error, timeout, 408, 425, 429, 5xx). `permanent`: any other 4xx.
+// DeliveryAttemptOutcome `accepted`: 2xx. `transient`: will be retried (network error, timeout, 408, 425, 429, 5xx). `permanent`: any other 4xx. `unknown`: the worker stopped during the call, so the request may or may not have reached the provider; it counts as an attempt and the notification is retried (decision 0005).
 type DeliveryAttemptOutcome string
 
 // DeliveryStats defines model for DeliveryStats.

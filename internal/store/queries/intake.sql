@@ -45,10 +45,10 @@ FROM notifications
 WHERE id = ?;
 
 -- name: ListDeliveryAttempts :many
--- Oldest first (attempts_notification_idx). Only calls with a result: the API
--- contract's outcome enum has no in_flight or unknown (owner item 0015); an
--- unknown call shows as the gap in attempt_no.
-SELECT * FROM delivery_attempts WHERE notification_id = ? AND outcome IN ('accepted', 'transient', 'permanent') ORDER BY id;
+-- Oldest first (attempts_notification_idx). Every finished or abandoned call:
+-- unknown (the worker died mid-call) is shown as such (owner item 0015, 16 Nov
+-- 2026); in_flight is not, since a call still running has no outcome yet.
+SELECT * FROM delivery_attempts WHERE notification_id = ? AND outcome IN ('accepted', 'transient', 'permanent', 'unknown') ORDER BY id;
 
 -- ListNotifications is built in Go (store.ListNotificationsQuery): the WHERE
 -- holds only the filters a request sets, so each filter keeps its index.

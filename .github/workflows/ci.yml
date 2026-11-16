@@ -67,9 +67,7 @@ jobs:
       - name: API contract keeps every client working (no breaking change against the base)
         env:
           BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          git show "$BASE:api/openapi.yaml" > "$RUNNER_TEMP/base-openapi.yaml"
-          $T oasdiff breaking --flatten-params --fail-on ERR "$RUNNER_TEMP/base-openapi.yaml" api/openapi.yaml
+        run: go run ./tools/apibreaking -base "$BASE"
       - name: Known vulnerabilities
         run: $T govulncheck ./...
 

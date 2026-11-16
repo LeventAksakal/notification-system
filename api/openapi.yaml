@@ -133,11 +133,12 @@ components:
           description: Absent when no response arrived
           type: integer
         outcome:
-          description: "`accepted`: 2xx. `transient`: will be retried (network error, timeout, 408, 425, 429, 5xx). `permanent`: any other 4xx."
+          description: "`accepted`: 2xx. `transient`: will be retried (network error, timeout, 408, 425, 429, 5xx). `permanent`: any other 4xx. `unknown`: the worker stopped during the call, so the request may or may not have reached the provider; it counts as an attempt and the notification is retried (decision 0005)."
           enum:
             - accepted
             - transient
             - permanent
+            - unknown
           type: string
         providerMessageId:
           type: string
@@ -665,7 +666,7 @@ info:
       whitespace. A batch holds 1..1000 notifications. A request body is at most 8 MiB
       (`413 request_too_large`).
   title: Notification system
-  version: 1.4.0
+  version: 2.0.0
 openapi: 3.0.3
 paths:
   /healthz:

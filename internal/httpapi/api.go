@@ -20,9 +20,12 @@ import (
 )
 
 // Version is the contract's version (info.version). Bump the minor version
-// for an addition, the major one for a breaking change; CI's oasdiff check
-// compares the generated spec with the base branch.
-const Version = "1.4.0"
+// for an addition, the major one for a breaking change; tools/apibreaking (CI
+// and task api:breaking) refuses a breaking change without a major bump.
+// 2.0.0 (16 Nov 2026): limits from standards (decision 0017: shorter maximum
+// lengths, blank content refused) and new enum values (the unknown attempt
+// outcome, owner item 0015), none of them released before.
+const Version = "2.0.0"
 
 const description = `Accepts notification requests (sms, email, push), queues them, and delivers them to an
 external provider with rate limiting, priorities, retries and status tracking.

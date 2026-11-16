@@ -214,7 +214,7 @@ type DeliveryAttempt struct {
 	AttemptNo         int       `json:"attemptNo"`
 	StartedAt         time.Time `json:"startedAt"`
 	DurationMs        int       `json:"durationMs"`
-	Outcome           string    "json:\"outcome\" enum:\"accepted,transient,permanent\" doc:\"`accepted`: 2xx. `transient`: will be retried (network error, timeout, 408, 425, 429, 5xx). `permanent`: any other 4xx.\""
+	Outcome           string    "json:\"outcome\" enum:\"accepted,transient,permanent,unknown\" doc:\"`accepted`: 2xx. `transient`: will be retried (network error, timeout, 408, 425, 429, 5xx). `permanent`: any other 4xx. `unknown`: the worker stopped during the call, so the request may or may not have reached the provider; it counts as an attempt and the notification is retried (decision 0005).\""
 	HTTPStatus        *int      `json:"httpStatus,omitempty" doc:"Absent when no response arrived"`
 	Error             *string   `json:"error,omitempty"`
 	ProviderMessageID *string   `json:"providerMessageId,omitempty"`

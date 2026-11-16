@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-15
 tags: [api, contract, attempts, metrics]
 ---
@@ -22,3 +22,4 @@ Option 1, in the huma code-first branch that owns `api/` (the store already has 
 Assumption taken meanwhile: option 2.
 
 ## Answer
+Owner, 16 Nov 2026: "yeah add unknown too". The attempt `outcome` enum gained `unknown` and `GET /v1/notifications/{id}` lists unknown attempts (`ListDeliveryAttempts`); the contract went to 2.0.0 with 0017's limits.

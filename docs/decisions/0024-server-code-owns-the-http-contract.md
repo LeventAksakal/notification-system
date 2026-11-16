@@ -31,6 +31,6 @@ The move kept the published contract: `oasdiff breaking` against the 1.3.0 docum
 
 ## Confirmation
 - `TestCommittedSpecIsGenerated` (`internal/httpapi`) and the CI step "Generated code is up to date" fail when `api/openapi.yaml` or `test/apiclient` differs from what `go generate` writes.
-- The CI step "API contract keeps every client working" runs `oasdiff breaking --fail-on ERR` against the base revision's spec (`task api:breaking` locally).
+- The CI step "API contract keeps every client working" runs `tools/apibreaking` against the base revision's spec (`task api:breaking` locally): with the same major version, `oasdiff breaking --fail-on ERR` must find nothing; a higher major version lists the breaking changes and passes. 2.0.0 (16 Nov 2026) carries 0017's shorter limits and the `unknown` attempt outcome, none released before.
 - `.claude/agent-policy.json` marks `api/openapi.yaml` and `*.gen.go` as generated and `internal/httpapi/{api,contract}.go` as contracts; `tools/ownercheck` fails a lane whose diff regenerates the spec, which also catches an operation changed in any other file of the package (`reschedule.go`, `template_versioning.go`, `stream_event.go`), since the spec is generated from them all.
 - `TestR10LimitsAgreeSpecAndCore` (`test/acceptance`) reads the limits from the generated document and compares them with `internal/notification/limits.go`.

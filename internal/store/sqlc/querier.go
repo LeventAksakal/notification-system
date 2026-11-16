@@ -114,9 +114,9 @@ type Querier interface {
 	// Every notification of a batch with its status_seq (batch_idx, then the
 	// row): the base a batch subscription orders live events against.
 	ListBatchStatusSeqs(ctx context.Context, batchID sql.NullString) ([]ListBatchStatusSeqsRow, error)
-	// Oldest first (attempts_notification_idx). Only calls with a result: the API
-	// contract's outcome enum has no in_flight or unknown (owner item 0015); an
-	// unknown call shows as the gap in attempt_no.
+	// Oldest first (attempts_notification_idx). Every finished or abandoned call:
+	// unknown (the worker died mid-call) is shown as such (owner item 0015, 16 Nov
+	// 2026); in_flight is not, since a call still running has no outcome yet.
 	ListDeliveryAttempts(ctx context.Context, notificationID string) ([]DeliveryAttempt, error)
 	ListTemplates(ctx context.Context) ([]Template, error)
 	// Delivery over a window [since, now] is read on the same timestamps the

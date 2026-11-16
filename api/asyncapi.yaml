@@ -3,7 +3,7 @@
 asyncapi: 3.0.0
 info:
   title: Notification system status stream
-  version: 1.4.0
+  version: 2.0.0
   description: "The WebSocket half of the Notification system contract. Like the OpenAPI document (api/openapi.yaml), it is generated from the server's code (internal/httpapi), and its payload schemas are that document's, by the same names. They are JSON Schema as Huma writes it, within what AsyncAPI's default schema format (a superset of JSON Schema draft 07) reads. A field may be added to a message in a minor version: ignore fields you do not know."
 defaultContentType: application/json
 servers:

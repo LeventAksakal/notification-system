@@ -68,9 +68,7 @@ tasks:
   api:breaking:
     desc: 'Fail if api/openapi.yaml breaks clients of a base revision (usage: task api:breaking [BASE=main])'
     cmds:
-      - git show {{.BASE | default "main"}}:api/openapi.yaml > .task-base-openapi.yaml
-      - defer: rm -f .task-base-openapi.yaml
-      - '{{.T}} oasdiff breaking --flatten-params --fail-on ERR .task-base-openapi.yaml api/openapi.yaml'
+      - go run ./tools/apibreaking -base {{.BASE | default "main"}}
 
   lint:
     desc: golangci-lint, failing on any silent typecheck error
