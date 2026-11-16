@@ -40,7 +40,7 @@ The limiter reserves up to a horizon (200 ms) of consecutive send slots per call
 | Interval | 10.53 ms | Derived: one second divided by 95 |
 | Horizon | 200 ms, or the send alignment when that is larger | A budget of limiter calls: a busy channel calls every half horizon, 10 per second per channel per worker; it grows to the alignment so one reservation outlasts one claim (as built, 16 Nov) |
 | Send alignment | p95 of the newest 20 claims, 200 ms to lease/8 | Measured per worker and channel; floor and ceiling derived in the as-built note below (16 Nov) |
-| Allowed lateness | one interval | Derived: keeps every pair of sends at least one interval apart |
+| Allowed lateness | one interval | Derived: keeps every pair of sends at least one interval apart; enforced at the request's first write, not only before the call (as built, 16 Nov) |
 | Throughput floors | 88 and 91 | Measured runs minus a margin (owner item 0010) |
 | CI floor | 40 | Sanity floor on the two-core runner, where throughput follows CPU (owner item 0011) |
 
@@ -51,3 +51,11 @@ The owner called the throughput drop under a slow database (56 to 75 per second 
 The fixed 200 ms alignment ("a slot whose claim takes longer than 200 ms ... is given up" above) is replaced (owner item 0011). A worker passes a lead to the limiter with each reservation: the p95 of its newest 20 claim times on that channel, never below 200 ms (the old fixed value) and never above an eighth of the lease (3.75 s by default). A free grid restarts at now plus that lead, and a busy grid continues where it was. Slots are still the send moments on one shared grid, so the spacing does not depend on any worker's lead. One reservation now covers the larger of `APP_RATE_LIMIT_HORIZON` and the lead, and a group that found fewer rows than slots gives the rest back to the limiter.
 
 Measured on the owner-item-0011 scenario (every claim held 1.6 s): the fast channels drained at 95.0 per second, busiest second 96; with the fixed alignment they managed 1.9 and 5.2. R8 drained at 93.3 to 94.6 per second against 89.2 to 91.9 before. R9 latency was unchanged. The design, the derived numbers and every run are in `.agents/pr/adaptive-align.md` on the branch `claude/feat-adaptive-send-alignment-a40f6f`. Claims slower than the ceiling still lose slots: the database is then several seconds behind on every query.
+
+## As built: lateness checked at the first write (16 Nov 2026)
+
+The question: a send passed the lateness check and still left late (clock and health checks, goroutine scheduling, the transport's connection handoff came after it), so on a loaded machine late sends bunched with on-time ones. `TestDeliveryR8RateLimit`, 20 runs pinned to two cores: busiest one-second window up to 102 before 16 Nov's provider changes and up to 106 after, against the cap of 100.
+
+How it runs now: the slot's late moment travels with the provider call (`provider.WithLeaveBy`). The client refuses a call already past that moment before it takes a connection, and refuses the request's first write when that moment plus the request's own wait for a connection (about zero on a pooled one, the dial on a fresh one) has passed: nothing is written, the call is `ErrNotSent`/`ErrTooLate`, and the worker releases the job as a missed slot (no attempt, no budget, no health report; decision 0005). Only the connection wait is excused: Refusing every late fresh connection would starve a provider whose dial is slower than one interval (a remote provider: nothing sent, nothing recorded), and excusing every fresh connection let late requests leave in a burst after a stall had closed the pooled ones (one run at 103).
+
+What it costs: a request can be late by at most its own wait for a connection; on a starved machine more slots are given up, so throughput drops (86.9 to 95.05 per second over 20 runs). Measured after: 20 of 20 runs at or under 100, busiest windows 96 to 100.
