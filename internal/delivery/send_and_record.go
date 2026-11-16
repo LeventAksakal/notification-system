@@ -85,10 +85,13 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 	elapsed := time.Since(start)
 	callDone()
 	if errors.Is(err, provider.ErrNotSent) {
-		// No byte of the call left this process (a descheduled worker's
-		// timeout, a refused dial, shutdown before the write): the provider
-		// cannot have seen it, so it is no attempt and says nothing about the
-		// provider. Given back like a missed slot (decision 0005), due at once.
+		// The call obtained a connection and wrote nothing to it (a
+		// descheduled worker's timeout, shutdown before the write): the
+		// provider cannot have seen it, so it is no attempt and says nothing
+		// about the provider. Given back like a missed slot (decision 0005),
+		// due at once. A failed dial is not this: it is a recorded provider
+		// fault, or a refusing provider would loop here and never open its
+		// outage.
 		w.cancelGate(ctx, gate, tk)
 		slog.WarnContext(ctx, "provider call never left; released", "channel", job.Channel,
 			"after_ms", elapsed.Milliseconds(), "err", err)

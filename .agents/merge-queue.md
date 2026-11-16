@@ -20,7 +20,8 @@ Integration branch: `refs/heads/integration/decision-review`, checked out in `C:
 | f7bef32 | dials-derived (0018): every dial derived, config cross-checks |
 | 3c2d59e | R7 second-row fix (adaptive-align): given-back slots return once later ones are back; R7 p99 18.9 ms (was 387) |
 | e7f1053 | public-polish: README without a directory tree, merged contract described; GitHub metadata drafted in `.agents/pr/public-metadata.md` (owner applies) |
-| (this commit) | attempt rows over requests (adaptive-align): a call of which no byte left is released, not recorded (load-driven timeouts; not caused by 3c2d59e) |
+| 25176b4 | attempt rows over requests (adaptive-align): a call of which no byte left is released, not recorded (load-driven timeouts; not caused by 3c2d59e) |
+| (this commit) | not-sent follow-up (adaptive-align): a failed dial stays a recorded provider fault; TLS counted above the handshake; HTTP/2 off; verifier findings on 25176b4 fixed |
 
 ## Protocol for every lane
 1. Finish your work and your verifier on your own branch, as briefed. Do not merge other lanes into your branch.

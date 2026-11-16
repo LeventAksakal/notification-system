@@ -6,6 +6,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,13 +45,16 @@ var ErrUnknownChannel = errors.New("no provider URL for channel")
 // ErrTimeout wraps a call that ran past the provider timeout.
 var ErrTimeout = errors.New("provider timeout")
 
-// ErrNotSent wraps a failed call of which no byte left this process: no
-// connection was obtained for it, or none was written to before the call
-// ended (a timeout, the caller's deadline, a refused dial). The provider
-// cannot have seen it, so it is no attempt (decision 0005): the caller
-// gives the job back instead of recording a result. Measured on the
+// ErrNotSent wraps a failed call that obtained a connection and wrote
+// nothing to it before it ended (a timeout or the caller's deadline): the
+// provider cannot have seen it, so it is no attempt (decision 0005) and the
+// caller gives the job back instead of recording a result. Measured on the
 // two-core acceptance runs: a descheduled worker's 500 ms calls ended after
 // 710-946 ms with nothing written, and the double counted no request.
+// A call that obtained no connection (a refused dial, a DNS failure, a dial
+// timeout) is not ErrNotSent: the provider's address did not answer, a
+// provider fault the caller records and reports to provider health, so a
+// stopped provider still opens an outage and still exhausts budgets.
 var ErrNotSent = errors.New("the request never left")
 
 // maxBody bounds how much of an answer is read.
@@ -69,7 +73,14 @@ func New(urls map[notification.Channel]string, timeout time.Duration, conns int)
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.MaxIdleConns = max(conns*len(notification.Channels), 100)
 	tr.MaxIdleConnsPerHost = max(conns, 2)
-	// Every connection reports whether a write was ever started on it, so a
+	// HTTP/1.1 only. HTTP/2 multiplexes calls on one connection: one call's
+	// writes would move another's count, and closing a failed call's
+	// connection (connUse.notSent) would cut every stream on it. A provider
+	// call is one small request, so h2 buys nothing here.
+	tr.ForceAttemptHTTP2 = false
+	tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	// Every connection counts the writes started on it, above TLS: a TLS
+	// close_notify written underneath on Close is no request byte. So a
 	// failed call can tell "nothing left" from "may have left" (ErrNotSent).
 	dial := tr.DialContext
 	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -78,6 +89,28 @@ func New(urls map[notification.Channel]string, timeout time.Duration, conns int)
 			return nil, err
 		}
 		return &writeMarkConn{Conn: c}, nil
+	}
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		raw, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		cfg := tr.TLSClientConfig.Clone() // read per dial: tests and callers may set it after New
+		if cfg == nil {
+			cfg = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		if cfg.ServerName == "" {
+			cfg.ServerName, _, _ = net.SplitHostPort(addr)
+		}
+		cfg.NextProtos = []string{"http/1.1"}
+		tc := tls.Client(raw, cfg)
+		hctx, cancel := context.WithTimeout(ctx, tr.TLSHandshakeTimeout) // as the transport's own handshake
+		defer cancel()
+		if err := tc.HandshakeContext(hctx); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		return &writeMarkConn{Conn: tc}, nil
 	}
 	return &Client{
 		urls:    urls,
@@ -135,7 +168,7 @@ func (c *Client) Send(ctx context.Context, m Message) (Response, error) {
 		if errors.Is(context.Cause(cctx), ErrTimeout) && ctx.Err() == nil {
 			err = fmt.Errorf("%w after %s", ErrTimeout, c.timeout)
 		}
-		if !used.mayHaveLeft() {
+		if used.notSent() {
 			err = fmt.Errorf("%w: %w", ErrNotSent, err)
 		}
 		return Response{}, err
@@ -161,9 +194,7 @@ func (c *Client) Send(ctx context.Context, m Message) (Response, error) {
 
 // writeMarkConn is a provider connection that remembers how many writes were
 // started on it. HTTP/1.1 carries one request at a time, so a count that did
-// not move while a request held the connection means none of it was written.
-// HTTP/2 shares a connection between calls, so another call's writes can move
-// it: the answer then errs toward "may have left", never the other way.
+// not move while a call held the connection means none of it was written.
 type writeMarkConn struct {
 	net.Conn
 	writes atomic.Int64
@@ -176,12 +207,18 @@ func (c *writeMarkConn) Write(b []byte) (int, error) {
 	return c.Conn.Write(b)
 }
 
-// connUse is what one call learned about its connection (httptrace.GotConn).
+// connUse is every connection one call obtained (httptrace.GotConn), with
+// its write count at that moment. A call normally obtains one; a transport
+// retry on a fresh connection would add another.
 type connUse struct {
-	mu       sync.Mutex
-	conn     *writeMarkConn
-	mark     int64 // conn.writes when the call got it
-	obtained bool  // GotConn fired
+	mu    sync.Mutex
+	conns []usedConn
+	other bool // a connection this client did not dial (none should exist)
+}
+
+type usedConn struct {
+	conn *writeMarkConn
+	mark int64
 }
 
 func (u *connUse) got(info httptrace.GotConnInfo) { u.gotConn(info.Conn) }
@@ -189,28 +226,32 @@ func (u *connUse) got(info httptrace.GotConnInfo) { u.gotConn(info.Conn) }
 func (u *connUse) gotConn(c net.Conn) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.obtained = true
-	if tc, ok := c.(interface{ NetConn() net.Conn }); ok { // TLS: count the writes underneath
-		c = tc.NetConn()
+	wc, ok := c.(*writeMarkConn)
+	if !ok {
+		u.other = true
+		return
 	}
-	if wc, ok := c.(*writeMarkConn); ok {
-		u.conn, u.mark = wc, wc.writes.Load()
-	}
+	u.conns = append(u.conns, usedConn{conn: wc, mark: wc.writes.Load()})
 }
 
-// mayHaveLeft reports whether any byte of the failed call can have left.
-// It closes the call's connection first, so no write can start after the
-// answer: a write already started counts as sent. A connection not dialled
-// by this client (none should exist) counts as sent.
-func (u *connUse) mayHaveLeft() bool {
+// notSent reports whether the failed call obtained a connection and wrote
+// nothing to any connection it obtained. It closes them first, so no write
+// can start after the answer: a write already started counts as sent. No
+// connection obtained is not "not sent": the dial failed, a provider fault
+// to record (ErrNotSent).
+func (u *connUse) notSent() bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	switch {
-	case !u.obtained:
-		return false // no connection was obtained: nothing was written
-	case u.conn == nil:
-		return true
+	if len(u.conns) == 0 || u.other {
+		return false
 	}
-	_ = u.conn.Close() // the call failed: the transport drops it anyway
-	return u.conn.writes.Load() != u.mark
+	for _, c := range u.conns {
+		_ = c.conn.Close() // the call failed: the transport drops it anyway
+	}
+	for _, c := range u.conns {
+		if c.conn.writes.Load() != c.mark {
+			return false
+		}
+	}
+	return true
 }
