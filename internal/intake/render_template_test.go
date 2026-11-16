@@ -82,3 +82,38 @@ func TestPlainContentHasNoTemplateOrigin(t *testing.T) {
 		t.Fatalf("errs %+v origin %+v", errs, a.Template)
 	}
 }
+
+func TestTemplateVariablesAndRendering(t *testing.T) {
+	for _, tc := range []struct {
+		name, body  string
+		vars        map[string]string
+		wantVars    []string
+		wantContent string
+		wantMissing []string
+	}{
+		{"no placeholders", "plain", nil, []string{}, "plain", nil},
+		{"one placeholder", "Hello {{name}}", map[string]string{"name": "Ada"}, []string{"name"}, "Hello Ada", nil},
+		{"spaces inside braces", "Hello {{ name }}", map[string]string{"name": "Ada"}, []string{"name"}, "Hello Ada", nil},
+		{"repeated variable listed once", "{{a}}{{b}}{{a}}", map[string]string{"a": "1", "b": "2"}, []string{"a", "b"}, "121", nil},
+		{"missing variables reported once each", "{{a}} {{b}} {{a}}", map[string]string{}, []string{"a", "b"}, "  ", []string{"a", "b"}},
+		{"values are not rendered again", "{{a}}", map[string]string{"a": "{{b}}", "b": "x"}, []string{"a"}, "{{b}}", nil},
+		{"single braces are text", "{a} {{ }}", nil, []string{}, "{a} {{ }}", nil},
+		{"multi-byte text kept", "Grüße {{n}} ☃", map[string]string{"n": "Ada"}, []string{"n"}, "Grüße Ada ☃", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Variables(tc.body); !slices.Equal(got, tc.wantVars) || got == nil {
+				t.Errorf("Variables = %#v, want %#v", got, tc.wantVars)
+			}
+			content, missing, over := Render(tc.body, tc.vars, notification.MaxContentLen)
+			if over {
+				t.Errorf("over = true for %q", tc.body)
+			}
+			if !slices.Equal(missing, tc.wantMissing) {
+				t.Errorf("missing = %v, want %v", missing, tc.wantMissing)
+			}
+			if len(missing) == 0 && content != tc.wantContent {
+				t.Errorf("content = %q, want %q", content, tc.wantContent)
+			}
+		})
+	}
+}

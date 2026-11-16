@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/validation"
 
+	"github.com/LeventAksakal/notification-system/internal/intake"
 	"github.com/LeventAksakal/notification-system/internal/notification"
 	"github.com/LeventAksakal/notification-system/internal/store"
 )
@@ -244,4 +246,48 @@ func cutLast(field string) (parent, name string) {
 func firstLine(s string) string {
 	line, _, _ := strings.Cut(s, "\n")
 	return line
+}
+
+// writeError writes the contract's Error body outside Huma (unknown route,
+// body limit, request deadline, WebSocket refusals), with its length, so a
+// client has the whole answer even while the server still holds the
+// connection.
+func writeError(w http.ResponseWriter, e *Error) {
+	b, err := json.Marshal(e)
+	if err != nil {
+		b = []byte(`{"code":"internal","message":"internal error"}`)
+	}
+	b = append(b, '\n')
+	for k, v := range e.headers {
+		w.Header().Set(k, v)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+	w.WriteHeader(e.status)
+	_, _ = w.Write(b)
+}
+
+// refusal maps the service's refusals to the contract's errors; any other
+// error passes through to Huma, and so to toError (500, or 503 when the
+// database cannot be reached).
+func refusal(err error) error {
+	var ve *intake.ValidationError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &ve):
+		details := make([]ErrorDetail, len(ve.Details))
+		for i, d := range ve.Details {
+			details[i] = ErrorDetail{Index: d.Index, Field: d.Field, Reason: d.Reason}
+			if r := d.Variables; r != nil {
+				details[i].Required, details[i].Missing, details[i].Unknown = r.Required, r.Missing, r.Unknown
+			}
+		}
+		e := invalid(details)
+		e.Message = ve.Error()
+		return e
+	case errors.Is(err, intake.ErrIdempotencyKeyReused):
+		return errKeyReused
+	}
+	return err
 }

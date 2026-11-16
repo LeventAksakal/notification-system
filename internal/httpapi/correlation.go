@@ -65,15 +65,3 @@ func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // Flush passes flushes through to the underlying writer.
 func (s *statusRecorder) Flush() { _ = http.NewResponseController(s.ResponseWriter).Flush() }
-
-// limitBody caps every request body at notification.MaxRequestBodyBytes, for
-// routes outside the contract too. Huma enforces the same limit on each
-// operation (MaxBodyBytes) and answers 413 through toError.
-func limitBody(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Body != nil && r.Body != http.NoBody {
-			r.Body = http.MaxBytesReader(w, r.Body, notification.MaxRequestBodyBytes)
-		}
-		next.ServeHTTP(w, r)
-	})
-}

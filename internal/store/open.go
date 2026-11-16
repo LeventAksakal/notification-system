@@ -4,13 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
-	"github.com/pressly/goose/v3"
-
-	"github.com/LeventAksakal/notification-system/migrations"
 )
 
 // Driver timeouts used when the DSN sets none. Without them a call on a
@@ -73,22 +69,6 @@ func driverConfig(dsn string) (*mysql.Config, error) {
 	}
 	cfg.Params["time_zone"] = "'+00:00'"
 	return cfg, nil
-}
-
-// Migrate applies every pending migration embedded in the binary.
-func Migrate(ctx context.Context, db *sql.DB) error {
-	p, err := goose.NewProvider(goose.DialectMySQL, db, migrations.FS)
-	if err != nil {
-		return fmt.Errorf("goose provider: %w", err)
-	}
-	results, err := p.Up(ctx)
-	if err != nil {
-		return fmt.Errorf("migrate up: %w", err)
-	}
-	for _, r := range results {
-		slog.InfoContext(ctx, "migration applied", "version", r.Source.Version, "path", r.Source.Path, "took", r.Duration)
-	}
-	return nil
 }
 
 // Warm opens n pooled connections up front, so the first queries of a
