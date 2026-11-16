@@ -1,5 +1,5 @@
 ---
-status: open
+status: closed
 created: 2026-11-13
 tags: [tests, provider-double]
 ---
@@ -17,3 +17,4 @@ R16 asks that the stored `providerMessageId` equal what the provider returned. `
 Option 2 (`dlRecorder` in `test/acceptance/delivery_helpers_test.go`, used by `TestDeliveryR16ProviderCall`). Option 1 would still be worth having for other tests.
 
 ## Answer
+Owner, 16 Nov 2026: covered in the 15 to 16 Nov walkthrough. The assumption taken above stands as the answer; closed by the coordinator.
