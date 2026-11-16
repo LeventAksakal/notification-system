@@ -101,8 +101,8 @@ func snapshotEvent(n intake.Notification) notification.Event {
 // liveUpdatesUnavailable describes /v1/ws's 503 (LiveUpdatesUnavailable in
 // the spec). It is not the API-wide ServiceUnavailable: the database is
 // usually fine, so creating, reading and cancelling still work.
-const liveUpdatesUnavailable = "Live updates are unavailable (`unavailable`): this instance has lost its event feed, " +
-	"or is shutting down. The REST API still answers; reconnect shortly. When the database is what cannot be reached, " +
+const liveUpdatesUnavailable = "Live updates are unavailable (`unavailable`): this instance has no event feed (it lost it, " +
+	"or has just started and is still connecting it), or is shutting down. The REST API still answers; reconnect shortly. When the database is what cannot be reached, " +
 	"the body says so and `Retry-After` is set"
 
 // liveUpdatesUnavailable503 is the LiveUpdatesUnavailable response object.
@@ -117,10 +117,11 @@ func liveUpdatesUnavailable503() *huma.Response {
 }
 
 // errLiveUpdatesUnavailable is the 503 body while this instance has no event
-// feed (Valkey down).
+// feed: Valkey is down, or the instance has just started and its
+// subscription is not confirmed yet (/readyz checks MySQL only).
 func errLiveUpdatesUnavailable() *Error {
 	return newError(http.StatusServiceUnavailable, "unavailable",
-		"live updates are unavailable: the event feed is down; retry shortly, the REST API still answers")
+		"live updates are unavailable: the event feed is not connected; retry shortly, the REST API still answers")
 }
 
 // streamClose is one way the server ends a stream: the close code, the

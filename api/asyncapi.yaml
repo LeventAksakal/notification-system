@@ -57,7 +57,7 @@ channels:
       - status: 503
         code: unavailable
         contentType: application/json
-        description: "Live updates are unavailable (`unavailable`): this instance has lost its event feed, or is shutting down. The REST API still answers; reconnect shortly. When the database is what cannot be reached, the body says so and `Retry-After` is set."
+        description: "Live updates are unavailable (`unavailable`): this instance has no event feed (it lost it, or has just started and is still connecting it), or is shutting down. The REST API still answers; reconnect shortly. When the database is what cannot be reached, the body says so and `Retry-After` is set."
         payload:
           $ref: "#/components/schemas/Error"
       - status: 404
