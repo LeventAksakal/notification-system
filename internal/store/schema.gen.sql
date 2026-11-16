@@ -2,6 +2,18 @@
 -- The schema sqlc reads: MySQL's export of the migrated database without its
 -- triggers, which sqlc's parser cannot read. Edit schema/, then run task migrate:diff.
 
+CREATE TABLE `attempts_per_minute` (
+  `minute` datetime NOT NULL,
+  `channel` enum('sms','email','push') NOT NULL,
+  `outcome` enum('accepted','transient','permanent','unknown') NOT NULL,
+  `shard` tinyint unsigned NOT NULL,
+  `n` int NOT NULL,
+  PRIMARY KEY (`minute`,`channel`,`outcome`,`shard`),
+  CONSTRAINT `attempts_per_minute_count` CHECK ((`n` >= 0)),
+  CONSTRAINT `attempts_per_minute_shard` CHECK ((`shard` < 4)),
+  CONSTRAINT `attempts_per_minute_whole_minute` CHECK ((second(`minute`) = 0))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 CREATE TABLE `batches` (
   `id` char(36) CHARACTER SET ascii COLLATE ascii_general_ci NOT NULL,
   `total` int unsigned NOT NULL,
@@ -38,6 +50,20 @@ CREATE TABLE `delivery_attempts` (
   CONSTRAINT `attempt_no_result_yet` CHECK (((`outcome` not in (_utf8mb4'in_flight',_utf8mb4'unknown')) or ((`http_status` is null) and (`duration_ms` = 0)))),
   CONSTRAINT `attempt_outcome_transition` CHECK (((`outcome_from` is null) or ((`outcome_from`,`outcome`) in ((_utf8mb4'created',_utf8mb4'in_flight'),(_utf8mb4'in_flight',_utf8mb4'accepted'),(_utf8mb4'in_flight',_utf8mb4'transient'),(_utf8mb4'in_flight',_utf8mb4'permanent'),(_utf8mb4'in_flight',_utf8mb4'unknown'),(_utf8mb4'unknown',_utf8mb4'accepted'),(_utf8mb4'unknown',_utf8mb4'transient'),(_utf8mb4'unknown',_utf8mb4'permanent'))))),
   CONSTRAINT `attempt_provider_id_only_when_accepted` CHECK (((`outcome` = _utf8mb4'accepted') or (`provider_message_id` is null)))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `finishes_per_minute` (
+  `minute` datetime NOT NULL,
+  `channel` enum('sms','email','push') NOT NULL,
+  `status` enum('sent','failed') NOT NULL,
+  `latency_le_ms` bigint unsigned NOT NULL,
+  `shard` tinyint unsigned NOT NULL,
+  `n` int NOT NULL,
+  PRIMARY KEY (`minute`,`channel`,`status`,`latency_le_ms`,`shard`),
+  CONSTRAINT `finishes_per_minute_count` CHECK ((`n` >= 0)),
+  CONSTRAINT `finishes_per_minute_latency_only_when_sent` CHECK (((`status` = _utf8mb4'sent') or (`latency_le_ms` = 0))),
+  CONSTRAINT `finishes_per_minute_shard` CHECK ((`shard` < 4)),
+  CONSTRAINT `finishes_per_minute_whole_minute` CHECK ((second(`minute`) = 0))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `idempotency_keys` (
@@ -79,11 +105,11 @@ CREATE TABLE `notifications` (
   `finished_at` datetime(3) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `batch_position_idx` (`batch_id`,`batch_index`),
-  KEY `claim_idx` (`status`,`channel`,`priority`,`due_at`),
-  KEY `finished_idx` (`finished_at`,`status`,`channel`),
   KEY `lease_idx` (`status`,`lease_until`),
   KEY `list_channel_idx` (`channel`,`id`),
   KEY `list_status_idx` (`status`,`id`),
+  KEY `claim_idx` (`status`,`channel`,`priority`,`due_at`,`attempts`),
+  KEY `finished_idx` (`finished_at`,`status`,`channel`,`created_at`,`scheduled_at`),
   CONSTRAINT `notifications_batch_fk` FOREIGN KEY (`batch_id`) REFERENCES `batches` (`id`),
   CONSTRAINT `attempted_before_sent_or_failed` CHECK (((`status` not in (_utf8mb4'sent',_utf8mb4'failed')) or (`attempts` >= 1))),
   CONSTRAINT `batch_position_with_batch` CHECK (((`batch_id` is null) = (`batch_index` is null))),

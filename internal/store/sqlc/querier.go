@@ -44,6 +44,8 @@ type Querier interface {
 	DeleteAttemptsOf(ctx context.Context, ids []string) (int64, error)
 	// Forget one key older than the retention, so it can be used again.
 	DeleteExpiredIdempotencyKey(ctx context.Context, arg DeleteExpiredIdempotencyKeyParams) (int64, error)
+	DeleteFoldedAttemptShards(ctx context.Context, arg DeleteFoldedAttemptShardsParams) (int64, error)
+	DeleteFoldedFinishShards(ctx context.Context, arg DeleteFoldedFinishShardsParams) (int64, error)
 	// The rows locked by RetentionCandidates, after their attempts.
 	DeleteNotifications(ctx context.Context, ids []string) (int64, error)
 	DeleteTemplate(ctx context.Context, name string) (int64, error)
@@ -73,6 +75,14 @@ type Querier interface {
 	// matches no status change happened since the claim: the new status_seq (the
 	// trigger raises it) is the claim's plus one, known without reading it back.
 	FinishSent(ctx context.Context, arg FinishSentParams) (int64, error)
+	// Adds the shards 1 to 3 of attempts_per_minute minutes in [from_minute,
+	// until_minute) into shard 0 (DeleteFoldedAttemptShards removes them in the
+	// same transaction). Shards only spread the minutes still being written;
+	// once folded, a past minute is one row per key again, as cheap to read as
+	// unsharded rollups. The locking read keeps the range still until commit.
+	FoldAttemptRollups(ctx context.Context, arg FoldAttemptRollupsParams) (int64, error)
+	// As FoldAttemptRollups, for finishes_per_minute.
+	FoldFinishRollups(ctx context.Context, arg FoldFinishRollupsParams) (int64, error)
 	GetBatch(ctx context.Context, id string) (Batch, error)
 	GetIdempotencyKey(ctx context.Context, idemKey string) (IdempotencyKey, error)
 	GetNotification(ctx context.Context, id string) (GetNotificationRow, error)
@@ -109,15 +119,35 @@ type Querier interface {
 	// unknown call shows as the gap in attempt_no.
 	ListDeliveryAttempts(ctx context.Context, notificationID string) ([]DeliveryAttempt, error)
 	ListTemplates(ctx context.Context) ([]Template, error)
-	// Provider calls started in the window (since its start), per channel, from
-	// attempts_window_idx (started_at, channel, outcome) alone. attempts are the
-	// calls with a result (accepted, transient, permanent), as the API documents
-	// them; a call still in flight counts nowhere; unknown (the result was never
-	// recorded) is its own count, neither failed nor accepted.
-	MetricsAttempts(ctx context.Context, since time.Time) ([]MetricsAttemptsRow, error)
-	// Notifications that reached sent or failed in the window (since its
-	// start), per channel, from finished_idx (finished_at, status, channel) alone.
-	MetricsFinished(ctx context.Context, since sql.NullTime) ([]MetricsFinishedRow, error)
+	// Delivery over a window [since, now] is read on the same timestamps the
+	// rollup triggers truncate: whole minutes from the rollups, and the window's
+	// partial first minute m0 from the raw rows, whichever side of since is
+	// shorter: [since, m0 + 1 min) added to the rollups from m0 + 1 min, or
+	// [m0, since) subtracted from the rollups from m0 (exact, as a rollup row
+	// equals a recount of its rows). So at most 30 s of raw rows are read,
+	// whatever the window; the current minute's rollup rows commit with the
+	// outcomes they count.
+	// Provider calls per channel and outcome in the whole minutes from
+	// from_minute on (attempts_per_minute primary key range).
+	MetricsAttemptRollups(ctx context.Context, fromMinute time.Time) ([]MetricsAttemptRollupsRow, error)
+	// Provider calls started in [from_time, until_time), one row each, from
+	// attempts_window_idx (started_at, channel, outcome) alone. The caller counts
+	// them: at most half a minute of rows (metrics.go, halfMinute), and sending
+	// them costs less than MySQL's temporary-table GROUP BY (13 against 18 ms for
+	// 8,300 rows at 1M rows, measured 16 Nov 2026).
+	MetricsAttemptsBetween(ctx context.Context, arg MetricsAttemptsBetweenParams) ([]MetricsAttemptsBetweenRow, error)
+	// Notifications that reached sent or failed in the whole minutes from
+	// from_minute on, per channel, status and latency bucket (finishes_per_minute
+	// primary key range).
+	MetricsFinishRollups(ctx context.Context, fromMinute time.Time) ([]MetricsFinishRollupsRow, error)
+	// Notifications that reached sent or failed in [from_time, until_time), one
+	// row each with its accept-to-sent latency in whole ms (0 for failed), from
+	// finished_idx (finished_at, status, channel, created_at, scheduled_at) alone.
+	// The latency is the expression of the rollup triggers in
+	// schema/notifications.sql. The caller buckets (latencyBucket) and counts
+	// them: 23 ms for 8,200 rows against 36 ms grouped by latency and 40 ms
+	// bucketed in SQL (1M rows, measured 16 Nov 2026).
+	MetricsFinishesBetween(ctx context.Context, arg MetricsFinishesBetweenParams) ([]MetricsFinishesBetweenRow, error)
 	// Every metrics statement runs in one read-only REPEATABLE READ transaction
 	// and takes the database clock, read once with SELECT NOW(3), as an
 	// argument, so the numbers of one summary agree with each other.
@@ -128,7 +158,8 @@ type Querier interface {
 	// oldest_due_age_ms is how long the oldest of those has waited.
 	MetricsQueue(ctx context.Context, arg MetricsQueueParams) ([]MetricsQueueRow, error)
 	// Pending notifications shown as scheduled (never tried, due after now): a
-	// claim_idx range over the not-yet-due pending rows, reading attempts.
+	// claim_idx range over the not-yet-due pending rows, from the index alone
+	// (attempts is its last column).
 	MetricsScheduled(ctx context.Context, now time.Time) (int64, error)
 	// Stored status counts over the whole table, from list_status_idx alone (an
 	// index scan, no table reads).
@@ -167,15 +198,27 @@ type Querier interface {
 	// batches are deleted once they are older than the retention, on the database
 	// clock, in bounded batches.
 	// Runs inside a READ COMMITTED transaction: up to LIMIT finished notifications
-	// past the retention, oldest first, through finished_idx (finished_at, status,
-	// channel). The rows are locked, so a replay waits for the delete (and then
+	// that finished before `before`, oldest first, through finished_idx. The
+	// caller sets before to the start of the minute the retention reaches into,
+	// the bound the metrics rollups are swept at too: a minute's rows and its
+	// rollup go together, so a metrics window (at most the retention) that starts
+	// in a minute finds both whole. The rows are locked, so a replay waits for the delete (and then
 	// finds nothing) instead of reviving a row whose history is being deleted;
 	// rows another sweeper or a replay holds are skipped.
 	RetentionCandidates(ctx context.Context, arg RetentionCandidatesParams) ([]string, error)
+	// Up to LIMIT attempts_per_minute rows of minutes before `before` (primary
+	// key range), the minute bound RetentionCandidates deletes rows at. Deleting a
+	// minute while rows it counts are kept, or keeping it while some are deleted,
+	// would make a window that starts in it subtract raw rows that no longer
+	// match its rollup (negative or inflated counts). The endpoint reads at most
+	// MaxMetricsWindow (1 h), which the retention's 1 h floor covers.
+	SweepAttemptRollups(ctx context.Context, arg SweepAttemptRollupsParams) (int64, error)
 	// Up to LIMIT batches older than the retention none of whose notifications is
 	// left (batches_created_idx, then batch_position_idx per batch). A batch's
 	// notifications are inserted with it, so an old batch never gains one.
 	SweepBatches(ctx context.Context, arg SweepBatchesParams) (int64, error)
+	// As SweepAttemptRollups, for finishes_per_minute.
+	SweepFinishRollups(ctx context.Context, arg SweepFinishRollupsParams) (int64, error)
 	// Forget up to 1000 keys older than the retention, on the database clock (the
 	// clock that set created_at), through idempotency_created_idx.
 	SweepIdempotencyKeys(ctx context.Context, retentionMs interface{}) (int64, error)

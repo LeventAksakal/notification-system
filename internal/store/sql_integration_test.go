@@ -59,6 +59,8 @@ func query(t testing.TB, name string, n int) string {
 func TestRetentionStatementsInSQL(t *testing.T) {
 	db, _ := support.MySQL(t)
 	keepUs := time.Hour.Microseconds()
+	// RetentionCandidates takes the start of the minute the retention reaches into.
+	before := time.Now().UTC().Add(-time.Hour).Truncate(time.Minute)
 
 	t.Run("each retention statement reads through its index", func(t *testing.T) {
 		for name, tc := range map[string]struct {
@@ -66,7 +68,7 @@ func TestRetentionStatementsInSQL(t *testing.T) {
 			args []any
 			key  string // the index the statement must read through
 		}{
-			"RetentionCandidates": {query(t, "RetentionCandidates", 0), []any{keepUs, 500}, "finished_idx"},
+			"RetentionCandidates": {query(t, "RetentionCandidates", 0), []any{before, 500}, "finished_idx"},
 			"DeleteAttemptsOf":    {query(t, "DeleteAttemptsOf", 2), []any{"a", "b"}, "attempts_notification_idx"},
 			"DeleteNotifications": {query(t, "DeleteNotifications", 2), []any{"a", "b"}, "PRIMARY"},
 			"SweepBatches":        {query(t, "SweepBatches", 0), []any{keepUs, 1000}, "batches_created_idx"},
@@ -103,7 +105,7 @@ func TestRetentionStatementsInSQL(t *testing.T) {
 			t.Fatalf("begin: %v", err)
 		}
 		defer func() { _ = tx.Rollback() }()
-		rows, err := tx.QueryContext(t.Context(), query(t, "RetentionCandidates", 0), keepUs, 500)
+		rows, err := tx.QueryContext(t.Context(), query(t, "RetentionCandidates", 0), before, 500)
 		if err != nil {
 			t.Fatalf("candidates: %v", err)
 		}
@@ -182,7 +184,7 @@ func TestRetentionStatementsInSQL(t *testing.T) {
 		}
 		defer func() { _ = sweep.Rollback() }()
 		st := time.Now()
-		rows, err := sweep.QueryContext(t.Context(), query(t, "RetentionCandidates", 0), keepUs, 500)
+		rows, err := sweep.QueryContext(t.Context(), query(t, "RetentionCandidates", 0), before, 500)
 		if err != nil {
 			t.Fatalf("candidates: %v", err)
 		}

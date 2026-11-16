@@ -5,6 +5,7 @@ package store_test
 import (
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -68,8 +69,8 @@ func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 		t.Fatal(err)
 	}
 	since := now.Add(-time.Minute)
+	edge := since.Truncate(time.Minute).Add(time.Minute)
 	qs := metricsQueries(t)
-	latency, latencyArgs := store.LatencyQuery(since)
 	cases := []struct {
 		name     string
 		query    string
@@ -80,9 +81,10 @@ func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 		{"queue", qs["MetricsQueue"], []any{now, now, now, now}, "claim_idx", false},
 		{"status counts", qs["MetricsStatusCounts"], nil, "list_status_idx", false},
 		{"scheduled", qs["MetricsScheduled"], []any{now}, "claim_idx", false},
-		{"finished in window", qs["MetricsFinished"], []any{since}, "finished_idx", true},
-		{"attempts in window", qs["MetricsAttempts"], []any{since}, "attempts_window_idx", true},
-		{"latency in window", latency, latencyArgs, "finished_idx", true},
+		{"attempt rollups", qs["MetricsAttemptRollups"], []any{edge}, "PRIMARY", true},
+		{"finish rollups", qs["MetricsFinishRollups"], []any{edge}, "PRIMARY", true},
+		{"attempts in the partial minute", qs["MetricsAttemptsBetween"], []any{since, edge}, "attempts_window_idx", true},
+		{"finishes in the partial minute", qs["MetricsFinishesBetween"], []any{since, edge}, "finished_idx", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -92,7 +94,7 @@ func TestMetricsQueriesUseTheirIndexes(t *testing.T) {
 			used := false
 			for _, row := range explain(t, db, tc.query, tc.args) {
 				table := row["table"]
-				if table != "notifications" && table != "delivery_attempts" {
+				if !slices.Contains([]string{"notifications", "delivery_attempts", "attempts_per_minute", "finishes_per_minute"}, table) {
 					continue
 				}
 				t.Logf("%s: table=%s type=%s key=%s extra=%s", tc.name, table, row["type"], row["key"], row["Extra"])
@@ -187,8 +189,9 @@ func TestMetricsReadCountsWhatIsStored(t *testing.T) {
 		t.Errorf("rates: %v %v", d.SuccessRate(), d.FailureRate())
 	}
 	// Latencies 100, 200, 300, 400 ms (each within a ms of it): nearest rank
-	// p50 = 2nd, p95 = p99 = 4th.
-	if l := d.Latency; l.P50 < 200 || l.P50 > 201 || l.P95 < 400 || l.P95 > 401 || l.P99 != l.P95 {
+	// p50 = 2nd, p95 = p99 = 4th, each estimated inside its latency bucket.
+	inBucket := func(got, exact int) bool { return store.LatencyBucket(int64(got)) == store.LatencyBucket(int64(exact)) }
+	if l := d.Latency; !inBucket(l.P50, 200) || !inBucket(l.P95, 400) || l.P99 != l.P95 {
 		t.Errorf("latency: %+v", l)
 	}
 	if m.ByChannel[2].Latency != d.Latency || m.ByChannel[0].Latency != (store.Latency{}) {

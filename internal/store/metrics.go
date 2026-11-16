@@ -19,7 +19,10 @@ type QueueDepth struct {
 	OldestPendingAgeMs int // age of the oldest due pending row; 0 when none
 }
 
-// Latency holds nearest-rank percentiles in milliseconds; zeros when empty.
+// Latency holds percentiles in milliseconds, zeros when empty: the nearest
+// rank located in the per-minute latency buckets and interpolated inside its
+// bucket, so each is within its bucket's width of the exact nearest-rank value
+// (exact to 16 ms, under 12.5% above; latency_buckets.go).
 type Latency struct{ P50, P95, P99 int }
 
 // Delivery is what happened in the window, for one channel or for all.
@@ -83,36 +86,13 @@ func NewMetricsReader(db *sql.DB) *MetricsReader {
 	return &MetricsReader{db: db, q: sqlc.New(db)}
 }
 
-// LatencyQuery returns the percentile statement and its arguments for the
-// window that starts at since. Latency runs from the first due time (the
-// creation, or the schedule when later; a retry or release moves due_at but
-// not this) to provider acceptance. Percentiles are computed in MySQL with
-// window functions (nearest rank: the value at row ceil(p*n) in latency
-// order), so only the rows at the ranks travel, whatever the rate times the
-// window is. The scan is a finished_idx range over the window's finished rows
-// (status = 'sent' is checked in the index; the times are read from the row).
-func LatencyQuery(since time.Time) (string, []any) {
-	return `WITH sent AS (
-  SELECT channel, GREATEST(CEIL(TIMESTAMPDIFF(MICROSECOND,
-    GREATEST(COALESCE(scheduled_at, created_at), created_at), finished_at) / 1000), 0) AS ms
-  FROM notifications FORCE INDEX (finished_idx)
-  WHERE finished_at >= ? AND status = 'sent'
-), ranked AS (
-  SELECT channel, ms,
-    ROW_NUMBER() OVER (PARTITION BY channel ORDER BY ms) AS rn,
-    COUNT(*) OVER (PARTITION BY channel) AS n,
-    ROW_NUMBER() OVER (ORDER BY ms) AS rn_all,
-    COUNT(*) OVER () AS n_all
-  FROM sent
-)
-SELECT CAST(channel AS CHAR), CAST(ms AS SIGNED), rn, n, rn_all, n_all FROM ranked
-WHERE rn IN (CEIL(0.5 * n), CEIL(0.95 * n), CEIL(0.99 * n))
-   OR rn_all IN (CEIL(0.5 * n_all), CEIL(0.95 * n_all), CEIL(0.99 * n_all))`, []any{since}
-}
-
 // Read computes the metrics, with delivery over the last window. Every query
 // runs in one read-only REPEATABLE READ transaction against one reading of
-// the database clock, so the numbers describe one moment and agree.
+// the database clock, so the numbers describe one moment and agree. Delivery
+// comes from the per-minute rollups plus at most half a minute of raw rows,
+// so its cost does not grow with the traffic in the window; queue depth and
+// the status totals are live index reads (the totals scan every kept row:
+// owner item 0017).
 func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics, error) {
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
 	if err != nil {
@@ -159,33 +139,18 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 	m.Totals["scheduled"] = int(scheduled)
 	m.Totals[string(notification.StatusPending)] = max(m.Totals[string(notification.StatusPending)]-int(scheduled), 0)
 
-	by := map[notification.Channel]*Delivery{}
-	for _, ch := range notification.Channels {
-		by[ch] = &Delivery{}
-	}
-	finished, err := q.MetricsFinished(ctx, sql.NullTime{Time: since, Valid: true})
+	by, err := delivery(ctx, q, since)
 	if err != nil {
-		return Metrics{}, fmt.Errorf("metrics finished: %w", err)
-	}
-	for _, f := range finished {
-		if d := by[notification.Channel(f.Channel)]; d != nil {
-			d.Sent, d.Failed = int(f.Sent), int(f.Failed)
-		}
-	}
-	attempts, err := q.MetricsAttempts(ctx, since)
-	if err != nil {
-		return Metrics{}, fmt.Errorf("metrics attempts: %w", err)
-	}
-	for _, a := range attempts {
-		if d := by[notification.Channel(a.Channel)]; d != nil {
-			d.Attempts, d.FailedAttempts, d.UnknownAttempts = int(a.Attempts), int(a.FailedAttempts), int(a.UnknownAttempts)
-		}
-	}
-	if err := latency(ctx, tx, since, by, &m.Delivery.Latency); err != nil {
 		return Metrics{}, err
 	}
+	all := latencyHistogram{}
 	for _, ch := range notification.Channels {
-		d := *by[ch]
+		all.add(by[ch].latency)
+	}
+	m.Delivery.Latency = all.percentiles()
+	for _, ch := range notification.Channels {
+		d := by[ch].Delivery
+		d.Latency = by[ch].latency.percentiles()
 		m.ByChannel = append(m.ByChannel, ChannelDelivery{Channel: ch, Delivery: d})
 		m.Delivery.Sent += d.Sent
 		m.Delivery.Failed += d.Failed
@@ -196,46 +161,103 @@ func (r *MetricsReader) Read(ctx context.Context, window time.Duration) (Metrics
 	return m, nil
 }
 
-func latency(ctx context.Context, tx *sql.Tx, since time.Time, by map[notification.Channel]*Delivery, all *Latency) error {
-	query, args := LatencyQuery(since)
-	rows, err := tx.QueryContext(ctx, query, args...)
+// channelDelivery is one channel's counts and latency buckets while they are summed.
+type channelDelivery struct {
+	Delivery
+	latency latencyHistogram
+}
+
+// delivery counts what happened in [since, now] per channel: whole minutes
+// from the rollups, and the partial first minute from the raw rows on the
+// same timestamps the rollup triggers truncate (started_at for attempts,
+// finished_at for notifications), so no outcome is counted twice or missed.
+// Of the partial minute m0 it reads the shorter side of since: the raw rows
+// of [since, m0+1min) added to the rollups from m0+1min, or those of
+// [m0, since) taken from the rollups from m0 (exact: a rollup row equals a
+// recount of its rows). At most halfMinute of raw rows, whatever the window.
+func delivery(ctx context.Context, q *sqlc.Queries, since time.Time) (map[notification.Channel]*channelDelivery, error) {
+	by := map[notification.Channel]*channelDelivery{}
+	for _, ch := range notification.Channels {
+		by[ch] = &channelDelivery{latency: latencyHistogram{}}
+	}
+	attempt := func(ch, outcome string, n int64) {
+		d := by[notification.Channel(ch)]
+		if d == nil {
+			return
+		}
+		// Attempts are calls with a result; in_flight counts nowhere and
+		// unknown only in its own count (owner item 0015).
+		switch notification.AttemptOutcome(outcome) {
+		case notification.OutcomeAccepted:
+			d.Attempts += int(n)
+		case notification.OutcomeTransient, notification.OutcomePermanent:
+			d.Attempts += int(n)
+			d.FailedAttempts += int(n)
+		case notification.OutcomeUnknown:
+			d.UnknownAttempts += int(n)
+		}
+	}
+	finish := func(ch, status string, le, n int64) {
+		d := by[notification.Channel(ch)]
+		if d == nil {
+			return
+		}
+		switch notification.Status(status) {
+		case notification.StatusSent:
+			d.Sent += int(n)
+			d.latency[le] += n
+		case notification.StatusFailed:
+			d.Failed += int(n)
+		}
+	}
+
+	m0 := since.Truncate(time.Minute)
+	from, rawFrom, rawUntil, sign := m0, since, since, int64(1) // since on a minute: no raw rows
+	switch {
+	case since.Equal(m0):
+	case since.Sub(m0) < halfMinute:
+		rawFrom, rawUntil, sign = m0, since, -1
+	default:
+		from, rawFrom, rawUntil = m0.Add(time.Minute), since, m0.Add(time.Minute)
+	}
+
+	attempts, err := q.MetricsAttemptRollups(ctx, from)
 	if err != nil {
-		return fmt.Errorf("metrics latency: %w", err)
+		return nil, fmt.Errorf("metrics attempt rollups: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var ch string
-		var ms, rn, n, rnAll, nAll int64
-		if err := rows.Scan(&ch, &ms, &rn, &n, &rnAll, &nAll); err != nil {
-			return fmt.Errorf("metrics latency: %w", err)
-		}
-		if d := by[notification.Channel(ch)]; d != nil {
-			setRank(&d.Latency, rn, n, ms)
-		}
-		setRank(all, rnAll, nAll, ms)
+	for _, a := range attempts {
+		attempt(string(a.Channel), string(a.Outcome), a.N)
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("metrics latency: %w", err)
+	finishes, err := q.MetricsFinishRollups(ctx, from)
+	if err != nil {
+		return nil, fmt.Errorf("metrics finish rollups: %w", err)
 	}
-	return nil
+	for _, f := range finishes {
+		finish(string(f.Channel), string(f.Status), int64(f.LatencyLeMs), f.N) //nolint:gosec // bucket bounds stay far below 2^63
+	}
+	if !rawUntil.After(rawFrom) {
+		return by, nil
+	}
+	rawAttempts, err := q.MetricsAttemptsBetween(ctx, sqlc.MetricsAttemptsBetweenParams{FromTime: rawFrom, UntilTime: rawUntil})
+	if err != nil {
+		return nil, fmt.Errorf("metrics attempts in [%s, %s): %w", rawFrom, rawUntil, err)
+	}
+	for _, a := range rawAttempts {
+		attempt(string(a.Channel), string(a.Outcome), sign)
+	}
+	rawFinishes, err := q.MetricsFinishesBetween(ctx, sqlc.MetricsFinishesBetweenParams{
+		FromTime: sql.NullTime{Time: rawFrom, Valid: true}, UntilTime: sql.NullTime{Time: rawUntil, Valid: true},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("metrics finishes in [%s, %s): %w", rawFrom, rawUntil, err)
+	}
+	for _, f := range rawFinishes {
+		finish(string(f.Channel), string(f.Status), latencyBucket(f.LatencyMs), sign)
+	}
+	return by, nil
 }
 
-// setRank stores ms in each percentile whose nearest rank is rn of n.
-func setRank(l *Latency, rn, n, ms int64) {
-	v := int(ms)
-	if rn == nearestRank(50, n) {
-		l.P50 = v
-	}
-	if rn == nearestRank(95, n) {
-		l.P95 = v
-	}
-	if rn == nearestRank(99, n) {
-		l.P99 = v
-	}
-}
-
-// nearestRank is ceil(pct/100 * n) in integers: the SQL's exact decimal
-// CEIL(0.95 * n), without float rounding.
-func nearestRank(pct, n int64) int64 {
-	return (pct*n + 99) / 100
-}
+// halfMinute splits the partial first minute of a window: below it the raw
+// rows before since are subtracted, from it those after are added, so the
+// raw read never covers more than half a minute.
+const halfMinute = 30 * time.Second

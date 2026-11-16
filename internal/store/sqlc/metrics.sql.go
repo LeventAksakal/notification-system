@@ -11,43 +11,128 @@ import (
 	"time"
 )
 
-const metricsAttempts = `-- name: MetricsAttempts :many
-SELECT
-  channel,
-  CAST(COALESCE(SUM(outcome IN ('accepted', 'transient', 'permanent')), 0) AS SIGNED) AS attempts,
-  CAST(COALESCE(SUM(outcome IN ('transient', 'permanent')), 0) AS SIGNED) AS failed_attempts,
-  CAST(COALESCE(SUM(outcome = 'unknown'), 0) AS SIGNED) AS unknown_attempts
-FROM delivery_attempts FORCE INDEX (attempts_window_idx)
-WHERE started_at >= ?
-GROUP BY channel
+const metricsAttemptRollups = `-- name: MetricsAttemptRollups :many
+
+SELECT channel, outcome, CAST(SUM(n) AS SIGNED) AS n
+FROM attempts_per_minute
+WHERE minute >= ?
+GROUP BY channel, outcome
 `
 
-type MetricsAttemptsRow struct {
-	Channel         DeliveryAttemptsChannel
-	Attempts        int64
-	FailedAttempts  int64
-	UnknownAttempts int64
+type MetricsAttemptRollupsRow struct {
+	Channel AttemptsPerMinuteChannel
+	Outcome AttemptsPerMinuteOutcome
+	N       int64
 }
 
-// Provider calls started in the window (since its start), per channel, from
-// attempts_window_idx (started_at, channel, outcome) alone. attempts are the
-// calls with a result (accepted, transient, permanent), as the API documents
-// them; a call still in flight counts nowhere; unknown (the result was never
-// recorded) is its own count, neither failed nor accepted.
-func (q *Queries) MetricsAttempts(ctx context.Context, since time.Time) ([]MetricsAttemptsRow, error) {
-	rows, err := q.db.QueryContext(ctx, metricsAttempts, since)
+// Delivery over a window [since, now] is read on the same timestamps the
+// rollup triggers truncate: whole minutes from the rollups, and the window's
+// partial first minute m0 from the raw rows, whichever side of since is
+// shorter: [since, m0 + 1 min) added to the rollups from m0 + 1 min, or
+// [m0, since) subtracted from the rollups from m0 (exact, as a rollup row
+// equals a recount of its rows). So at most 30 s of raw rows are read,
+// whatever the window; the current minute's rollup rows commit with the
+// outcomes they count.
+// Provider calls per channel and outcome in the whole minutes from
+// from_minute on (attempts_per_minute primary key range).
+func (q *Queries) MetricsAttemptRollups(ctx context.Context, fromMinute time.Time) ([]MetricsAttemptRollupsRow, error) {
+	rows, err := q.db.QueryContext(ctx, metricsAttemptRollups, fromMinute)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []MetricsAttemptsRow
+	var items []MetricsAttemptRollupsRow
 	for rows.Next() {
-		var i MetricsAttemptsRow
+		var i MetricsAttemptRollupsRow
+		if err := rows.Scan(&i.Channel, &i.Outcome, &i.N); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const metricsAttemptsBetween = `-- name: MetricsAttemptsBetween :many
+SELECT channel, outcome
+FROM delivery_attempts FORCE INDEX (attempts_window_idx)
+WHERE started_at >= ? AND started_at < ?
+`
+
+type MetricsAttemptsBetweenParams struct {
+	FromTime  time.Time
+	UntilTime time.Time
+}
+
+type MetricsAttemptsBetweenRow struct {
+	Channel DeliveryAttemptsChannel
+	Outcome DeliveryAttemptsOutcome
+}
+
+// Provider calls started in [from_time, until_time), one row each, from
+// attempts_window_idx (started_at, channel, outcome) alone. The caller counts
+// them: at most half a minute of rows (metrics.go, halfMinute), and sending
+// them costs less than MySQL's temporary-table GROUP BY (13 against 18 ms for
+// 8,300 rows at 1M rows, measured 16 Nov 2026).
+func (q *Queries) MetricsAttemptsBetween(ctx context.Context, arg MetricsAttemptsBetweenParams) ([]MetricsAttemptsBetweenRow, error) {
+	rows, err := q.db.QueryContext(ctx, metricsAttemptsBetween, arg.FromTime, arg.UntilTime)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []MetricsAttemptsBetweenRow
+	for rows.Next() {
+		var i MetricsAttemptsBetweenRow
+		if err := rows.Scan(&i.Channel, &i.Outcome); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const metricsFinishRollups = `-- name: MetricsFinishRollups :many
+SELECT channel, status, latency_le_ms, CAST(SUM(n) AS SIGNED) AS n
+FROM finishes_per_minute
+WHERE minute >= ?
+GROUP BY channel, status, latency_le_ms
+`
+
+type MetricsFinishRollupsRow struct {
+	Channel     FinishesPerMinuteChannel
+	Status      FinishesPerMinuteStatus
+	LatencyLeMs uint64
+	N           int64
+}
+
+// Notifications that reached sent or failed in the whole minutes from
+// from_minute on, per channel, status and latency bucket (finishes_per_minute
+// primary key range).
+func (q *Queries) MetricsFinishRollups(ctx context.Context, fromMinute time.Time) ([]MetricsFinishRollupsRow, error) {
+	rows, err := q.db.QueryContext(ctx, metricsFinishRollups, fromMinute)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []MetricsFinishRollupsRow
+	for rows.Next() {
+		var i MetricsFinishRollupsRow
 		if err := rows.Scan(
 			&i.Channel,
-			&i.Attempts,
-			&i.FailedAttempts,
-			&i.UnknownAttempts,
+			&i.Status,
+			&i.LatencyLeMs,
+			&i.N,
 		); err != nil {
 			return nil, err
 		}
@@ -62,35 +147,43 @@ func (q *Queries) MetricsAttempts(ctx context.Context, since time.Time) ([]Metri
 	return items, nil
 }
 
-const metricsFinished = `-- name: MetricsFinished :many
-SELECT
-  channel,
-  CAST(COALESCE(SUM(status = 'sent'), 0) AS SIGNED) AS sent,
-  CAST(COALESCE(SUM(status = 'failed'), 0) AS SIGNED) AS failed
+const metricsFinishesBetween = `-- name: MetricsFinishesBetween :many
+SELECT channel, status,
+  CAST(CASE WHEN status = 'sent' THEN CEIL(TIMESTAMPDIFF(MICROSECOND,
+    GREATEST(COALESCE(scheduled_at, created_at), created_at), finished_at) / 1000) ELSE 0 END AS SIGNED) AS latency_ms
 FROM notifications FORCE INDEX (finished_idx)
-WHERE finished_at >= ?
+WHERE finished_at >= ? AND finished_at < ?
   AND status IN ('sent', 'failed')
-GROUP BY channel
 `
 
-type MetricsFinishedRow struct {
-	Channel NotificationsChannel
-	Sent    int64
-	Failed  int64
+type MetricsFinishesBetweenParams struct {
+	FromTime  sql.NullTime
+	UntilTime sql.NullTime
 }
 
-// Notifications that reached sent or failed in the window (since its
-// start), per channel, from finished_idx (finished_at, status, channel) alone.
-func (q *Queries) MetricsFinished(ctx context.Context, since sql.NullTime) ([]MetricsFinishedRow, error) {
-	rows, err := q.db.QueryContext(ctx, metricsFinished, since)
+type MetricsFinishesBetweenRow struct {
+	Channel   NotificationsChannel
+	Status    NotificationsStatus
+	LatencyMs int64
+}
+
+// Notifications that reached sent or failed in [from_time, until_time), one
+// row each with its accept-to-sent latency in whole ms (0 for failed), from
+// finished_idx (finished_at, status, channel, created_at, scheduled_at) alone.
+// The latency is the expression of the rollup triggers in
+// schema/notifications.sql. The caller buckets (latencyBucket) and counts
+// them: 23 ms for 8,200 rows against 36 ms grouped by latency and 40 ms
+// bucketed in SQL (1M rows, measured 16 Nov 2026).
+func (q *Queries) MetricsFinishesBetween(ctx context.Context, arg MetricsFinishesBetweenParams) ([]MetricsFinishesBetweenRow, error) {
+	rows, err := q.db.QueryContext(ctx, metricsFinishesBetween, arg.FromTime, arg.UntilTime)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []MetricsFinishedRow
+	var items []MetricsFinishesBetweenRow
 	for rows.Next() {
-		var i MetricsFinishedRow
-		if err := rows.Scan(&i.Channel, &i.Sent, &i.Failed); err != nil {
+		var i MetricsFinishesBetweenRow
+		if err := rows.Scan(&i.Channel, &i.Status, &i.LatencyMs); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -189,7 +282,8 @@ WHERE status = 'pending' AND due_at > ? AND attempts = 0
 `
 
 // Pending notifications shown as scheduled (never tried, due after now): a
-// claim_idx range over the not-yet-due pending rows, reading attempts.
+// claim_idx range over the not-yet-due pending rows, from the index alone
+// (attempts is its last column).
 func (q *Queries) MetricsScheduled(ctx context.Context, now time.Time) (int64, error) {
 	row := q.db.QueryRowContext(ctx, metricsScheduled, now)
 	var n int64

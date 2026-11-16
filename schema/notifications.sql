@@ -82,7 +82,10 @@ CREATE TABLE notifications (
   CONSTRAINT template_origin_complete CHECK (((`template_name` is null) = (`template_version` is null))),
   CONSTRAINT template_origin_version_positive CHECK ((`template_version` >= 1)),
   -- The claim: WHERE status='pending' AND channel=? AND priority=? AND due_at<=NOW(3) ORDER BY due_at.
-  KEY claim_idx (status, channel, priority, due_at),
+  -- attempts after due_at leaves the claim's order alone and lets the metrics'
+  -- scheduled count (pending, due later, never tried) read the index alone: with
+  -- 20,000 such rows the table lookups took 6.6 s on a cold buffer pool.
+  KEY claim_idx (status, channel, priority, due_at, attempts),
   -- The reaper: WHERE status='processing' AND lease_until < NOW(3).
   KEY lease_idx (status, lease_until),
   -- Batch items in request order, one row per position.
@@ -91,7 +94,9 @@ CREATE TABLE notifications (
   KEY list_channel_idx (channel, id),
   KEY list_status_idx (status, id),
   -- Metrics: what finished inside a window. Retention: WHERE finished_at < ? (decision 0025).
-  KEY finished_idx (finished_at, status, channel)
+  -- created_at and scheduled_at make the metrics' partial-minute latency read
+  -- (MetricsFinishesBetween) index-only: 37 ms for 13 s of rows with table lookups.
+  KEY finished_idx (finished_at, status, channel, created_at, scheduled_at)
 );
 
 -- Only the triggers write status_from, so status_transition sees every status
@@ -168,3 +173,94 @@ CREATE TRIGGER delivery_attempts_outcome_from_update BEFORE UPDATE ON delivery_a
   END IF;
 END;
 
+
+-- The metrics rollups (schema/delivery_rollups.sql) are pre-computed views of
+-- the rows below: a rollup row holds what MetricsFinishesBetween or
+-- MetricsAttemptsBetween (internal/store/queries/metrics.sql) count for its
+-- minute. These triggers keep them so in the transaction that changes a row,
+-- whoever writes it: a change takes the row's old contribution out (never
+-- below 0, for rows older than the rollups) and puts its new one in. Deletes
+-- (retention) leave the rollups alone; they have their own retention
+-- (decision 0014, "As built"). A take-out goes to the key's first shard that
+-- holds a count; if it changed nothing it runs once more: a take-out that
+-- waited on a fold (store.FoldRollups) resumes past the shard 0 row the fold
+-- inserted, and finds the shards it scans deleted. The second run sees that
+-- shard 0, which folds never delete. A take-out that finds nothing twice is a
+-- row older than the rollups. The latency is the expression of
+-- MetricsFinishesBetween; the bucket expression is latencyBucket in
+-- internal/store/latency_buckets.go, which metrics_rollup_integration_test.go
+-- holds it equal to.
+CREATE TRIGGER notifications_finish_rollup_insert AFTER INSERT ON notifications FOR EACH ROW BEGIN
+  DECLARE ms BIGINT;
+  IF NEW.status IN ('sent', 'failed') AND NEW.finished_at IS NOT NULL THEN
+    SET ms = CAST(CEIL(TIMESTAMPDIFF(MICROSECOND, GREATEST(COALESCE(NEW.scheduled_at, NEW.created_at), NEW.created_at), NEW.finished_at) / 1000) AS SIGNED);
+    INSERT INTO finishes_per_minute (minute, channel, status, latency_le_ms, shard, n)
+    VALUES (NEW.finished_at - INTERVAL (SECOND(NEW.finished_at) * 1000000 + MICROSECOND(NEW.finished_at)) MICROSECOND, NEW.channel, NEW.status,
+      CASE WHEN NEW.status <> 'sent' OR ms <= 0 THEN 0
+        ELSE (((ms - 1) >> GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0)) + 1) << GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0) END, CRC32(NEW.id) % 4, 1)
+    ON DUPLICATE KEY UPDATE n = n + 1;
+  END IF;
+END;
+
+CREATE TRIGGER notifications_finish_rollup_update AFTER UPDATE ON notifications FOR EACH ROW BEGIN
+  DECLARE ms BIGINT;
+  IF NOT (NEW.status <=> OLD.status AND NEW.finished_at <=> OLD.finished_at AND NEW.channel <=> OLD.channel
+      AND NEW.created_at <=> OLD.created_at AND NEW.scheduled_at <=> OLD.scheduled_at) THEN
+    IF OLD.status IN ('sent', 'failed') AND OLD.finished_at IS NOT NULL THEN
+      SET ms = CAST(CEIL(TIMESTAMPDIFF(MICROSECOND, GREATEST(COALESCE(OLD.scheduled_at, OLD.created_at), OLD.created_at), OLD.finished_at) / 1000) AS SIGNED);
+      UPDATE finishes_per_minute SET n = n - 1
+      WHERE minute = OLD.finished_at - INTERVAL (SECOND(OLD.finished_at) * 1000000 + MICROSECOND(OLD.finished_at)) MICROSECOND
+        AND channel = OLD.channel AND status = OLD.status AND n > 0
+        AND latency_le_ms = CASE WHEN OLD.status <> 'sent' OR ms <= 0 THEN 0
+          ELSE (((ms - 1) >> GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0)) + 1) << GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0) END
+      ORDER BY shard LIMIT 1;
+      IF ROW_COUNT() = 0 THEN -- a fold committed shard 0 behind this scan while it waited (see below)
+        UPDATE finishes_per_minute SET n = n - 1
+        WHERE minute = OLD.finished_at - INTERVAL (SECOND(OLD.finished_at) * 1000000 + MICROSECOND(OLD.finished_at)) MICROSECOND
+          AND channel = OLD.channel AND status = OLD.status AND n > 0
+          AND latency_le_ms = CASE WHEN OLD.status <> 'sent' OR ms <= 0 THEN 0
+            ELSE (((ms - 1) >> GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0)) + 1) << GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0) END
+        ORDER BY shard LIMIT 1;
+      END IF;
+    END IF;
+    IF NEW.status IN ('sent', 'failed') AND NEW.finished_at IS NOT NULL THEN
+      SET ms = CAST(CEIL(TIMESTAMPDIFF(MICROSECOND, GREATEST(COALESCE(NEW.scheduled_at, NEW.created_at), NEW.created_at), NEW.finished_at) / 1000) AS SIGNED);
+      INSERT INTO finishes_per_minute (minute, channel, status, latency_le_ms, shard, n)
+      VALUES (NEW.finished_at - INTERVAL (SECOND(NEW.finished_at) * 1000000 + MICROSECOND(NEW.finished_at)) MICROSECOND, NEW.channel, NEW.status,
+        CASE WHEN NEW.status <> 'sent' OR ms <= 0 THEN 0
+          ELSE (((ms - 1) >> GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0)) + 1) << GREATEST(CHAR_LENGTH(BIN(ms - 1)) - 4, 0) END, CRC32(NEW.id) % 4, 1)
+      ON DUPLICATE KEY UPDATE n = n + 1;
+    END IF;
+  END IF;
+END;
+
+-- in_flight is not an outcome yet and counts nowhere.
+CREATE TRIGGER delivery_attempts_rollup_insert AFTER INSERT ON delivery_attempts FOR EACH ROW BEGIN
+  IF NEW.outcome IN ('accepted', 'transient', 'permanent', 'unknown') THEN
+    INSERT INTO attempts_per_minute (minute, channel, outcome, shard, n)
+    VALUES (NEW.started_at - INTERVAL (SECOND(NEW.started_at) * 1000000 + MICROSECOND(NEW.started_at)) MICROSECOND, NEW.channel, NEW.outcome, NEW.id % 4, 1)
+    ON DUPLICATE KEY UPDATE n = n + 1;
+  END IF;
+END;
+
+CREATE TRIGGER delivery_attempts_rollup_update AFTER UPDATE ON delivery_attempts FOR EACH ROW BEGIN
+  IF NOT (NEW.outcome <=> OLD.outcome AND NEW.started_at <=> OLD.started_at AND NEW.channel <=> OLD.channel) THEN
+    IF OLD.outcome IN ('accepted', 'transient', 'permanent', 'unknown') THEN
+      UPDATE attempts_per_minute SET n = n - 1
+      WHERE minute = OLD.started_at - INTERVAL (SECOND(OLD.started_at) * 1000000 + MICROSECOND(OLD.started_at)) MICROSECOND
+        AND channel = OLD.channel AND outcome = OLD.outcome AND n > 0
+      ORDER BY shard LIMIT 1;
+      IF ROW_COUNT() = 0 THEN -- a fold committed shard 0 behind this scan while it waited
+        UPDATE attempts_per_minute SET n = n - 1
+        WHERE minute = OLD.started_at - INTERVAL (SECOND(OLD.started_at) * 1000000 + MICROSECOND(OLD.started_at)) MICROSECOND
+          AND channel = OLD.channel AND outcome = OLD.outcome AND n > 0
+        ORDER BY shard LIMIT 1;
+      END IF;
+    END IF;
+    IF NEW.outcome IN ('accepted', 'transient', 'permanent', 'unknown') THEN
+      INSERT INTO attempts_per_minute (minute, channel, outcome, shard, n)
+      VALUES (NEW.started_at - INTERVAL (SECOND(NEW.started_at) * 1000000 + MICROSECOND(NEW.started_at)) MICROSECOND, NEW.channel, NEW.outcome, NEW.id % 4, 1)
+      ON DUPLICATE KEY UPDATE n = n + 1;
+    END IF;
+  END IF;
+END;
