@@ -11,6 +11,7 @@ Integration branch: `refs/heads/integration/decision-review`, checked out in `C:
 | 6873097 | provider-health (0008 → 0026): shared outage state; `APP_MAX_ATTEMPTS` 10 |
 | af16e3a | trace-correlation (0019): sampler env vars, stored correlation id on every line |
 | 5eb668f | db-rules-retention (0005, 0025): state machine in MySQL, write-ahead attempts, retention |
+| 34bc20d | reschedule (0016): PATCH reschedule, horizon on the database clock |
 
 ## Protocol for every lane
 1. Finish your work and your verifier on your own branch, as briefed. Do not merge other lanes into your branch.
