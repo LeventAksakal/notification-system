@@ -1,3 +1,9 @@
 * text=auto eol=lf
 *.png binary
 *.jpg binary
+# Generated: GitHub collapses their diffs; edit the source and run `task gen` (decisions 0024, 0027).
+*.gen.go linguist-generated
+internal/store/sqlc/** linguist-generated
+internal/store/schema.gen.sql linguist-generated
+api/openapi.yaml linguist-generated
+api/asyncapi.yaml linguist-generated

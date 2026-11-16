@@ -15,7 +15,10 @@
   "files.readonlyInclude": {
     "**/*.gen.go": true,
     "internal/store/sqlc/**": true,
-    "migrations/*.sql": true
+    "migrations/*.sql": true,
+    "internal/store/schema.gen.sql": true,
+    "api/openapi.yaml": true,
+    "api/asyncapi.yaml": true
   },
 
   "yaml.schemas": {

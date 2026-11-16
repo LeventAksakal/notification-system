@@ -1,7 +1,7 @@
 {
   "_doc": "Who may write what. Read by tools/agentguard (PreToolUse hook, fast feedback) and by the merge ownership check (catches Bash writes). Main thread = coordinator.",
-  "generated": ["**/*.gen.go", "internal/store/sqlc/**", "migrations/**", "api/openapi.yaml"],
-  "contracts": ["api/**", "schema/**", "internal/notification/**", "internal/httpapi/contract.go", "internal/httpapi/api.go"],
+  "generated": ["**/*.gen.go", "internal/store/sqlc/**", "migrations/**", "internal/store/schema.gen.sql", "api/openapi.yaml", "api/asyncapi.yaml"],
+  "contracts": ["api/**", "schema/**", "internal/notification/**", "internal/httpapi/contract.go", "internal/httpapi/api.go", "internal/httpapi/reschedule.go", "internal/httpapi/template_versioning.go", "internal/httpapi/stream_event.go", "internal/httpapi/wscontract/**"],
   "bash_deny": [
     "git push --force",
     "git push -f",
