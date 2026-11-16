@@ -22,3 +22,6 @@ Option 2, the owner's choice. `core` became `notification` ("core" names nothing
 
 ## Confirmation
 `go build ./...`; `.claude/agent-policy.json` lists the contracts (`api/**`, `schema/**`, `internal/notification/**`) and `tools/ownercheck` enforces them at merge; `grep -rn 'type statusEvent' internal/` finds nothing.
+
+## Superseded in part (16 Nov 2026)
+The sentence "AsyncAPI was considered for the WebSocket contract and not adopted" is superseded by 0027: the stream now has a snapshot, ordered status messages, a 503 refusal and close codes, and the owner asked for its contract to be published alongside the HTTP one.

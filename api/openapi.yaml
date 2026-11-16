@@ -216,13 +216,15 @@ components:
     Error:
       properties:
         code:
-          description: invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, precondition_failed, precondition_required, idempotency_key_reused, request_too_large, internal
+          description: "Machine-readable cause, one of: invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, precondition_failed, precondition_required, idempotency_key_reused, request_too_large, unavailable, internal"
           type: string
         details:
+          description: One entry per broken rule on an invalid_request; absent otherwise
           items:
             $ref: "#/components/schemas/ErrorDetail"
           type: array
         message:
+          description: A human-readable summary; not stable, do not parse it
           type: string
       required:
         - code
@@ -234,6 +236,7 @@ components:
           description: On `If-Match` (412, 428), the template's current version; absent when the template does not exist
           type: integer
         field:
+          description: The JSON field the rule applies to, as a dotted path from the request body (to, template.variables, scheduledAt)
           type: string
         index:
           description: Position of the item in a batch request
@@ -244,6 +247,7 @@ components:
             type: string
           type: array
         reason:
+          description: What is wrong with the field, in words a person can act on
           type: string
         required:
           description: On `template.variables`, the variables the template uses, in order of first appearance
@@ -515,18 +519,24 @@ components:
       description: One message on the WebSocket stream
       properties:
         at:
+          description: When the change was made, by the server's clock, in UTC (RFC 3339). On a snapshot, when the notification last changed
           format: date-time
           type: string
         attempts:
+          description: Delivery attempts that have ended so far (the provider answered, the call failed, or the worker's lease ran out); 0 before the first one ends and again after a replay
           type: integer
         batchId:
+          description: The batch the notification was created in; absent for a notification created on its own
           format: uuid
           type: string
         correlationId:
+          description: The `X-Correlation-ID` stored with the notification when it was created; every log line and trace about it carries the same id
           type: string
         error:
+          description: The last delivery error recorded for the notification, as text for a person; absent when none was recorded. Branch on `status`, not on this text
           type: string
         notificationId:
+          description: "The notification this message is about: its `id` in the REST API (GET /v1/notifications/{id}). Lower case, with hyphens"
           format: uuid
           type: string
         seq:
@@ -538,6 +548,7 @@ components:
           type: boolean
         status:
           $ref: "#/components/schemas/Status"
+          description: The notification's status after this change. A snapshot shows it as GET /v1/notifications/{id} does, so it may be `scheduled`; a change shows the stored status, never `scheduled` (a notification created with a future due time arrives as `pending`)
       required:
         - notificationId
         - status
@@ -1253,6 +1264,8 @@ paths:
         - `1008`: the subscriber fell behind and events were dropped (the send buffer, APP_WS_SEND_BUFFER, filled); resubscribe.
         - `1012`: the server lost its event feed, so changes may be missing; reconnect (503 until the feed is back) and read the snapshot.
         - `1001`: the server is shutting down; reconnect.
+        - `1008`: the client sent a data message; clients send none on this stream.
+        - `1002`: the client broke the WebSocket framing (an unmasked or fragmented control frame, reserved bits or an unknown opcode); the reason is the library's description of the fault.
       operationId: streamEvents
       parameters:
         - in: query

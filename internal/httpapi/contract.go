@@ -339,9 +339,9 @@ const (
 
 // ErrorDetail names one broken rule. Field order is the wire order.
 type ErrorDetail struct {
-	Field    string   `json:"field"`
+	Field    string   `json:"field" doc:"The JSON field the rule applies to, as a dotted path from the request body (to, template.variables, scheduledAt)"`
 	Index    *int     `json:"index,omitempty" doc:"Position of the item in a batch request"`
-	Reason   string   `json:"reason"`
+	Reason   string   `json:"reason" doc:"What is wrong with the field, in words a person can act on"`
 	Required []string "json:\"required,omitzero\" doc:\"On `template.variables`, the variables the template uses, in order of first appearance\""
 	Missing  []string "json:\"missing,omitzero\" doc:\"On `template.variables`, the required variables the request did not send\""
 	// Unknown is a non-nil empty slice on a template.variables detail, so it
@@ -356,7 +356,7 @@ type Error struct {
 	status  int
 	headers map[string]string
 
-	Code    string        `json:"code" doc:"invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, precondition_failed, precondition_required, idempotency_key_reused, request_too_large, internal"`
-	Details []ErrorDetail `json:"details,omitempty"`
-	Message string        `json:"message"`
+	Code    string        `json:"code" doc:"Machine-readable cause, one of: invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, precondition_failed, precondition_required, idempotency_key_reused, request_too_large, unavailable, internal"`
+	Details []ErrorDetail `json:"details,omitempty" doc:"One entry per broken rule on an invalid_request; absent otherwise"`
+	Message string        `json:"message" doc:"A human-readable summary; not stable, do not parse it"`
 }

@@ -28,3 +28,4 @@ Record 0004 in this folder is still `proposed` (the owner rejected it on 15 Nov 
 - [The server's endpoint code owns the HTTP contract; the spec and clients are generated from it (0024)](0024-server-code-owns-the-http-contract.md)
 - [Finished notifications and their attempts are deleted after APP_NOTIFICATION_RETENTION (0025)](0025-finished-notifications-expire.md)
 - [Provider health is shared in Valkey per channel; a failure counts against a message only while its provider is believed healthy (0026)](0026-provider-health-shared-outages-spend-no-budget.md)
+- [The WebSocket contract is an AsyncAPI document generated from the server's types (0027)](0027-websocket-contract-is-generated-asyncapi.md)

@@ -81,7 +81,7 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	for _, p := range []struct {
 		name string
 		dst  *string
-	}{{"notificationId", &f.NotificationID}, {"batchId", &f.BatchID}} {
+	}{{queryNotificationID, &f.NotificationID}, {queryBatchID, &f.BatchID}} {
 		name, dst := p.name, p.dst
 		v := q.Get(name)
 		if v == "" {

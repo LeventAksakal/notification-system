@@ -235,24 +235,32 @@ type DeliveryTotals struct {
 
 // Error defines model for Error.
 type Error struct {
-	// Code invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, precondition_failed, precondition_required, idempotency_key_reused, request_too_large, internal
-	Code    string         `json:"code"`
+	// Code Machine-readable cause, one of: invalid_request, not_found, not_cancellable, not_retryable, not_reschedulable, precondition_failed, precondition_required, idempotency_key_reused, request_too_large, unavailable, internal
+	Code string `json:"code"`
+
+	// Details One entry per broken rule on an invalid_request; absent otherwise
 	Details *[]ErrorDetail `json:"details,omitempty"`
-	Message string         `json:"message"`
+
+	// Message A human-readable summary; not stable, do not parse it
+	Message string `json:"message"`
 }
 
 // ErrorDetail defines model for ErrorDetail.
 type ErrorDetail struct {
 	// CurrentVersion On `If-Match` (412, 428), the template's current version; absent when the template does not exist
-	CurrentVersion *int   `json:"currentVersion,omitempty"`
-	Field          string `json:"field"`
+	CurrentVersion *int `json:"currentVersion,omitempty"`
+
+	// Field The JSON field the rule applies to, as a dotted path from the request body (to, template.variables, scheduledAt)
+	Field string `json:"field"`
 
 	// Index Position of the item in a batch request
 	Index *int `json:"index,omitempty"`
 
 	// Missing On `template.variables`, the required variables the request did not send
 	Missing *[]string `json:"missing,omitempty"`
-	Reason  string    `json:"reason"`
+
+	// Reason What is wrong with the field, in words a person can act on
+	Reason string `json:"reason"`
 
 	// Required On `template.variables`, the variables the template uses, in order of first appearance
 	Required *[]string `json:"required,omitempty"`
@@ -394,12 +402,23 @@ type StatusCounts struct {
 
 // StatusEvent One message on the WebSocket stream
 type StatusEvent struct {
-	At             time.Time           `json:"at"`
-	Attempts       int                 `json:"attempts"`
-	BatchId        *openapi_types.UUID `json:"batchId,omitempty"`
-	CorrelationId  string              `json:"correlationId"`
-	Error          *string             `json:"error,omitempty"`
-	NotificationId openapi_types.UUID  `json:"notificationId"`
+	// At When the change was made, by the server's clock, in UTC (RFC 3339). On a snapshot, when the notification last changed
+	At time.Time `json:"at"`
+
+	// Attempts Delivery attempts that have ended so far (the provider answered, the call failed, or the worker's lease ran out); 0 before the first one ends and again after a replay
+	Attempts int `json:"attempts"`
+
+	// BatchId The batch the notification was created in; absent for a notification created on its own
+	BatchId *openapi_types.UUID `json:"batchId,omitempty"`
+
+	// CorrelationId The `X-Correlation-ID` stored with the notification when it was created; every log line and trace about it carries the same id
+	CorrelationId string `json:"correlationId"`
+
+	// Error The last delivery error recorded for the notification, as text for a person; absent when none was recorded. Branch on `status`, not on this text
+	Error *string `json:"error,omitempty"`
+
+	// NotificationId The notification this message is about: its `id` in the REST API (GET /v1/notifications/{id}). Lower case, with hyphens
+	NotificationId openapi_types.UUID `json:"notificationId"`
 
 	// Seq The notification's status sequence: 1 at creation, one more with every status change. A stream sends a notification's events in this order without repeats; a gap means a change was lost, read the notification. Absent when unknown
 	Seq *int `json:"seq,omitempty"`
@@ -793,6 +812,8 @@ type ClientInterface interface {
 	// - `1008`: the subscriber fell behind and events were dropped (the send buffer, APP_WS_SEND_BUFFER, filled); resubscribe.
 	// - `1012`: the server lost its event feed, so changes may be missing; reconnect (503 until the feed is back) and read the snapshot.
 	// - `1001`: the server is shutting down; reconnect.
+	// - `1008`: the client sent a data message; clients send none on this stream.
+	// - `1002`: the client broke the WebSocket framing (an unmasked or fragmented control frame, reserved bits or an unknown opcode); the reason is the library's description of the fault.
 	//
 	// Corresponds with GET /v1/ws (the `StreamEvents` operationId).
 	StreamEvents(ctx context.Context, params *StreamEventsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -1164,6 +1185,8 @@ func (c *Client) PutTemplate(ctx context.Context, name TemplateName, params *Put
 // - `1008`: the subscriber fell behind and events were dropped (the send buffer, APP_WS_SEND_BUFFER, filled); resubscribe.
 // - `1012`: the server lost its event feed, so changes may be missing; reconnect (503 until the feed is back) and read the snapshot.
 // - `1001`: the server is shutting down; reconnect.
+// - `1008`: the client sent a data message; clients send none on this stream.
+// - `1002`: the client broke the WebSocket framing (an unmasked or fragmented control frame, reserved bits or an unknown opcode); the reason is the library's description of the fault.
 //
 // Corresponds with GET /v1/ws (the `StreamEvents` operationId).
 func (c *Client) StreamEvents(ctx context.Context, params *StreamEventsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
@@ -2231,6 +2254,8 @@ type ClientWithResponsesInterface interface {
 	// - `1008`: the subscriber fell behind and events were dropped (the send buffer, APP_WS_SEND_BUFFER, filled); resubscribe.
 	// - `1012`: the server lost its event feed, so changes may be missing; reconnect (503 until the feed is back) and read the snapshot.
 	// - `1001`: the server is shutting down; reconnect.
+	// - `1008`: the client sent a data message; clients send none on this stream.
+	// - `1002`: the client broke the WebSocket framing (an unmasked or fragmented control frame, reserved bits or an unknown opcode); the reason is the library's description of the fault.
 	//
 	// Returns a wrapper object for the known response body format(s).
 	//
@@ -3649,6 +3674,8 @@ func (c *ClientWithResponses) PutTemplateWithResponse(ctx context.Context, name 
 // - `1008`: the subscriber fell behind and events were dropped (the send buffer, APP_WS_SEND_BUFFER, filled); resubscribe.
 // - `1012`: the server lost its event feed, so changes may be missing; reconnect (503 until the feed is back) and read the snapshot.
 // - `1001`: the server is shutting down; reconnect.
+// - `1008`: the client sent a data message; clients send none on this stream.
+// - `1002`: the client broke the WebSocket framing (an unmasked or fragmented control frame, reserved bits or an unknown opcode); the reason is the library's description of the fault.
 //
 // Returns a wrapper object for the known response body format(s).
 //

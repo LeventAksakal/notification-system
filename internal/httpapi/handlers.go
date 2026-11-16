@@ -82,6 +82,7 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.Handle("GET /openapi.json", specHandler(spec))
 	mux.Handle("GET /docs", docsHandler())
 	mux.Handle("GET "+scalarPath, scalarHandler())
+	mux.Handle("GET /asyncapi.yaml", asyncAPIHandler())
 	mux.HandleFunc("GET /v1/ws", s.streamEvents)
 	mux.Handle("/", withTimeout(s.requestTimeout, contract))
 	return otelhttp.NewHandler(withCorrelation(limitBody(mux)), "http",
