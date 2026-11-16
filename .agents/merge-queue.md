@@ -12,6 +12,7 @@ Integration branch: `refs/heads/integration/decision-review`, checked out in `C:
 | af16e3a | trace-correlation (0019): sampler env vars, stored correlation id on every line |
 | 5eb668f | db-rules-retention (0005, 0025): state machine in MySQL, write-ahead attempts, retention |
 | 34bc20d | reschedule (0016): PATCH reschedule, horizon on the database clock |
+| 341630c | realtime-seq (0013): status_seq ordering, MySQL-only readiness, 503/1012 in the contract |
 
 ## Protocol for every lane
 1. Finish your work and your verifier on your own branch, as briefed. Do not merge other lanes into your branch.
