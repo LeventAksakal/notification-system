@@ -17,6 +17,7 @@ Integration branch: `refs/heads/integration/decision-review`, checked out in `C:
 | aaeb893 | adaptive-align (0009): alignment follows measured claim latency |
 | ce1fd26 | limits-standards (0017): every limit cited, blank content refused at every layer |
 | efd3d6b | metrics-rollup (0014): per-minute rollups and latency buckets |
+| f7bef32 | dials-derived (0018): every dial derived, config cross-checks |
 
 ## Protocol for every lane
 1. Finish your work and your verifier on your own branch, as briefed. Do not merge other lanes into your branch.
