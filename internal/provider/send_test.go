@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -69,6 +72,141 @@ func TestSendTimeout(t *testing.T) {
 	}
 	if v := Classify(0, err, nil); v.Outcome != notification.OutcomeTransient {
 		t.Errorf("timeout classified %s", v.Outcome)
+	}
+}
+
+// A failed call is ErrNotSent only when no byte of it can have left: the
+// worker then gives the job back instead of recording an attempt the
+// provider never saw (decision 0005).
+func TestSendTellsACallThatNeverLeftFromOneThatMayHave(t *testing.T) {
+	const timeout = 50 * time.Millisecond // short: every case ends in it or sooner
+	cases := []struct {
+		name    string
+		url     func(t *testing.T) string
+		dial    func(ctx context.Context, network, addr string) (net.Conn, error) // nil: the default dialer
+		notSent bool
+	}{
+		{"a request the provider received but did not answer may have left", func(t *testing.T) string {
+			srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				<-r.Context().Done()
+			}))
+			t.Cleanup(srv.Close)
+			return srv.URL
+		}, nil, false},
+		{"a call that never got a connection did not leave", func(*testing.T) string { return "http://192.0.2.1/send" },
+			func(ctx context.Context, _, _ string) (net.Conn, error) { <-ctx.Done(); return nil, ctx.Err() }, true},
+		{"a refused dial did not leave", func(t *testing.T) string {
+			ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := ln.Addr().String()
+			_ = ln.Close()
+			return "http://" + addr + "/send"
+		}, nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(map[notification.Channel]string{notification.ChannelSMS: tc.url(t)}, timeout, 1)
+			if tc.dial != nil {
+				c.http.Transport.(*http.Transport).DialContext = tc.dial
+			}
+			_, err := c.Send(context.Background(), Message{Channel: notification.ChannelSMS, Key: "k"})
+			if err == nil {
+				t.Fatal("want an error")
+			}
+			if got := errors.Is(err, ErrNotSent); got != tc.notSent {
+				t.Fatalf("ErrNotSent = %v, want %v (err: %v)", got, tc.notSent, err)
+			}
+		})
+	}
+}
+
+// Under contention many calls time out at every stage (dialling, before the
+// write, after it). Whatever the stage, a call reported ErrNotSent never
+// reached the server, so the worker's attempt rows match the requests the
+// provider saw.
+func TestSendNeverReportsNotSentForARequestTheServerReceived(t *testing.T) {
+	const (
+		calls = 400                    // enough that every timeout stage occurs on a loaded runner
+		quiet = 300 * time.Millisecond // late arrivals after the clients gave up
+	)
+	var mu sync.Mutex
+	received := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		received[r.Header.Get("Idempotency-Key")]++
+		mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	urls := map[notification.Channel]string{notification.ChannelSMS: srv.URL}
+	notSent, failed := make([]bool, calls), make([]bool, calls)
+	var wg sync.WaitGroup
+	for i := range calls {
+		// Timeouts from 0.5 ms to 20 ms, spread over 40 steps: from "before
+		// any dial" to "answered" on a loaded runner (measured: every stage
+		// occurs with GOMAXPROCS=1).
+		c := New(urls, time.Duration(500+i%40*500)*time.Microsecond, 4)
+		wg.Go(func() {
+			_, err := c.Send(context.Background(), Message{Channel: notification.ChannelSMS, Key: fmt.Sprint(i)})
+			notSent[i], failed[i] = errors.Is(err, ErrNotSent), err != nil
+		})
+	}
+	wg.Wait()
+	time.Sleep(quiet)
+	mu.Lock()
+	defer mu.Unlock()
+	var nNotSent, nReceived, nFailedReceived int
+	for i := range calls {
+		got := received[fmt.Sprint(i)]
+		nReceived += got
+		if failed[i] && !notSent[i] && got > 0 {
+			nFailedReceived++ // timed out after the write: may have left, and did
+		}
+		if notSent[i] {
+			nNotSent++
+			if got > 0 {
+				t.Errorf("call %d: reported ErrNotSent, but the server received it %d time(s)", i, got)
+			}
+		}
+	}
+	t.Logf("%d calls: %d not sent, %d received (%d of them by calls that failed after the write)", calls, nNotSent, nReceived, nFailedReceived)
+}
+
+// A connection obtained by a call but never written to before it failed
+// counts as not sent; one write started on it counts as sent.
+func TestConnUseCountsWritesStartedSinceTheCallGotItsConnection(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	go func() { _, _ = io.Copy(io.Discard, server) }()
+	wc := &writeMarkConn{Conn: client}
+	if _, err := wc.Write([]byte("an earlier request on the same connection")); err != nil {
+		t.Fatal(err)
+	}
+	var idle connUse
+	idle.gotConn(wc)
+	if idle.mayHaveLeft() {
+		t.Error("nothing written since the call got the connection: want not sent")
+	}
+
+	client2, server2 := net.Pipe()
+	defer func() { _ = server2.Close() }()
+	go func() { _, _ = io.Copy(io.Discard, server2) }()
+	wc2 := &writeMarkConn{Conn: client2}
+	var written connUse
+	written.gotConn(wc2)
+	if _, err := wc2.Write([]byte("POST /send")); err != nil {
+		t.Fatal(err)
+	}
+	if !written.mayHaveLeft() {
+		t.Error("a write started after the call got the connection: want may have left")
+	}
+	var none connUse
+	if none.mayHaveLeft() {
+		t.Error("no connection obtained: want not sent")
 	}
 }
 

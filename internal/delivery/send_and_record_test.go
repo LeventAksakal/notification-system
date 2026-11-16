@@ -15,7 +15,7 @@ import (
 func TestWorkerRetryOutcomes(t *testing.T) {
 	cases := []struct {
 		name     string
-		answers  []int // status per call; 0 = network error
+		answers  []int // status per call; 0 = network error, -1 = a call that never left
 		status   notification.Status
 		kind     notification.FailureKind
 		outcomes string
@@ -23,6 +23,8 @@ func TestWorkerRetryOutcomes(t *testing.T) {
 		{"transient twice then accepted", []int{503, 0, 202}, notification.StatusSent, "", "[transient transient accepted]"},
 		{"permanent after one call", []int{400}, notification.StatusFailed, notification.FailurePermanent, "[permanent]"},
 		{"exhausted after max attempts", []int{503, 503, 503}, notification.StatusFailed, notification.FailureExhausted, "[transient transient transient]"},
+		// No byte left: released, no attempt, the budget untouched (decision 0005).
+		{"a call that never left is no attempt", []int{-1, -1, 202}, notification.StatusSent, "", "[accepted]"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -35,8 +37,11 @@ func TestWorkerRetryOutcomes(t *testing.T) {
 				defer mu.Unlock()
 				st := c.answers[min(calls, len(c.answers)-1)]
 				calls++
-				if st == 0 {
+				switch st {
+				case 0:
 					return provider.Response{}, errors.New("connection reset")
+				case -1:
+					return provider.Response{}, fmt.Errorf("%w: %w after 500ms", provider.ErrNotSent, provider.ErrTimeout)
 				}
 				return provider.Response{Status: st, Header: http.Header{}}, nil
 			}

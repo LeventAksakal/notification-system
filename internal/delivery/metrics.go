@@ -25,6 +25,7 @@ const (
 	giveUpLeaseTooShort  giveUp = "lease_too_short"
 	giveUpClockUncertain giveUp = "clock_uncertain"
 	giveUpClockStepped   giveUp = "clock_stepped"
+	giveUpCallNeverLeft  giveUp = "call_never_left" // provider.ErrNotSent: the slot passed without a request
 )
 
 // metrics are the worker's OpenTelemetry instruments. Attributes are the

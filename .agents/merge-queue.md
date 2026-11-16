@@ -19,7 +19,8 @@ Integration branch: `refs/heads/integration/decision-review`, checked out in `C:
 | efd3d6b | metrics-rollup (0014): per-minute rollups and latency buckets |
 | f7bef32 | dials-derived (0018): every dial derived, config cross-checks |
 | 3c2d59e | R7 second-row fix (adaptive-align): given-back slots return once later ones are back; R7 p99 18.9 ms (was 387) |
-| (this commit) | public-polish: README without a directory tree, merged contract described; GitHub metadata drafted in `.agents/pr/public-metadata.md` (owner applies) |
+| e7f1053 | public-polish: README without a directory tree, merged contract described; GitHub metadata drafted in `.agents/pr/public-metadata.md` (owner applies) |
+| (this commit) | attempt rows over requests (adaptive-align): a call of which no byte left is released, not recorded (load-driven timeouts; not caused by 3c2d59e) |
 
 ## Protocol for every lane
 1. Finish your work and your verifier on your own branch, as briefed. Do not merge other lanes into your branch.

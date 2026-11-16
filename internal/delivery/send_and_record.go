@@ -84,6 +84,18 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 	cancelCall()
 	elapsed := time.Since(start)
 	callDone()
+	if errors.Is(err, provider.ErrNotSent) {
+		// No byte of the call left this process (a descheduled worker's
+		// timeout, a refused dial, shutdown before the write): the provider
+		// cannot have seen it, so it is no attempt and says nothing about the
+		// provider. Given back like a missed slot (decision 0005), due at once.
+		w.cancelGate(ctx, gate, tk)
+		slog.WarnContext(ctx, "provider call never left; released", "channel", job.Channel,
+			"after_ms", elapsed.Milliseconds(), "err", err)
+		w.m.gaveUp(ctx, job.Channel, giveUpCallNeverLeft, 1)
+		w.release(ctx, job, announced, "the provider call never left")
+		return
+	}
 	var v provider.Verdict
 	var nx next
 	if err != nil && ctx.Err() != nil {
