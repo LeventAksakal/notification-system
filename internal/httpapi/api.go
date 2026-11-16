@@ -99,6 +99,8 @@ func responses() map[string]*huma.Response {
 		"RequestTooLarge":      errorBody("The request body is larger than 8 MiB (`request_too_large`)"),
 		"IdempotencyKeyReused": errorBody("The Idempotency-Key was used before with a different payload"),
 		"ServiceUnavailable":   unavailable,
+		// Only GET /v1/ws refers to it (stream_event.go).
+		"LiveUpdatesUnavailable": liveUpdatesUnavailable503(),
 	}
 }
 
@@ -286,10 +288,12 @@ func documentStream(api huma.API) {
 			"batch's notifications follow. With neither, every change follows. The REST API stays the\n" +
 			"source of truth. The server closes the stream rather than deliver a stream with holes: a slow\n" +
 			"subscriber is disconnected, and so is every subscriber when the server loses its event feed\n" +
-			"(reconnect and read the snapshot).\n",
+			"(reconnect and read the snapshot). Within a notification, events arrive in `seq` order.\n\n" +
+			closeCodesDoc(),
 		Parameters: []*huma.Param{uuidParam("notificationId"), uuidParam("batchId")},
-	}, "", 400, 404, 503)
+	}, "", 400, 404)
 	delete(op.Responses, "200")
+	op.Responses["503"] = &huma.Response{Ref: "#/components/responses/LiveUpdatesUnavailable"}
 	op.Responses["101"] = &huma.Response{Description: "Switching protocols; `StatusEvent` messages follow"}
 	// The reference keeps StatusEvent in the document (Huma drops schemas
 	// nothing refers to) and names it as this operation's message.

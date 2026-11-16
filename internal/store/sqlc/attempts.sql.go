@@ -79,7 +79,8 @@ type FailSpentParams struct {
 }
 
 // processing -> failed without a call: unknown calls (counted by the reaper)
-// have already spent the attempt budget.
+// have already spent the attempt budget. Fenced by claim_version like the
+// other finishes, so the new status_seq is the claim's plus one.
 func (q *Queries) FailSpent(ctx context.Context, arg FailSpentParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, failSpent, arg.LastError, arg.ID, arg.ClaimVersion)
 	if err != nil {

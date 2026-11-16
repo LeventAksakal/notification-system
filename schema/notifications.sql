@@ -18,6 +18,10 @@ CREATE TABLE notifications (
   -- 'created' on insert, the old status on every status change. NULL only on
   -- rows that existed before the triggers (decision 0005, "As built").
   status_from ENUM('created', 'pending', 'processing', 'sent', 'failed', 'cancelled') NULL,
+  -- Goes up by exactly one with every status change, in the statement that
+  -- makes it; creation is 1. Live events carry it, so subscribers order them
+  -- exactly and skip what a snapshot already shows (decision 0013).
+  status_seq BIGINT UNSIGNED NOT NULL DEFAULT 1,
   failure_kind ENUM('permanent', 'exhausted') NULL,
   -- Provider calls made in the current attempt budget; reset by a replay.
   attempts INT UNSIGNED NOT NULL DEFAULT 0,
@@ -48,6 +52,7 @@ CREATE TABLE notifications (
   CONSTRAINT content_length CHECK ((((`channel` = _utf8mb4'sms') and (char_length(`content`) between 1 and 1600)) or ((`channel` = _utf8mb4'email') and (char_length(`content`) between 1 and 100000)) or ((`channel` = _utf8mb4'push') and (char_length(`content`) between 1 and 1024)))),
   CONSTRAINT failure_kind_only_when_failed CHECK ((status = 'failed') = (failure_kind IS NOT NULL)),
   CONSTRAINT budget_within_attempts CHECK ((`budget_spent` <= `attempts`)),
+  CONSTRAINT status_seq_from_one CHECK ((`status_seq` >= 1)),
   -- The state machine (internal/notification/status.go, transitions): every
   -- (status_from, status) pair the triggers can produce must be an allowed
   -- edge; 'created' -> pending is the only way in. store_rules_integration_test.go
@@ -79,16 +84,21 @@ CREATE TABLE notifications (
 
 -- Only the triggers write status_from, so status_transition sees every status
 -- change, whoever writes it (sqldef cannot parse SIGNAL, decision 0023, so the
--- refusal is the CHECK, not the trigger).
+-- refusal is the CHECK, not the trigger). They also own status_seq: 1 on
+-- insert, OLD + 1 on every status change, unchanged otherwise, so no query can
+-- skip or double a step whatever it writes to the column (decision 0013).
 CREATE TRIGGER notifications_status_from_insert BEFORE INSERT ON notifications FOR EACH ROW BEGIN
   SET NEW.status_from = 'created';
+  SET NEW.status_seq = 1;
 END;
 
 CREATE TRIGGER notifications_status_from_update BEFORE UPDATE ON notifications FOR EACH ROW BEGIN
   IF NOT (NEW.status <=> OLD.status) THEN
     SET NEW.status_from = OLD.status;
+    SET NEW.status_seq = OLD.status_seq + 1;
   ELSE
     SET NEW.status_from = OLD.status_from;
+    SET NEW.status_seq = OLD.status_seq;
   END IF;
 END;
 

@@ -50,16 +50,21 @@ SELECT * FROM delivery_attempts WHERE notification_id = ? AND outcome IN ('accep
 -- ListNotifications is built in Go (store.ListNotificationsQuery): the WHERE
 -- holds only the filters a request sets, so each filter keeps its index.
 
--- name: CancelNotification :execrows
+-- name: CancelNotification :execresult
 -- The only way out of pending to cancelled; a lost race changes nothing.
+-- The trigger stores status_seq + 1; LAST_INSERT_ID(expr) computes the same
+-- value from the old row and hands it back in the OK packet
+-- (sql.Result.LastInsertId), so the event carries it without a second read
+-- that a later change could overtake.
 UPDATE notifications
-SET status = 'cancelled', finished_at = NOW(3)
+SET status = 'cancelled', status_seq = LAST_INSERT_ID(status_seq + 1), finished_at = NOW(3)
 WHERE id = ? AND status = 'pending';
 
--- name: ReplayNotification :execrows
--- A dead letter goes back to pending with a fresh attempt budget; history is kept.
+-- name: ReplayNotification :execresult
+-- A dead letter goes back to pending with a fresh attempt budget; history is
+-- kept. The new status_seq comes back as LastInsertId, as for a cancel.
 UPDATE notifications
-SET status = 'pending', attempts = 0, budget_spent = 0, failure_kind = NULL, finished_at = NULL, due_at = NOW(3)
+SET status = 'pending', status_seq = LAST_INSERT_ID(status_seq + 1), attempts = 0, budget_spent = 0, failure_kind = NULL, finished_at = NULL, due_at = NOW(3)
 WHERE id = ? AND status = 'failed';
 
 -- name: GetBatch :one
@@ -82,6 +87,11 @@ FROM notifications
 WHERE batch_id = sqlc.arg(batch_id) AND CAST(batch_index AS SIGNED) > sqlc.arg(after_index)
 ORDER BY batch_index
 LIMIT ?;
+
+-- name: ListBatchStatusSeqs :many
+-- Every notification of a batch with its status_seq (batch_idx, then the
+-- row): the base a batch subscription orders live events against.
+SELECT id, status_seq FROM notifications WHERE batch_id = ?;
 
 -- name: ListBatchNotificationIDs :many
 -- Every id of a batch in request order; rebuilds a replayed BatchCreated.

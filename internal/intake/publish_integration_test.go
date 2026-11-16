@@ -29,7 +29,7 @@ func TestCreateAnswersPromptlyWithValkeyDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(vk.Close)
-	svc := intake.New(db, realtime.NewPublisher(vk, realtime.OriginAPI), time.Hour).WithWaker(wake.NewPublisher(vk))
+	svc := intake.New(db, realtime.NewPublisher(vk), time.Hour).WithWaker(wake.NewPublisher(vk))
 	proxy.Close()
 
 	batch := func() []intake.Request {
@@ -54,8 +54,8 @@ func TestCreateAnswersPromptlyWithValkeyDown(t *testing.T) {
 		after time.Duration // idle time before the request
 	}{
 		{"first batch: the open connection breaks", 0},
-		{"second batch: publishes held off", 0},
-		{"third batch: the hold-off is over and the client redials", time.Second},
+		{"second batch: only one probe tries while Valkey is down", 0},
+		{"third batch, a second later: still one probe, the client redials", time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			time.Sleep(tc.after)

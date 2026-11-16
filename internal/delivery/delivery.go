@@ -1143,7 +1143,9 @@ func (w *Worker) deliver(ctx context.Context, job notification.Job, announced <-
 	if status != notification.StatusSent {
 		errText = v.Error
 	}
-	w.publish(ctx, job, announced, status, attempts, errText)
+	// The write was fenced by the claim's claim_version: it is the first
+	// change since the claim.
+	w.publish(ctx, job, announced, status, attempts, errText, job.StatusSeq+1)
 }
 
 // release returns an unsent job to pending, due now, without an attempt, and
@@ -1157,12 +1159,13 @@ func (w *Worker) release(ctx context.Context, job notification.Job, announced <-
 	}
 	slog.DebugContext(ctx, "released unsent notification", "channel", job.Channel, "reason", reason)
 	w.wakeAll(ctx, notification.Wake{Channel: job.Channel, Priority: job.Priority, Due: time.Now()})
-	w.publish(ctx, job, announced, notification.StatusPending, job.Attempts, "")
+	w.publish(ctx, job, announced, notification.StatusPending, job.Attempts, "", job.StatusSeq+1) // fenced, as a result
 }
 
 // publish announces job's move to st once after is closed (nil: at once), so
 // it follows the event published before it.
-func (w *Worker) publish(ctx context.Context, job notification.Job, after <-chan struct{}, st notification.Status, attempts int, errText string) {
+// seq is the notification's status_seq after the change.
+func (w *Worker) publish(ctx context.Context, job notification.Job, after <-chan struct{}, st notification.Status, attempts int, errText string, seq uint64) {
 	if w.deps.Publisher == nil {
 		return
 	}
@@ -1171,7 +1174,7 @@ func (w *Worker) publish(ctx context.Context, job notification.Job, after <-chan
 	}
 	err := w.deps.Publisher.Publish(ctx, notification.Event{
 		NotificationID: job.ID, BatchID: job.BatchID, Status: st, Attempts: attempts,
-		Error: errText, At: time.Now().UTC(), CorrelationID: job.CorrelationID,
+		Error: errText, At: time.Now().UTC(), CorrelationID: job.CorrelationID, Seq: seq,
 	})
 	if err != nil {
 		slog.WarnContext(ctx, "publish status change", "status", st, "err", err)
@@ -1184,8 +1187,9 @@ type batchPublisher interface {
 	PublishAll(ctx context.Context, es []notification.Event) error
 }
 
-// publishAll announces that jobs moved to st (their attempts unchanged), in
-// order: in one call when the publisher has a batch form, else one by one.
+// publishAll announces that jobs moved to st (their attempts unchanged, their
+// StatusSeq the change's), in order: in one call when the publisher has a
+// batch form, else one by one.
 func (w *Worker) publishAll(ctx context.Context, jobs []notification.Job, st notification.Status) {
 	if w.deps.Publisher == nil || len(jobs) == 0 {
 		return
@@ -1193,7 +1197,7 @@ func (w *Worker) publishAll(ctx context.Context, jobs []notification.Job, st not
 	bp, ok := w.deps.Publisher.(batchPublisher)
 	if !ok {
 		for _, job := range jobs {
-			w.publish(jobContext(ctx, job), job, nil, st, job.Attempts, "")
+			w.publish(jobContext(ctx, job), job, nil, st, job.Attempts, "", job.StatusSeq)
 		}
 		return
 	}
@@ -1201,7 +1205,7 @@ func (w *Worker) publishAll(ctx context.Context, jobs []notification.Job, st not
 	es := make([]notification.Event, len(jobs))
 	for i, job := range jobs {
 		es[i] = notification.Event{NotificationID: job.ID, BatchID: job.BatchID, Status: st, Attempts: job.Attempts,
-			At: now, CorrelationID: job.CorrelationID}
+			At: now, CorrelationID: job.CorrelationID, Seq: job.StatusSeq}
 	}
 	if err := bp.PublishAll(ctx, es); err != nil {
 		slog.WarnContext(ctx, "publish status changes", "status", st, "count", len(es), "err", err)

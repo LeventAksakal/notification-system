@@ -52,7 +52,8 @@ WHERE notification_id = sqlc.arg(notification_id) AND claim_version = sqlc.arg(c
 
 -- name: FailSpent :execrows
 -- processing -> failed without a call: unknown calls (counted by the reaper)
--- have already spent the attempt budget.
+-- have already spent the attempt budget. Fenced by claim_version like the
+-- other finishes, so the new status_seq is the claim's plus one.
 UPDATE notifications
 SET status = 'failed', last_error = sqlc.narg(last_error), failure_kind = 'exhausted', lease_until = NULL, finished_at = NOW(3)
 WHERE id = sqlc.arg(id) AND status = 'processing' AND claim_version = sqlc.arg(claim_version);

@@ -389,6 +389,9 @@ type StatusEvent struct {
 	Error          *string             `json:"error,omitempty"`
 	NotificationId openapi_types.UUID  `json:"notificationId"`
 
+	// Seq The notification's status sequence: 1 at creation, one more with every status change. A stream sends a notification's events in this order without repeats; a gap means a change was lost, read the notification. Absent when unknown
+	Seq *int `json:"seq,omitempty"`
+
 	// Snapshot True on the first message of a `notificationId` subscription
 	Snapshot *bool `json:"snapshot,omitempty"`
 
@@ -436,6 +439,9 @@ type IdempotencyKeyReused = Error
 
 // InvalidRequest defines model for InvalidRequest.
 type InvalidRequest = Error
+
+// LiveUpdatesUnavailable defines model for LiveUpdatesUnavailable.
+type LiveUpdatesUnavailable = Error
 
 // NotFound defines model for NotFound.
 type NotFound = Error
@@ -742,7 +748,12 @@ type ClientInterface interface {
 	// batch's notifications follow. With neither, every change follows. The REST API stays the
 	// source of truth. The server closes the stream rather than deliver a stream with holes: a slow
 	// subscriber is disconnected, and so is every subscriber when the server loses its event feed
-	// (reconnect and read the snapshot).
+	// (reconnect and read the snapshot). Within a notification, events arrive in `seq` order.
+	//
+	// The server ends a stream with one of these close codes:
+	// - `1008`: the subscriber fell behind and events were dropped (the send buffer, APP_WS_SEND_BUFFER, filled); resubscribe.
+	// - `1012`: the server lost its event feed, so changes may be missing; reconnect (503 until the feed is back) and read the snapshot.
+	// - `1001`: the server is shutting down; reconnect.
 	//
 	// Corresponds with GET /v1/ws (the `StreamEvents` operationId).
 	StreamEvents(ctx context.Context, params *StreamEventsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -1096,7 +1107,12 @@ func (c *Client) PutTemplate(ctx context.Context, name TemplateName, body PutTem
 // batch's notifications follow. With neither, every change follows. The REST API stays the
 // source of truth. The server closes the stream rather than deliver a stream with holes: a slow
 // subscriber is disconnected, and so is every subscriber when the server loses its event feed
-// (reconnect and read the snapshot).
+// (reconnect and read the snapshot). Within a notification, events arrive in `seq` order.
+//
+// The server ends a stream with one of these close codes:
+// - `1008`: the subscriber fell behind and events were dropped (the send buffer, APP_WS_SEND_BUFFER, filled); resubscribe.
+// - `1012`: the server lost its event feed, so changes may be missing; reconnect (503 until the feed is back) and read the snapshot.
+// - `1001`: the server is shutting down; reconnect.
 //
 // Corresponds with GET /v1/ws (the `StreamEvents` operationId).
 func (c *Client) StreamEvents(ctx context.Context, params *StreamEventsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
@@ -2131,7 +2147,12 @@ type ClientWithResponsesInterface interface {
 	// batch's notifications follow. With neither, every change follows. The REST API stays the
 	// source of truth. The server closes the stream rather than deliver a stream with holes: a slow
 	// subscriber is disconnected, and so is every subscriber when the server loses its event feed
-	// (reconnect and read the snapshot).
+	// (reconnect and read the snapshot). Within a notification, events arrive in `seq` order.
+	//
+	// The server ends a stream with one of these close codes:
+	// - `1008`: the subscriber fell behind and events were dropped (the send buffer, APP_WS_SEND_BUFFER, filled); resubscribe.
+	// - `1012`: the server lost its event feed, so changes may be missing; reconnect (503 until the feed is back) and read the snapshot.
+	// - `1001`: the server is shutting down; reconnect.
 	//
 	// Returns a wrapper object for the known response body format(s).
 	//
@@ -3147,7 +3168,7 @@ type StreamEventsResponse struct {
 	// JSON404 the response for an HTTP 404 `application/json` response
 	JSON404 *NotFound
 	// JSON503 the response for an HTTP 503 `application/json` response
-	JSON503 *ServiceUnavailable
+	JSON503 *LiveUpdatesUnavailable
 	// Headers503 the parsed response headers for an HTTP 503 response
 	Headers503 *StreamEventsResponse503Headers
 }
@@ -3163,7 +3184,7 @@ func (r StreamEventsResponse) GetJSON404() *NotFound {
 }
 
 // GetJSON503 returns the response for an HTTP 503 `application/json` response
-func (r StreamEventsResponse) GetJSON503() *ServiceUnavailable {
+func (r StreamEventsResponse) GetJSON503() *LiveUpdatesUnavailable {
 	return r.JSON503
 }
 
@@ -3490,7 +3511,12 @@ func (c *ClientWithResponses) PutTemplateWithResponse(ctx context.Context, name 
 // batch's notifications follow. With neither, every change follows. The REST API stays the
 // source of truth. The server closes the stream rather than deliver a stream with holes: a slow
 // subscriber is disconnected, and so is every subscriber when the server loses its event feed
-// (reconnect and read the snapshot).
+// (reconnect and read the snapshot). Within a notification, events arrive in `seq` order.
+//
+// The server ends a stream with one of these close codes:
+// - `1008`: the subscriber fell behind and events were dropped (the send buffer, APP_WS_SEND_BUFFER, filled); resubscribe.
+// - `1012`: the server lost its event feed, so changes may be missing; reconnect (503 until the feed is back) and read the snapshot.
+// - `1001`: the server is shutting down; reconnect.
 //
 // Returns a wrapper object for the known response body format(s).
 //
@@ -4404,7 +4430,7 @@ func ParseStreamEventsResponse(rsp *http.Response) (*StreamEventsResponse, error
 		response.JSON404 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
-		var dest ServiceUnavailable
+		var dest LiveUpdatesUnavailable
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}

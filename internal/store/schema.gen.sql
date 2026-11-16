@@ -60,6 +60,7 @@ CREATE TABLE `notifications` (
   `content` mediumtext NOT NULL,
   `status` enum('pending','processing','sent','failed','cancelled') NOT NULL DEFAULT 'pending',
   `status_from` enum('created','pending','processing','sent','failed','cancelled') DEFAULT NULL,
+  `status_seq` bigint unsigned NOT NULL DEFAULT '1',
   `failure_kind` enum('permanent','exhausted') DEFAULT NULL,
   `attempts` int unsigned NOT NULL DEFAULT '0',
   `budget_spent` int unsigned NOT NULL DEFAULT '0',
@@ -94,6 +95,7 @@ CREATE TABLE `notifications` (
   CONSTRAINT `recipient_not_blank` CHECK ((char_length(`recipient`) between 1 and 255)),
   CONSTRAINT `recipient_sms_e164` CHECK (((`channel` <> _utf8mb4'sms') or regexp_like(`recipient`,_utf8mb4'^\\+[0-9]{7,15}$'))),
   CONSTRAINT `scheduled_within_horizon` CHECK (((`scheduled_at` is null) or (`scheduled_at` <= (`updated_at` + interval 30 day)))),
+  CONSTRAINT `status_seq_from_one` CHECK ((`status_seq` >= 1)),
   CONSTRAINT `status_transition` CHECK (((`status_from` is null) or ((`status_from`,`status`) in ((_utf8mb4'created',_utf8mb4'pending'),(_utf8mb4'pending',_utf8mb4'processing'),(_utf8mb4'pending',_utf8mb4'cancelled'),(_utf8mb4'processing',_utf8mb4'sent'),(_utf8mb4'processing',_utf8mb4'pending'),(_utf8mb4'processing',_utf8mb4'failed'),(_utf8mb4'failed',_utf8mb4'pending')))))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

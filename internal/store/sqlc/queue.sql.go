@@ -14,7 +14,7 @@ import (
 
 const claimCandidates = `-- name: ClaimCandidates :many
 
-SELECT id, batch_id, recipient, content, attempts, budget_spent, claim_version, due_at, correlation_id, traceparent
+SELECT id, batch_id, recipient, content, attempts, budget_spent, claim_version, status_seq, due_at, correlation_id, traceparent
 FROM notifications
 WHERE status = 'pending' AND channel = ? AND priority = ? AND due_at <= NOW(3)
 ORDER BY due_at
@@ -36,6 +36,7 @@ type ClaimCandidatesRow struct {
 	Attempts      uint32
 	BudgetSpent   uint32
 	ClaimVersion  uint64
+	StatusSeq     uint64
 	DueAt         time.Time
 	CorrelationID string
 	Traceparent   sql.NullString
@@ -65,6 +66,7 @@ func (q *Queries) ClaimCandidates(ctx context.Context, arg ClaimCandidatesParams
 			&i.Attempts,
 			&i.BudgetSpent,
 			&i.ClaimVersion,
+			&i.StatusSeq,
 			&i.DueAt,
 			&i.CorrelationID,
 			&i.Traceparent,
@@ -155,7 +157,10 @@ type FinishSentParams struct {
 	ClaimVersion      uint64
 }
 
-// processing -> sent.
+// processing -> sent. Every write below is fenced by claim_version, and only a
+// claim moves a row into processing (bumping claim_version), so when it
+// matches no status change happened since the claim: the new status_seq (the
+// trigger raises it) is the claim's plus one, known without reading it back.
 func (q *Queries) FinishSent(ctx context.Context, arg FinishSentParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, finishSent, arg.ProviderMessageID, arg.ID, arg.ClaimVersion)
 	if err != nil {
@@ -211,7 +216,9 @@ type LeaseNotificationsParams struct {
 }
 
 // pending -> processing for the rows locked by ClaimCandidates in the same
-// transaction, in one statement (one round trip, however many rows).
+// transaction, in one statement (one round trip, however many rows). The
+// trigger raises status_seq; each row's new value is the one ClaimCandidates
+// read plus one, since the row lock is held from that SELECT to the commit.
 func (q *Queries) LeaseNotifications(ctx context.Context, arg LeaseNotificationsParams) (int64, error) {
 	query := leaseNotifications
 	var queryParams []interface{}
@@ -283,7 +290,7 @@ func (q *Queries) NextDue(ctx context.Context, arg NextDueParams) ([]NextDueRow,
 }
 
 const reapCandidates = `-- name: ReapCandidates :many
-SELECT id, batch_id, channel, attempts, correlation_id
+SELECT id, batch_id, channel, attempts, status_seq, correlation_id
 FROM notifications
 WHERE status = 'processing' AND lease_until < NOW(3)
 ORDER BY lease_until
@@ -296,6 +303,7 @@ type ReapCandidatesRow struct {
 	BatchID       sql.NullString
 	Channel       NotificationsChannel
 	Attempts      uint32
+	StatusSeq     uint64
 	CorrelationID string
 }
 
@@ -315,6 +323,7 @@ func (q *Queries) ReapCandidates(ctx context.Context) ([]ReapCandidatesRow, erro
 			&i.BatchID,
 			&i.Channel,
 			&i.Attempts,
+			&i.StatusSeq,
 			&i.CorrelationID,
 		); err != nil {
 			return nil, err
@@ -336,7 +345,8 @@ SET status = 'pending', lease_until = NULL
 WHERE id IN (/*SLICE:ids*/?) AND status = 'processing'
 `
 
-// processing -> pending for rows locked by ReapCandidates in the same transaction.
+// processing -> pending for rows locked by ReapCandidates in the same
+// transaction; the trigger makes status_seq the one read plus one (row locks held).
 func (q *Queries) ReapLeases(ctx context.Context, ids []string) (int64, error) {
 	query := reapLeases
 	var queryParams []interface{}

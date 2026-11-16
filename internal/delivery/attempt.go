@@ -33,6 +33,6 @@ func (w *Worker) spent(ctx context.Context, cr *channelRun, job notification.Job
 	}
 	slog.InfoContext(ctx, "attempt budget spent by unknown calls; failed without a call", "channel", job.Channel,
 		"attempts", job.Attempts, "budget_spent", job.BudgetSpent)
-	w.publish(ctx, job, announced, notification.StatusFailed, job.Attempts, reason)
+	w.publish(ctx, job, announced, notification.StatusFailed, job.Attempts, reason, job.StatusSeq+1)
 	return true
 }

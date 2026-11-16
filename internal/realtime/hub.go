@@ -27,14 +27,20 @@ var (
 )
 
 const (
-	// holdFor bounds how long a claim waits for the pending it follows
-	// (see sequencer); the race it covers lasts milliseconds.
-	holdFor = 200 * time.Millisecond
-	// rememberFor is how long the hub remembers a notification's last state.
-	rememberFor = 10 * time.Minute
-	// tickEvery is how often held events are checked for expiry.
-	tickEvery = 25 * time.Millisecond
-	// retryMax caps the wait between resubscribe attempts.
+	// retryFirst is the wait before the first resubscribe attempt after the
+	// feed dropped. Arbitrary: short enough that a blip (a Valkey restart
+	// answers again within about a second) costs little; to tune it, measure
+	// the gap between "subscription lost" and live again in the logs while
+	// restarting Valkey, and keep it well under that.
+	retryFirst = 100 * time.Millisecond
+	// retryMax caps the doubling wait between resubscribe attempts, and is
+	// how long a subscription must have stayed up for the next loss to start
+	// again at retryFirst. While the feed is down /v1/ws refuses subscribers
+	// (503), so it bounds how long after Valkey's return they are still
+	// refused: 5 s is within the few seconds a client's own reconnect backoff
+	// usually waits. Arbitrary within that; to tune it, weigh the reconnect
+	// rate against Valkey (one SUBSCRIBE per API instance per retryMax) with
+	// how long clients may see 503 after an outage.
 	retryMax = 5 * time.Second
 )
 
@@ -49,8 +55,10 @@ func (f Filter) match(e notification.Event) bool {
 		(f.BatchID == "" || f.BatchID == e.BatchID)
 }
 
-// Subscription receives the events matching its filter, in commit order per
-// notification. C is closed when the subscription ends; Err then says why.
+// Subscription receives the events matching its filter as they arrive from
+// Valkey: per notification they may be out of order (two processes publish)
+// and the subscriber puts them in order with a Reorderer. C is closed when
+// the subscription ends; Err then says why.
 type Subscription struct {
 	C <-chan notification.Event
 
@@ -75,7 +83,7 @@ func (s *Subscription) Close() {
 }
 
 // Hub holds one Valkey subscription per process and fans events out to local
-// subscribers. One mutex guards the subscribers and the ordering state.
+// subscribers. One mutex guards the subscribers.
 type Hub struct {
 	client  valkey.Client
 	channel string
@@ -84,7 +92,6 @@ type Hub struct {
 
 	mu     sync.Mutex
 	subs   map[*Subscription]struct{}
-	seq    *sequencer
 	closed bool
 }
 
@@ -92,7 +99,7 @@ type Hub struct {
 func NewHub(client valkey.Client) *Hub {
 	return &Hub{
 		client: client, channel: Channel, now: time.Now,
-		subs: map[*Subscription]struct{}{}, seq: newSequencer(holdFor, rememberFor),
+		subs: map[*Subscription]struct{}{},
 	}
 }
 
@@ -121,13 +128,7 @@ func (h *Hub) Subscribe(f Filter, buf int) (*Subscription, error) {
 // Run keeps the Valkey subscription up until ctx ends, resubscribing after a
 // failure, then ends every local subscription with ErrClosed.
 func (h *Hub) Run(ctx context.Context) error {
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() { // owned by Run through wg
-		defer wg.Done()
-		h.tick(ctx)
-	}()
-	wait := 100 * time.Millisecond
+	wait := retryFirst
 	for {
 		started := h.now()
 		err := h.listen(ctx)
@@ -136,7 +137,7 @@ func (h *Hub) Run(ctx context.Context) error {
 		}
 		h.feedLost(ctx)
 		if h.now().Sub(started) > retryMax {
-			wait = 100 * time.Millisecond
+			wait = retryFirst
 		}
 		slog.WarnContext(ctx, "status event subscription lost; resubscribing", "err", err, "retry_in", wait.String())
 		t := time.NewTimer(wait)
@@ -150,7 +151,6 @@ func (h *Hub) Run(ctx context.Context) error {
 		}
 		wait = min(wait*2, retryMax)
 	}
-	wg.Wait()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.closed = true
@@ -162,13 +162,11 @@ func (h *Hub) Run(ctx context.Context) error {
 
 // feedLost ends every subscription with ErrFeedLost: events published while
 // the subscription was down are gone, and a stream with holes is worse than a
-// closed one (the client reconnects and reads the snapshot). What was held
-// for ordering is dropped with them.
+// closed one (the client reconnects and reads the snapshot).
 func (h *Hub) feedLost(ctx context.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.live.Store(false)
-	h.seq = newSequencer(holdFor, rememberFor)
 	n := len(h.subs)
 	for s := range h.subs {
 		h.drop(s, ErrFeedLost)
@@ -209,47 +207,30 @@ func (h *Hub) listen(ctx context.Context) error {
 }
 
 func (h *Hub) receive(ctx context.Context, payload string) {
-	m, err := decode([]byte(payload))
+	e, err := decode([]byte(payload))
 	if err != nil {
 		slog.WarnContext(ctx, "dropping malformed status event", "err", err)
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.deliver(h.seq.push(m, h.now()))
+	h.deliver(e)
 }
 
-func (h *Hub) tick(ctx context.Context) {
-	t := time.NewTicker(tickEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		h.mu.Lock()
-		h.deliver(h.seq.expire(h.now()))
-		h.mu.Unlock()
-	}
-}
-
-// deliver hands msgs to every matching subscriber without waiting; a
+// deliver hands e to every matching subscriber without waiting; a
 // subscriber with a full buffer is ended with ErrSlow. Caller holds h.mu.
-func (h *Hub) deliver(msgs []Message) {
+func (h *Hub) deliver(e notification.Event) {
 	if h.closed {
 		return
 	}
-	for _, m := range msgs {
-		for s := range h.subs {
-			if !s.filter.match(m.Event) {
-				continue
-			}
-			select {
-			case s.ch <- m.Event:
-			default:
-				h.drop(s, ErrSlow)
-			}
+	for s := range h.subs {
+		if !s.filter.match(e) {
+			continue
+		}
+		select {
+		case s.ch <- e:
+		default:
+			h.drop(s, ErrSlow)
 		}
 	}
 }

@@ -24,3 +24,5 @@ Assumption taken: once the handshake completes, every later committed change is 
 2. and 3. The assumptions taken stand.
 4. (a) The stored id goes on lines about the notification; the request's id stays on its access line. Built in session trace-correlation, with cancel added to R14.
 5. Covered by decision 0013 and session realtime-seq (exact event order).
+
+Item 5, 16 Nov (realtime-seq): still holds; the subscription is taken before the snapshot and the handshake. Added: while the API has no event feed (Valkey down) `/v1/ws` answers 503 instead of upgrading (decision 0013 "As built").

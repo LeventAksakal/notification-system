@@ -302,24 +302,6 @@ type Metrics struct {
 	DeliveryByChannel []DeliveryStats `json:"deliveryByChannel" doc:"One entry per channel, always all three"`
 }
 
-// StatusEvent is one message on the WebSocket stream (GET /v1/ws). Huma does
-// not route the stream; the type is registered in the spec by hand (api.go).
-type StatusEvent struct {
-	NotificationID uuid.UUID  `json:"notificationId"`
-	BatchID        *uuid.UUID `json:"batchId,omitempty"`
-	Status         Status     `json:"status"`
-	Attempts       int        `json:"attempts"`
-	Error          *string    `json:"error,omitempty"`
-	At             time.Time  `json:"at"`
-	CorrelationID  string     `json:"correlationId"`
-	Snapshot       *bool      "json:\"snapshot,omitempty\" doc:\"True on the first message of a `notificationId` subscription\""
-}
-
-func (StatusEvent) TransformSchema(_ huma.Registry, s *huma.Schema) *huma.Schema {
-	s.Description = "One message on the WebSocket stream"
-	return s
-}
-
 // Health answers the liveness and readiness probes.
 type Health struct {
 	Status string            `json:"status" enum:"ok,unavailable"`

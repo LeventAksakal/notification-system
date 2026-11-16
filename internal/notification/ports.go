@@ -14,15 +14,19 @@ var ErrLeaseLost = errors.New("lease lost")
 // Job is a claimed notification: what a worker needs to send it and to write
 // the result back.
 type Job struct {
-	ID            string
-	BatchID       string // "" outside a batch
-	Channel       Channel
-	Priority      Priority
-	To            string
-	Content       string
-	Attempts      int    // provider calls already made in this attempt budget
-	BudgetSpent   int    // of those, the failures counted against the budget (decision 0026)
-	ClaimVersion  uint64 // carried on every write for this claim
+	ID           string
+	BatchID      string // "" outside a batch
+	Channel      Channel
+	Priority     Priority
+	To           string
+	Content      string
+	Attempts     int    // provider calls already made in this attempt budget
+	BudgetSpent  int    // of those, the failures counted against the budget (decision 0026)
+	ClaimVersion uint64 // carried on every write for this claim
+	// StatusSeq is the row's status_seq in the state this Job reports: the
+	// claim's (processing) from Claim, the new pending one from ReapExpired.
+	// A write fenced by ClaimVersion that succeeds sets it to StatusSeq+1.
+	StatusSeq     uint64
 	LeaseUntil    time.Time
 	DueAt         time.Time
 	CorrelationID string
@@ -80,8 +84,8 @@ type Queue interface {
 	// ReapExpired returns notifications whose lease ran out to pending and
 	// reports them, so the caller can publish the change (decision 0018); an
 	// attempt still in flight on such a lease becomes unknown and counts,
-	// against the budget too (decision 0005). Of
-	// each Job only ID, BatchID, Channel, Attempts and CorrelationID are set.
+	// against the budget too (decision 0005). Of each Job only ID, BatchID,
+	// Channel, Attempts, StatusSeq and CorrelationID are set.
 	ReapExpired(ctx context.Context) ([]Job, error)
 	// NextDue reports, for each priority of the channel that has pending
 	// notifications, how long until the earliest of them is due, measured on
@@ -144,6 +148,11 @@ type Event struct {
 	Error          string // last error, when there is one
 	At             time.Time
 	CorrelationID  string
+	// Seq is the notification's status_seq after this change: 1 at creation,
+	// one more with every change. Subscribers order a notification's events
+	// by it and drop what they already have. 0 means unknown (a publisher
+	// that predates it); such an event is passed on unordered.
+	Seq uint64
 }
 
 // Publisher fans status changes out to subscribers. It is called once per

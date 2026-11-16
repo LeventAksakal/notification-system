@@ -22,7 +22,11 @@ type Querier interface {
 	// ListNotifications is built in Go (store.ListNotificationsQuery): the WHERE
 	// holds only the filters a request sets, so each filter keeps its index.
 	// The only way out of pending to cancelled; a lost race changes nothing.
-	CancelNotification(ctx context.Context, id string) (int64, error)
+	// The trigger stores status_seq + 1; LAST_INSERT_ID(expr) computes the same
+	// value from the old row and hands it back in the OK packet
+	// (sql.Result.LastInsertId), so the event carries it without a second read
+	// that a later change could overtake.
+	CancelNotification(ctx context.Context, id string) (sql.Result, error)
 	// The delivery queue (decisions 0003, 0018). A claim is a lease: it sets
 	// lease_until and bumps claim_version; every later write by the claimer
 	// carries WHERE status = 'processing' AND claim_version = ?, so a worker that
@@ -49,7 +53,8 @@ type Querier interface {
 	// the same transaction.
 	DeleteUnsentAttempt(ctx context.Context, arg DeleteUnsentAttemptParams) (int64, error)
 	// processing -> failed without a call: unknown calls (counted by the reaper)
-	// have already spent the attempt budget.
+	// have already spent the attempt budget. Fenced by claim_version like the
+	// other finishes, so the new status_seq is the claim's plus one.
 	FailSpent(ctx context.Context, arg FailSpentParams) (int64, error)
 	// started_at stays the claim's time (at most the reservation horizon before
 	// the request): rewriting it would move the row in attempts_window_idx a
@@ -63,7 +68,10 @@ type Querier interface {
 	// counted is 1 when the failure counts against the budget, 0 when it belongs
 	// to a declared provider outage (decision 0026).
 	FinishRetry(ctx context.Context, arg FinishRetryParams) (int64, error)
-	// processing -> sent.
+	// processing -> sent. Every write below is fenced by claim_version, and only a
+	// claim moves a row into processing (bumping claim_version), so when it
+	// matches no status change happened since the claim: the new status_seq (the
+	// trigger raises it) is the claim's plus one, known without reading it back.
 	FinishSent(ctx context.Context, arg FinishSentParams) (int64, error)
 	GetBatch(ctx context.Context, id string) (Batch, error)
 	GetIdempotencyKey(ctx context.Context, idemKey string) (IdempotencyKey, error)
@@ -81,12 +89,17 @@ type Querier interface {
 	// due_at is the schedule or now on the database clock; a past schedule means now.
 	InsertNotification(ctx context.Context, arg InsertNotificationParams) error
 	// pending -> processing for the rows locked by ClaimCandidates in the same
-	// transaction, in one statement (one round trip, however many rows).
+	// transaction, in one statement (one round trip, however many rows). The
+	// trigger raises status_seq; each row's new value is the one ClaimCandidates
+	// read plus one, since the row lock is held from that SELECT to the commit.
 	LeaseNotifications(ctx context.Context, arg LeaseNotificationsParams) (int64, error)
 	// One page of a batch in request order (batch_position_idx); after_index -1 starts at the first item.
 	ListBatchItems(ctx context.Context, arg ListBatchItemsParams) ([]ListBatchItemsRow, error)
 	// Every id of a batch in request order; rebuilds a replayed BatchCreated.
 	ListBatchNotificationIDs(ctx context.Context, batchID sql.NullString) ([]string, error)
+	// Every notification of a batch with its status_seq (batch_idx, then the
+	// row): the base a batch subscription orders live events against.
+	ListBatchStatusSeqs(ctx context.Context, batchID sql.NullString) ([]ListBatchStatusSeqsRow, error)
 	// Oldest first (attempts_notification_idx). Only calls with a result: the API
 	// contract's outcome enum has no in_flight or unknown (owner item 0015); an
 	// unknown call shows as the gap in attempt_no.
@@ -129,12 +142,14 @@ type Querier interface {
 	// Runs inside a READ COMMITTED transaction: the expired leases (lease_idx),
 	// locked so two reapers never return the same row. Bounded per tick.
 	ReapCandidates(ctx context.Context) ([]ReapCandidatesRow, error)
-	// processing -> pending for rows locked by ReapCandidates in the same transaction.
+	// processing -> pending for rows locked by ReapCandidates in the same
+	// transaction; the trigger makes status_seq the one read plus one (row locks held).
 	ReapLeases(ctx context.Context, ids []string) (int64, error)
 	// processing -> pending without an attempt (provider outage declared, shutdown; decision 0026).
 	ReleaseLease(ctx context.Context, arg ReleaseLeaseParams) (int64, error)
-	// A dead letter goes back to pending with a fresh attempt budget; history is kept.
-	ReplayNotification(ctx context.Context, id string) (int64, error)
+	// A dead letter goes back to pending with a fresh attempt budget; history is
+	// kept. The new status_seq comes back as LastInsertId, as for a cancel.
+	ReplayNotification(ctx context.Context, id string) (sql.Result, error)
 	// A new schedule for a notification no worker has claimed yet (claim_version
 	// 0: never leased, so no attempt, retry backoff or Retry-After is pending).
 	// One statement: a claim racing it on the same row either leased it first

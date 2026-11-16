@@ -446,6 +446,7 @@ type Notification struct {
 	Content           string
 	Status            NotificationsStatus
 	StatusFrom        NullNotificationsStatusFrom
+	StatusSeq         uint64
 	FailureKind       NullNotificationsFailureKind
 	Attempts          uint32
 	BudgetSpent       uint32

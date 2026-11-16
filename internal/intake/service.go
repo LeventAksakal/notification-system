@@ -213,7 +213,7 @@ func (s *Service) Create(ctx context.Context, r Request, m Meta) (n Notification
 	}
 	lctx := telemetry.WithNotification(ctx, n.ID, n.CorrelationID)
 	slog.InfoContext(lctx, "notification accepted", "channel", a.Channel, "priority", a.Priority, "scheduled", n.Scheduled)
-	s.publish(lctx, n.Notification)
+	s.publishCreated(lctx, n.Notification)
 	s.wake(lctx, hintFor(n.Notification))
 	return n, false, nil
 }
@@ -287,6 +287,7 @@ func (s *Service) CreateBatch(ctx context.Context, rs []Request, m Meta) (b Batc
 	for i, it := range items {
 		events[i] = notification.Event{
 			NotificationID: it.ID, BatchID: b.ID, Status: notification.StatusPending, At: b.CreatedAt, CorrelationID: m.CorrelationID,
+			Seq: 1,
 		}
 	}
 	// One pipelined publish with one deadline, whatever the batch size.
@@ -542,14 +543,18 @@ func (s *Service) Retry(ctx context.Context, id string) (Notification, error) {
 }
 
 func (s *Service) transition(ctx context.Context, id string, from, to notification.Status,
-	update func(context.Context, string) (int64, error), refused error, msg string,
+	update func(context.Context, string) (sql.Result, error), refused error, msg string,
 ) (Notification, error) {
 	if err := notification.Transition(from, to); err != nil {
 		return Notification{}, err
 	}
-	changed, err := update(ctx, id)
+	res, err := update(ctx, id)
 	if err != nil {
 		return Notification{}, fmt.Errorf("%s %s to %s: %w", id, from, to, err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return Notification{}, fmt.Errorf("%s %s to %s: rows affected: %w", id, from, to, err)
 	}
 	if changed == 0 {
 		if _, err := s.get(ctx, id); err != nil {
@@ -565,14 +570,45 @@ func (s *Service) transition(ctx context.Context, id string, from, to notificati
 	// request's own id stays on the access line and is added here.
 	lctx := telemetry.WithNotification(ctx, id, n.CorrelationID)
 	slog.InfoContext(lctx, msg, "from", from, "to", to, "request_correlation_id", telemetry.CorrelationID(ctx))
-	s.publishEvent(lctx, notification.Event{
+	// The statement set status_seq = LAST_INSERT_ID(status_seq + 1): the
+	// sequence of this change, whatever happens to the row after it. The
+	// change is committed either way; without it the read's value is the
+	// best left (exact unless a later change already landed).
+	seq := n.StatusSeq
+	if v, err := res.LastInsertId(); err == nil && v > 0 {
+		seq = uint64(v) //nolint:gosec // v > 0
+	} else {
+		slog.WarnContext(lctx, "no status_seq from the update; using the read", "err", err, "status_seq", seq)
+	}
+	// The read may already show a later change (a worker claims a replayed
+	// row at once); the event describes this change. A cancel is final and a
+	// replay resets attempts, so neither depends on that read.
+	e := notification.Event{
 		NotificationID: n.ID, BatchID: n.BatchID.String, Status: to, Attempts: int(n.Attempts),
-		Error: n.LastError.String, At: n.UpdatedAt, CorrelationID: n.CorrelationID,
-	})
-	if to == notification.StatusPending { // a replay: claimable again
+		Error: n.LastError.String, At: n.UpdatedAt, CorrelationID: n.CorrelationID, Seq: seq,
+	}
+	if to == notification.StatusPending { // a replay: fresh budget, claimable again
+		e.Attempts = 0
+	}
+	s.publishEvent(lctx, e)
+	if to == notification.StatusPending {
 		s.wake(lctx, hintFor(n.Notification))
 	}
 	return n, nil
+}
+
+// BatchStatusSeqs returns the status_seq of every notification of a batch,
+// keyed by id: what a batch subscription already has once it is read.
+func (s *Service) BatchStatusSeqs(ctx context.Context, id string) (map[string]uint64, error) {
+	rows, err := s.q.ListBatchStatusSeqs(ctx, sql.NullString{String: id, Valid: true})
+	if err != nil {
+		return nil, fmt.Errorf("batch %s status sequences: %w", id, err)
+	}
+	out := make(map[string]uint64, len(rows))
+	for _, r := range rows {
+		out[r.ID] = r.StatusSeq
+	}
+	return out, nil
 }
 
 // GetBatch returns a batch's counts per API status and one page of its items
@@ -657,10 +693,13 @@ func (s *Service) loadTemplates(ctx context.Context, rs []Request) (map[string]s
 	return out, nil
 }
 
-func (s *Service) publish(ctx context.Context, n sqlc.Notification) {
+// publishCreated announces a creation: pending, sequence 1. It is built from
+// the stored row but not from its current state, which a worker may already
+// have moved on (that change is announced by the worker).
+func (s *Service) publishCreated(ctx context.Context, n sqlc.Notification) {
 	s.publishEvent(ctx, notification.Event{
-		NotificationID: n.ID, BatchID: n.BatchID.String, Status: notification.Status(n.Status), Attempts: int(n.Attempts),
-		At: n.UpdatedAt, CorrelationID: n.CorrelationID,
+		NotificationID: n.ID, BatchID: n.BatchID.String, Status: notification.StatusPending,
+		At: n.CreatedAt, CorrelationID: n.CorrelationID, Seq: 1,
 	})
 }
 

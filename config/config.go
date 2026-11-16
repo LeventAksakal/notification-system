@@ -172,7 +172,7 @@ var Dials = []Dial{
 	// deleted row; at least APP_IDEMPOTENCY_RETENTION, checked in load.
 	duration("APP_NOTIFICATION_RETENTION", "168h", "how long sent, failed and cancelled notifications and their attempts are kept after they finish; a failed one can be replayed only while kept", time.Hour, 365*24*time.Hour,
 		func(c *Config) *time.Duration { return &c.NotificationRetention }),
-	integer("APP_WS_SEND_BUFFER", "256", "events buffered per WebSocket subscriber before it is dropped", 1, 65_536,
+	integer("APP_WS_SEND_BUFFER", "256", "events buffered per WebSocket subscriber before it is dropped as slow (arbitrary; how to tune it: decision 0013, Numbers)", 1, 65_536,
 		func(c *Config) *int { return &c.WSSendBuffer }),
 }
 

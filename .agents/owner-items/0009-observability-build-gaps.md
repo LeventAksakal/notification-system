@@ -15,3 +15,5 @@ Question: ordering between processes (API create vs worker claim) is restored in
 Assumption taken: rule-based ordering, as built. Residual: a release or reap racing a reclaim, judged by `at` across two worker clocks.
 
 Seen 14 Nov (fix lane, by reasoning; not reproduced): when a job is released and claimed again before the first claim's `processing` publish has returned, the release's `pending` event and the second claim's `processing` and `sent` events wait on different publishes and can reach Valkey in either order. A subscriber can then see `sent` followed by a late `pending`. It needs a slow Valkey and a release at the same time; the REST API stays correct. The sequence number asked about above would close it; nothing else was done.
+
+Resolved 16 Nov (realtime-seq, decision 0013 "As built"): item 3 is built as `notifications.status_seq`, carried in every event and the snapshot; the release/reclaim race above is reproduced through a slowed Valkey and ordered correctly by `TestReleaseAndReclaimRaceReachesTheSubscriberInCommitOrder`. Item 2 (live events cannot show `scheduled`) is unchanged.

@@ -11,22 +11,22 @@ import (
 	"time"
 )
 
-const cancelNotification = `-- name: CancelNotification :execrows
+const cancelNotification = `-- name: CancelNotification :execresult
 
 UPDATE notifications
-SET status = 'cancelled', finished_at = NOW(3)
+SET status = 'cancelled', status_seq = LAST_INSERT_ID(status_seq + 1), finished_at = NOW(3)
 WHERE id = ? AND status = 'pending'
 `
 
 // ListNotifications is built in Go (store.ListNotificationsQuery): the WHERE
 // holds only the filters a request sets, so each filter keeps its index.
 // The only way out of pending to cancelled; a lost race changes nothing.
-func (q *Queries) CancelNotification(ctx context.Context, id string) (int64, error) {
-	result, err := q.db.ExecContext(ctx, cancelNotification, id)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
+// The trigger stores status_seq + 1; LAST_INSERT_ID(expr) computes the same
+// value from the old row and hands it back in the OK packet
+// (sql.Result.LastInsertId), so the event carries it without a second read
+// that a later change could overtake.
+func (q *Queries) CancelNotification(ctx context.Context, id string) (sql.Result, error) {
+	return q.db.ExecContext(ctx, cancelNotification, id)
 }
 
 const countBatchByStatus = `-- name: CountBatchByStatus :many
@@ -144,7 +144,7 @@ func (q *Queries) GetIdempotencyKey(ctx context.Context, idemKey string) (Idempo
 }
 
 const getNotification = `-- name: GetNotification :one
-SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.status_from, notifications.failure_kind, notifications.attempts, notifications.budget_spent, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
+SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.status_from, notifications.status_seq, notifications.failure_kind, notifications.attempts, notifications.budget_spent, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
   CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
 FROM notifications
 WHERE id = ?
@@ -168,6 +168,7 @@ func (q *Queries) GetNotification(ctx context.Context, id string) (GetNotificati
 		&i.Notification.Content,
 		&i.Notification.Status,
 		&i.Notification.StatusFrom,
+		&i.Notification.StatusSeq,
 		&i.Notification.FailureKind,
 		&i.Notification.Attempts,
 		&i.Notification.BudgetSpent,
@@ -290,7 +291,7 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 }
 
 const listBatchItems = `-- name: ListBatchItems :many
-SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.status_from, notifications.failure_kind, notifications.attempts, notifications.budget_spent, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
+SELECT notifications.id, notifications.batch_id, notifications.batch_index, notifications.recipient, notifications.channel, notifications.priority, notifications.content, notifications.status, notifications.status_from, notifications.status_seq, notifications.failure_kind, notifications.attempts, notifications.budget_spent, notifications.due_at, notifications.scheduled_at, notifications.lease_until, notifications.claim_version, notifications.provider_message_id, notifications.last_error, notifications.correlation_id, notifications.traceparent, notifications.created_at, notifications.updated_at, notifications.finished_at,
   CAST(notifications.status = 'pending' AND notifications.attempts = 0 AND notifications.due_at > NOW(3) AS SIGNED) AS is_scheduled
 FROM notifications
 WHERE batch_id = ? AND CAST(batch_index AS SIGNED) > ?
@@ -329,6 +330,7 @@ func (q *Queries) ListBatchItems(ctx context.Context, arg ListBatchItemsParams) 
 			&i.Notification.Content,
 			&i.Notification.Status,
 			&i.Notification.StatusFrom,
+			&i.Notification.StatusSeq,
 			&i.Notification.FailureKind,
 			&i.Notification.Attempts,
 			&i.Notification.BudgetSpent,
@@ -376,6 +378,40 @@ func (q *Queries) ListBatchNotificationIDs(ctx context.Context, batchID sql.Null
 			return nil, err
 		}
 		items = append(items, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listBatchStatusSeqs = `-- name: ListBatchStatusSeqs :many
+SELECT id, status_seq FROM notifications WHERE batch_id = ?
+`
+
+type ListBatchStatusSeqsRow struct {
+	ID        string
+	StatusSeq uint64
+}
+
+// Every notification of a batch with its status_seq (batch_idx, then the
+// row): the base a batch subscription orders live events against.
+func (q *Queries) ListBatchStatusSeqs(ctx context.Context, batchID sql.NullString) ([]ListBatchStatusSeqsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listBatchStatusSeqs, batchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListBatchStatusSeqsRow
+	for rows.Next() {
+		var i ListBatchStatusSeqsRow
+		if err := rows.Scan(&i.ID, &i.StatusSeq); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -461,19 +497,16 @@ func (q *Queries) ListTemplates(ctx context.Context) ([]Template, error) {
 	return items, nil
 }
 
-const replayNotification = `-- name: ReplayNotification :execrows
+const replayNotification = `-- name: ReplayNotification :execresult
 UPDATE notifications
-SET status = 'pending', attempts = 0, budget_spent = 0, failure_kind = NULL, finished_at = NULL, due_at = NOW(3)
+SET status = 'pending', status_seq = LAST_INSERT_ID(status_seq + 1), attempts = 0, budget_spent = 0, failure_kind = NULL, finished_at = NULL, due_at = NOW(3)
 WHERE id = ? AND status = 'failed'
 `
 
-// A dead letter goes back to pending with a fresh attempt budget; history is kept.
-func (q *Queries) ReplayNotification(ctx context.Context, id string) (int64, error) {
-	result, err := q.db.ExecContext(ctx, replayNotification, id)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
+// A dead letter goes back to pending with a fresh attempt budget; history is
+// kept. The new status_seq comes back as LastInsertId, as for a cancel.
+func (q *Queries) ReplayNotification(ctx context.Context, id string) (sql.Result, error) {
+	return q.db.ExecContext(ctx, replayNotification, id)
 }
 
 const rescheduleNotification = `-- name: RescheduleNotification :execrows

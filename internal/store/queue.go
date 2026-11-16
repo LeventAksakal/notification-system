@@ -105,6 +105,7 @@ func (s *Queue) claimOnce(ctx context.Context, channel notification.Channel, pri
 			BudgetSpent: int(r.BudgetSpent),
 			// Exact: the row lock is held from the SELECT to the commit.
 			ClaimVersion: r.ClaimVersion + 1,
+			StatusSeq:    r.StatusSeq + 1, // the same lock: LeaseNotifications added one
 			// A lower bound on the local clock: the worker sends only while
 			// it holds. The fenced value is claim_version.
 			LeaseUntil:    started.Add(lease),
@@ -313,6 +314,7 @@ func (s *Queue) reapOnce(ctx context.Context) ([]notification.Job, error) {
 		jobs[i] = notification.Job{
 			ID: r.ID, BatchID: r.BatchID.String, Channel: notification.Channel(r.Channel),
 			Attempts: int(r.Attempts), CorrelationID: r.CorrelationID,
+			StatusSeq: r.StatusSeq + 1, // ReapLeases adds one under the lock taken here
 		}
 	}
 	// An attempt in flight on an expired lease becomes unknown and counts.

@@ -7,7 +7,7 @@
 -- Runs inside a READ COMMITTED transaction. claim_idx (status, channel,
 -- priority, due_at) serves both the filter and the order, so InnoDB locks
 -- only the rows it returns; rows locked by another claimer are skipped.
-SELECT id, batch_id, recipient, content, attempts, budget_spent, claim_version, due_at, correlation_id, traceparent
+SELECT id, batch_id, recipient, content, attempts, budget_spent, claim_version, status_seq, due_at, correlation_id, traceparent
 FROM notifications
 WHERE status = 'pending' AND channel = sqlc.arg(channel) AND priority = sqlc.arg(priority) AND due_at <= NOW(3)
 ORDER BY due_at
@@ -33,7 +33,9 @@ FROM notifications l WHERE l.status = 'pending' AND l.channel = sqlc.arg(channel
 
 -- name: LeaseNotifications :execrows
 -- pending -> processing for the rows locked by ClaimCandidates in the same
--- transaction, in one statement (one round trip, however many rows).
+-- transaction, in one statement (one round trip, however many rows). The
+-- trigger raises status_seq; each row's new value is the one ClaimCandidates
+-- read plus one, since the row lock is held from that SELECT to the commit.
 UPDATE notifications
 SET status = 'processing',
     lease_until = NOW(3) + INTERVAL sqlc.arg(lease_us) MICROSECOND,
@@ -41,7 +43,10 @@ SET status = 'processing',
 WHERE id IN (sqlc.slice(ids)) AND status = 'pending';
 
 -- name: FinishSent :execrows
--- processing -> sent.
+-- processing -> sent. Every write below is fenced by claim_version, and only a
+-- claim moves a row into processing (bumping claim_version), so when it
+-- matches no status change happened since the claim: the new status_seq (the
+-- trigger raises it) is the claim's plus one, known without reading it back.
 UPDATE notifications
 SET status = 'sent', attempts = attempts + 1, provider_message_id = sqlc.narg(provider_message_id),
     lease_until = NULL, finished_at = NOW(3)
@@ -72,7 +77,7 @@ WHERE id = sqlc.arg(id) AND status = 'processing' AND claim_version = sqlc.arg(c
 -- name: ReapCandidates :many
 -- Runs inside a READ COMMITTED transaction: the expired leases (lease_idx),
 -- locked so two reapers never return the same row. Bounded per tick.
-SELECT id, batch_id, channel, attempts, correlation_id
+SELECT id, batch_id, channel, attempts, status_seq, correlation_id
 FROM notifications
 WHERE status = 'processing' AND lease_until < NOW(3)
 ORDER BY lease_until
@@ -80,7 +85,8 @@ LIMIT 1000
 FOR UPDATE SKIP LOCKED;
 
 -- name: ReapLeases :execrows
--- processing -> pending for rows locked by ReapCandidates in the same transaction.
+-- processing -> pending for rows locked by ReapCandidates in the same
+-- transaction; the trigger makes status_seq the one read plus one (row locks held).
 UPDATE notifications
 SET status = 'pending', lease_until = NULL
 WHERE id IN (sqlc.slice(ids)) AND status = 'processing';

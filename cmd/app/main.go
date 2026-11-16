@@ -167,7 +167,7 @@ func worker(ctx context.Context, cfg config.Config, db *sql.DB) error {
 		Queue:     store.NewQueue(db),
 		Limiter:   limiter.New(vk, cfg.RateLimitPerSecond, cfg.RateLimitHeadroomPct, cfg.RateLimitHorizon, "ratelimit:"),
 		Sender:    provider.New(cfg.ProviderURLs, cfg.ProviderTimeout, cfg.WorkerConcurrency),
-		Publisher: realtime.NewPublisher(vk, realtime.OriginWorker),
+		Publisher: realtime.NewPublisher(vk),
 		Health:    health.NewValkey(vk, health.Config{Failures: cfg.BreakerFailures, Cooldown: cfg.BreakerCooldown}, "health:"),
 		Tracer:    otel.Tracer("notifier/worker"),
 		Waker:     wake.NewPublisher(vk),
@@ -198,20 +198,13 @@ func serve(ctx context.Context, cfg config.Config, db *sql.DB) error {
 
 	// One Valkey subscription per process feeds every WebSocket (decision 0013).
 	hub := realtime.NewHub(vk)
-	svc := intake.New(db, realtime.NewPublisher(vk, realtime.OriginAPI), cfg.IdempotencyRetention).WithWaker(wake.NewPublisher(vk))
+	svc := intake.New(db, realtime.NewPublisher(vk), cfg.IdempotencyRetention).WithWaker(wake.NewPublisher(vk))
+	// Readiness is MySQL only: intake, reads and cancels need nothing else.
+	// While the hub's Valkey subscription is down, /v1/ws refuses new
+	// subscribers with 503 and open streams are closed (decision 0013), so
+	// live updates degrade on their own without taking intake out of rotation.
 	srv := httpapi.NewServer(svc, map[string]httpapi.Check{
 		"mysql": db.PingContext,
-		// Ready only while events reach this instance: a subscriber accepted
-		// now must not miss the next change.
-		"valkey": func(ctx context.Context) error {
-			if err := vk.Do(ctx, vk.B().Ping().Build()).Error(); err != nil {
-				return err
-			}
-			if !hub.Live() {
-				return errors.New("status event subscription not active")
-			}
-			return nil
-		},
 	}, httpapi.Options{Metrics: store.NewMetricsReader(db), Hub: hub, WSSendBuffer: cfg.WSSendBuffer,
 		RequestTimeout: cfg.RequestTimeout})
 	h, err := srv.Handler()
