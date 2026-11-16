@@ -16,6 +16,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -38,7 +39,7 @@ func main() {
 }
 
 func run(base string) error {
-	old, err := exec.Command("git", "show", base+":"+spec).Output()
+	old, err := exec.CommandContext(context.Background(), "git", "show", base+":"+spec).Output() //nolint:gosec // G204: a revision from the caller (CI's base commit), as in commitcheck
 	if err != nil {
 		return fmt.Errorf("read %s at %s: %w", spec, base, err)
 	}
@@ -74,7 +75,7 @@ func run(base string) error {
 	} else {
 		fmt.Printf("major version %d -> %d: breaking changes are allowed and listed below\n", baseMajor, headMajor)
 	}
-	cmd := exec.Command("go", append(args, oldPath, spec)...)
+	cmd := exec.CommandContext(context.Background(), "go", append(args, oldPath, spec)...) //nolint:gosec // G204: fixed tool, arguments built here
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("oasdiff found changes that break clients of %s; keep them compatible or bump the major version (internal/httpapi/api.go Version): %w", base, err)
