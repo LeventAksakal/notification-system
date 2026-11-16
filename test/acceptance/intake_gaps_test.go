@@ -11,6 +11,7 @@ package acceptance
 // tests cannot make MySQL refuse the second chunk of a valid batch.
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
@@ -348,6 +349,8 @@ func TestGapR10RequestBodyLimit(t *testing.T) {
 	s := startStack(t, stackOptions{})
 
 	t.Run("one byte over the limit: 413 request_too_large", func(t *testing.T) {
+		// The content is far over the email limit too; the body limit refuses
+		// the request before the content is validated.
 		single := gapEmailBody(t, notification.MaxRequestBodyBytes+1)
 		wantError(t, s.postJSON(t, "/v1/notifications", single), http.StatusRequestEntityTooLarge, "request_too_large")
 
@@ -365,9 +368,22 @@ func TestGapR10RequestBodyLimit(t *testing.T) {
 	})
 
 	t.Run("a 5 MB batch under the limit: 201", func(t *testing.T) {
-		items := make([]apiclient.NotificationCreate, 100)
+		// Every item is a valid email at its content limit, so only the body
+		// size is under test: enough of them to pass 5 MB, within the batch
+		// maximum and under the body limit.
+		const size = 5_000_000
+		n := (size + notification.MaxEmailContentBytes - 1) / notification.MaxEmailContentBytes
+		items := make([]apiclient.NotificationCreate, n)
 		for i := range items {
-			items[i] = msg("email", fmt.Sprintf("%03d", i)+strings.Repeat("b", 50_000-3))
+			items[i] = msg("email", fmt.Sprintf("%04d", i)+strings.Repeat("b", notification.MaxEmailContentBytes-4))
+		}
+		body, err := json.Marshal(apiclient.BatchCreate{Notifications: items})
+		if err != nil {
+			t.Fatalf("test setup: %v", err)
+		}
+		if len(items) > notification.MaxBatchSize || len(body) < size || len(body) > notification.MaxRequestBodyBytes {
+			t.Fatalf("test setup: %d items, body %d bytes; want at most %d items and %d..%d bytes",
+				len(items), len(body), notification.MaxBatchSize, size, notification.MaxRequestBodyBytes)
 		}
 		b := s.createBatch(t, items)
 		if len(b.NotificationIds) != len(items) {
