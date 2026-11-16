@@ -120,17 +120,26 @@ func TestDeliveryR11OnceUnderTimeoutsAndCrashes(t *testing.T) {
 		if st.MaxRequestsPerKey > maxAttempts {
 			t.Errorf("maxRequestsPerKey: %d, want at most APP_MAX_ATTEMPTS=%d", st.MaxRequestsPerKey, maxAttempts)
 		}
-		// The crashed call stays in the history (read with SQL: the API does
-		// not list `unknown` attempts until owner item 0015).
+		// R11, decision 0005 ("attempts written before the call"): the crashed
+		// call stays in the history as unknown, read through the API as an
+		// operator would: GET /v1/notifications/{id} lists `unknown` attempts
+		// (owner item 0015).
+		const wantHistory = "1 unknown, 2 accepted"
 		for _, id := range ids {
-			if got := s.attemptHistory(t, id); got != "1 unknown, 2 accepted" {
-				t.Errorf("%s: attempt history %q, want %q", id, got, "1 unknown, 2 accepted")
+			as := history(s.get(t, id))
+			got := make([]string, len(as))
+			for i, a := range as {
+				got[i] = fmt.Sprintf("%d %s", a.AttemptNo, a.Outcome)
+			}
+			if h := strings.Join(got, ", "); h != wantHistory {
+				t.Errorf("%s: GET attempt history %q, want %q; full history %s", id, h, wantHistory, attemptsString(as))
 			}
 		}
 	})
 }
 
-// attemptHistory reads a notification's attempt rows as "1 unknown, 2 accepted".
+// attemptHistory reads a notification's attempt rows with SQL as
+// "1 unknown, 2 accepted" (kept for TestR13MetricsUnknownAttemptsCountedApart).
 func (s *stack) attemptHistory(t *testing.T, id uuid.UUID) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
