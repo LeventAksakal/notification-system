@@ -5,7 +5,7 @@ One coordinating session and four kinds of sub-agent, each started with a writte
 
 | Role | May write | Why the limit |
 |---|---|---|
-| Coordinator (main session) | contracts (`api/`, `schema/`, `internal/core/`), briefs, decision records, docs, logs | One author for the interfaces every lane depends on; it reads diffs and merges but does not build |
+| Coordinator (main session) | contracts (`api/`, `schema/`, `internal/notification/`), briefs, decision records, docs, logs | One author for the interfaces every lane depends on; it reads diffs and merges but does not build |
 | Researcher (Sonnet) | `.agents/` | Facts with a source before a decision is written |
 | Test-writer (Opus) | `test/acceptance/` | Tests come from the contract, by an agent that has not seen the code |
 | Implementer (Opus) | `cmd/`, `internal/`, `test/` except `test/acceptance/` | Cannot edit the tests that judge it, nor the contracts |

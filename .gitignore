@@ -1,4 +1,6 @@
 .claude/bin/
+.claude/worktrees/
+.claude/handoffs/
 .claude/settings.local.json
 .env
 .env.*
